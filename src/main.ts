@@ -1,0 +1,137 @@
+/**
+ * OpenLLM local daemon — entrypoint.
+ *
+ * Headless. Boots a localhost `Bun.serve` that exposes ONE surface — the
+ * OpenAI/Anthropic-compatible `/v1/*` inference surface, run locally
+ * against `packages/core`'s pipeline for SUBSCRIPTION hops (credentials
+ * delegated to the official vendor CLIs). Control (status / connect /
+ * cli-install) is NOT served on localhost anymore: the daemon dials OUT to
+ * the cloud control channel (`control-relay.ts`) and the dashboard drives
+ * it from there — so there's no browser→loopback hop (no Private Network
+ * Access prompt). See `docs/proposals/daemon-control-via-neon-longpoll.md`.
+ *
+ * It holds NO DEK and decrypts NO vault credential. The only secret it
+ * carries is the user's `sk-llm-...` key, used to authenticate cloud
+ * control-plane calls (config pull + request-metadata recording) and to
+ * forward API-key hops in a mixed chain to the cloud `/v1/*` surface.
+ *
+ * This file is compiled into a source-free standalone binary with
+ * `bun build --compile --minify --bytecode` (see scripts/compile.ts).
+ */
+import { getCloudState, refreshBootstrap } from "./config";
+import { reportControlInactive, startControlRelay } from "./control-relay";
+import { isDevMode } from "./env";
+import { handleInference } from "./listener";
+import { DAEMON_VERSION } from "./version";
+
+const DEFAULT_PORT = 8787;
+
+// Once the cloud snapshot is healthy, refresh every 5 minutes to stay in
+// lockstep with dashboard config changes.
+const BOOTSTRAP_TTL_MS = 5 * 60 * 1000;
+// Until it's healthy (no key yet / cloud still starting up in dev / key
+// just changed), retry quickly so the daemon picks up a freshly-set key
+// or a `next dev` that finished compiling — without waiting a full TTL.
+const BOOTSTRAP_RETRY_MS = 5 * 1000;
+
+const readPort = (): number => {
+  const raw = process.env.OPENLLM_DAEMON_PORT;
+  if (raw === undefined) return DEFAULT_PORT;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_PORT;
+};
+
+const main = async (): Promise<void> => {
+  const port = readPort();
+
+  // Pull the catalog + routing config. This NEVER throws — when there's
+  // no API key yet (the daemon installs keyless; the dashboard sets the
+  // key afterwards) or the cloud isn't reachable, it records the reason
+  // in `cloudState` and the daemon comes up anyway, serving the control
+  // surface so the dashboard can set/fix the key. We poll on a SHORT
+  // interval until the snapshot is healthy, then relax to the TTL — so a
+  // just-set key (or a `next dev` that just finished booting) is picked
+  // up within seconds, not after a 5-minute wait.
+  await refreshBootstrap();
+  const scheduleBootstrap = (): void => {
+    const delay =
+      getCloudState() === "ok" ? BOOTSTRAP_TTL_MS : BOOTSTRAP_RETRY_MS;
+    setTimeout(async () => {
+      await refreshBootstrap();
+      scheduleBootstrap();
+    }, delay);
+  };
+  scheduleBootstrap();
+
+  // Dial OUT to the cloud control channel: a long-poll that delivers
+  // dashboard commands (connect / cli-install) and, by being held open,
+  // marks this key's daemon "online" server-side — so the dashboard no
+  // longer has to reach loopback (no Private Network Access prompt). See
+  // `docs/proposals/daemon-control-via-neon-longpoll.md`.
+  startControlRelay();
+
+  // Graceful-exit beacon: flip the key offline immediately on Ctrl-C /
+  // termination instead of waiting for the presence-staleness window.
+  let shuttingDown = false;
+  const shutdown = (signal: NodeJS.Signals): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    void reportControlInactive().finally(() => {
+      process.exit(signal === "SIGINT" ? 130 : 143);
+    });
+  };
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+  Bun.serve({
+    hostname: "127.0.0.1",
+    port,
+    // Long-lived connections: streaming `/v1/*` inference. The default
+    // ~10s idle timeout would sever a stream between writes, so raise it to
+    // Bun's max; the stream emits its own keep-alives well under it.
+    idleTimeout: 255,
+    fetch: async (req: Request): Promise<Response> => {
+      const url = new URL(req.url);
+      if (url.pathname.startsWith("/v1/")) {
+        // Stamp every inference response as daemon-served — an
+        // observability marker (you can always tell a response came from
+        // the local daemon vs the cloud) AND a safety net: an unexpected
+        // throw in `handleInference` becomes a clean error envelope
+        // instead of a bare runtime 500. Body is passed through
+        // untouched so streaming responses keep streaming.
+        let res: Response;
+        try {
+          res = await handleInference(req);
+        } catch (err) {
+          res = new Response(
+            JSON.stringify({
+              error: {
+                message: err instanceof Error ? err.message : String(err),
+              },
+            }),
+            { status: 500, headers: { "content-type": "application/json" } },
+          );
+        }
+        const headers = new Headers(res.headers);
+        headers.set("x-openllm-served-by", "daemon");
+        return new Response(res.body, {
+          status: res.status,
+          statusText: res.statusText,
+          headers,
+        });
+      }
+      // The daemon serves ONLY /v1/* locally now — control comes via the
+      // cloud relay, not a browser→loopback call.
+      return new Response(JSON.stringify({ error: "not found" }), {
+        status: 404,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  // Single line to stdout so the install-time launcher can confirm boot.
+  process.stdout.write(
+    `openllmd v${DAEMON_VERSION}${isDevMode() ? " (dev)" : ""} listening on http://127.0.0.1:${port}\n`,
+  );
+};
+
+void main();

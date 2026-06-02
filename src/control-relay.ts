@@ -1,0 +1,154 @@
+/**
+ * The daemon's OUTBOUND control channel — it dials the cloud instead of
+ * waiting for the browser to reach loopback (which Chrome gates behind a
+ * flaky Private Network Access prompt). See
+ * `docs/proposals/daemon-control-via-neon-longpoll.md`.
+ *
+ * The loop holds `GET /api/daemon/poll` (long-poll, ~25s server-side) with
+ * the daemon's `sk-llm` key. The held poll IS the presence signal (the cloud
+ * stamps `daemon_active`/`last_seen`). When a command is delivered it's run
+ * through the SAME control handlers the localhost surface uses (connect /
+ * cli-install), then acked + a status snapshot pushed via
+ * `POST /api/daemon/status`. On graceful exit a final `{ active:false }`
+ * beacon flips the key offline immediately.
+ *
+ * No new secret, no `x-openllm-daemon` header — just the API key.
+ */
+
+import type { TDaemonCommand, TDaemonCommandAck } from "@openllm/schema";
+import { installCli } from "./cli-install";
+import type { TCliProvider } from "./cli-paths";
+import {
+  InvalidApiKeyError,
+  NoApiKeyError,
+  pollControl,
+  reportStatus,
+} from "./cloud-client";
+import { getDelegate } from "./delegation";
+import { hasApiKey } from "./env";
+import { computeStatus } from "./status";
+
+// No key / unreachable / rejected → back off before re-dialing.
+const BACKOFF_MS = 5_000;
+// Abort a poll that outlives the server's hold + margin, then re-dial.
+const POLL_TIMEOUT_MS = 35_000;
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Execute one delivered command via the existing control handlers. Returns
+ * the terminal ack. Unknown kinds are acked as errors rather than thrown so
+ * one bad command can't stall the batch.
+ */
+const runCommand = async (cmd: TDaemonCommand): Promise<TDaemonCommandAck> => {
+  try {
+    const payload = (cmd.payload ?? {}) as { slug?: string };
+    switch (cmd.kind) {
+      case "connect": {
+        const delegate =
+          payload.slug !== undefined ? getDelegate(payload.slug) : null;
+        if (delegate === null) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: "unknown provider" },
+          };
+        }
+        const r = await delegate.connect();
+        return { id: cmd.id, status: "done", result: r };
+      }
+      case "cli_install": {
+        if (payload.slug === undefined || getDelegate(payload.slug) === null) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: "unknown provider" },
+          };
+        }
+        const r = await installCli(payload.slug as TCliProvider);
+        return { id: cmd.id, status: "done", result: r };
+      }
+      // A bare refresh: nothing to do — the status push below carries the
+      // fresh snapshot back.
+      case "refresh":
+      case "status":
+        return { id: cmd.id, status: "done" };
+      default:
+        return {
+          id: cmd.id,
+          status: "error",
+          result: { error: `unknown command kind "${cmd.kind}"` },
+        };
+    }
+  } catch (err) {
+    return {
+      id: cmd.id,
+      status: "error",
+      result: { error: err instanceof Error ? err.message : String(err) },
+    };
+  }
+};
+
+let running = false;
+
+/**
+ * Start the control loop (idempotent). Runs for the daemon's lifetime:
+ * dial → drain commands → run → ack + push status → re-dial.
+ */
+export const startControlRelay = (): void => {
+  if (running) return;
+  running = true;
+  void loop();
+};
+
+const loop = async (): Promise<void> => {
+  // Push an initial snapshot once a key is present so the dashboard has
+  // state immediately, not only after the first command.
+  let pushedInitial = false;
+  for (;;) {
+    if (!hasApiKey()) {
+      await sleep(BACKOFF_MS);
+      continue;
+    }
+    try {
+      if (!pushedInitial) {
+        await reportStatus({ active: true, status: await computeStatus() });
+        pushedInitial = true;
+      }
+      const { commands } = await pollControl(
+        AbortSignal.timeout(POLL_TIMEOUT_MS),
+      );
+      if (commands.length > 0) {
+        const acks: TDaemonCommandAck[] = [];
+        for (const cmd of commands) acks.push(await runCommand(cmd));
+        await reportStatus({
+          active: true,
+          status: await computeStatus(),
+          acks,
+        });
+      }
+      // Empty batch = the poll's hold elapsed; immediately re-dial (the poll
+      // itself refreshed presence cloud-side).
+    } catch (err) {
+      // Invalid/absent key or an unreachable/stalled cloud — back off, then
+      // re-try. A freshly set key (or recovered network) is picked up on the
+      // next iteration. Re-push the initial snapshot after a key change.
+      if (err instanceof InvalidApiKeyError || err instanceof NoApiKeyError) {
+        pushedInitial = false;
+      }
+      await sleep(BACKOFF_MS);
+    }
+  }
+};
+
+/**
+ * Fire-and-forget graceful-exit beacon: tell the cloud this key's daemon is
+ * going offline so the dashboard flips immediately (rather than waiting for
+ * the presence-staleness window). Awaitable so the signal handler can let it
+ * flush before exiting.
+ */
+export const reportControlInactive = async (): Promise<void> => {
+  if (!hasApiKey()) return;
+  await reportStatus({ active: false });
+};

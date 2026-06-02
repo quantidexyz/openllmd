@@ -1,0 +1,22 @@
+{
+  "name": "@openllm/daemon",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./*": "./*.ts"
+  },
+  "bin": {
+    "openllmd": "./src/main.ts"
+  },
+  "scripts": {
+    "compile": "bun scripts/compile.ts"
+  },
+  "dependencies": {
+    "@openllm/schema": "workspace:*",
+    "@openllm/wire": "workspace:*",
+    "effect": "*"
+  },
+  "license": "BUSL-1.1"
+}
