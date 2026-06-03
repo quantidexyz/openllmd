@@ -87,8 +87,26 @@ export const spawnLogin = async (
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
-  return { code, output: `${stdout}${stderr}`.trim() };
+  // Join with a newline, NOT bare concatenation: a token printed as the last
+  // bytes of stdout (no trailing newline) must not fuse with the first bytes
+  // of stderr, or a greedy token match would swallow the spillover.
+  return { code, output: `${stdout}\n${stderr}`.trim() };
 };
+
+// OSC (ESC ] … BEL/ST), CSI (ESC [ … final), and lone ESC. Built from a
+// string so the source stays free of raw control bytes.
+const ANSI_RE = new RegExp(
+  "\\u001b\\][^]*?(?:\\u0007|\\u001b\\\\)" +
+    "|\\u001b\\[[0-9;?]*[ -/]*[@-~]" +
+    "|\\u001b[@-Z\\\\-_]",
+  "g",
+);
+
+/**
+ * Strip ANSI/terminal control sequences (CSI colour codes, OSC, lone escapes)
+ * from CLI output so a value parsed out of it isn't fused with rendering bytes.
+ */
+export const stripAnsi = (s: string): string => s.replace(ANSI_RE, "");
 
 /** Read + JSON-parse a file, or null if absent / unparseable. */
 export const readJsonFile = async <T>(path: string): Promise<T | null> => {

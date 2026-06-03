@@ -26,6 +26,16 @@ import { join } from "node:path";
 import { stateDir } from "./env";
 
 const OAT_PREFIX = "sk-ant-oat01-";
+// The full token shape: prefix + base64url body. Used to EXTRACT a clean token
+// from a stored value, so trailing terminal junk that slipped past capture
+// (newlines, a fused log line, etc.) can never reach the upstream as a corrupt
+// Bearer — we send only the matched token, never the raw file/env contents.
+const OAT_RE = /sk-ant-oat01-[A-Za-z0-9_-]+/;
+
+const extractOat = (raw: string | null | undefined): string | null => {
+  if (raw === null || raw === undefined) return null;
+  return raw.match(OAT_RE)?.[0] ?? null;
+};
 
 const setupTokenDir = (): string => join(stateDir(), "setup-token");
 const tokenFile = (provider: string): string => join(setupTokenDir(), provider);
@@ -40,14 +50,13 @@ const envVarFor = (provider: string): string | null =>
  */
 export const loadSetupToken = (provider: string): string | null => {
   try {
-    const fromFile = readFileSync(tokenFile(provider), "utf-8").trim();
-    if (fromFile.startsWith(OAT_PREFIX)) return fromFile;
+    const fromFile = extractOat(readFileSync(tokenFile(provider), "utf-8"));
+    if (fromFile !== null) return fromFile;
   } catch {
     // no file — fall through to env
   }
   const envVar = envVarFor(provider);
-  const fromEnv = envVar !== null ? process.env[envVar]?.trim() : undefined;
-  return fromEnv?.startsWith(OAT_PREFIX) ? fromEnv : null;
+  return envVar !== null ? extractOat(process.env[envVar]) : null;
 };
 
 export const hasSetupToken = (provider: string): boolean =>

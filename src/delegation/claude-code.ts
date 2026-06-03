@@ -32,6 +32,7 @@ import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllm/schema";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
+import { logError, logInfo } from "../logger";
 import { hasSetupToken, loadSetupToken, setSetupToken } from "../setup-token";
 import type { TProviderDelegate } from "./types";
 import {
@@ -42,6 +43,7 @@ import {
   readJsonFile,
   runCapture,
   spawnLogin,
+  stripAnsi,
   toEpochMs,
   writeIsolatedKeychain,
 } from "./util";
@@ -256,9 +258,18 @@ const authStatusLoggedIn = async (): Promise<boolean | null> => {
  * Run `claude setup-token` (a browser login on THIS box that prints a
  * long-lived `sk-ant-oat01-` token) and capture the token. Used by the
  * this-machine `connectSetupToken` (store locally) AND the remote-copy
- * `mintSetupToken` (return for sealing — never stored here). ⚠️ RESEARCH:
- * setup-token stdout shape unverified; matched anywhere in the output.
+ * `mintSetupToken` (return for sealing — never stored here).
+ *
+ * The token is parsed out of the CLI's terminal output, which is fragile:
+ * colour codes can fuse onto it, a default 80-col width can line-wrap it, and
+ * stdout/stderr can run together. We harden against all three — force a plain,
+ * unwrapped render (NO_COLOR + TERM=dumb + a very wide COLUMNS), strip any
+ * residual ANSI, and match the base64url token body (`[A-Za-z0-9_-]`, NOT `.`,
+ * so a trailing sentence can't bleed in). A redacted diagnostic is logged so a
+ * future "grabbed extra text" report can be pinned from `~/.openllm/openllmd.log`.
  */
+const SETUP_TOKEN_RE = /sk-ant-oat01-[A-Za-z0-9_-]+/;
+
 const captureSetupToken = async (): Promise<
   { token: string } | { error: string }
 > => {
@@ -270,17 +281,41 @@ const captureSetupToken = async (): Promise<
   // macOS: setup-token is still an OAuth login, so the isolated keychain must
   // exist (it may write session state alongside printing the token).
   await ensureIsolatedKeychain(cliHome(PROVIDER));
-  const result = await spawnLogin([bin(), "setup-token"], env());
-  const match = result.output.match(/sk-ant-oat01-[A-Za-z0-9._-]+/);
+  const result = await spawnLogin([bin(), "setup-token"], {
+    ...env(),
+    // Plain, unwrapped output so the token prints clean on its own line.
+    NO_COLOR: "1",
+    FORCE_COLOR: "0",
+    TERM: "dumb",
+    COLUMNS: "4096",
+  });
+  const cleaned = stripAnsi(result.output);
+  const match = cleaned.match(SETUP_TOKEN_RE);
   if (match === null) {
+    logError("setup-token", "no token in `claude setup-token` output", {
+      code: result.code,
+      outputLen: cleaned.length,
+    });
     return {
       error:
-        result.output.length > 0
-          ? result.output.slice(0, 300)
+        cleaned.length > 0
+          ? cleaned.slice(0, 300)
           : `claude setup-token exited ${result.code} without a token`,
     };
   }
-  return { token: match[0] };
+  const token = match[0];
+  // Non-secret diagnostic: the token length + the bytes immediately AFTER it
+  // (escaped). If a token ever comes out wrong, this shows the boundary the
+  // parser saw without writing the secret itself.
+  const tail = cleaned.slice(
+    (match.index ?? 0) + token.length,
+    (match.index ?? 0) + token.length + 24,
+  );
+  logInfo("setup-token", "captured setup token", {
+    tokenLen: token.length,
+    trailing: JSON.stringify(tail),
+  });
+  return { token };
 };
 
 export const claudeCodeDelegate: TProviderDelegate = {
