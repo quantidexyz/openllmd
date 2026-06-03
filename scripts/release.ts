@@ -44,14 +44,11 @@ import { readFile, writeFile } from "node:fs/promises";
  */
 import { $ } from "bun";
 import rootPkg from "../../../package.json" with { type: "json" };
+import { DAEMON_TARGETS } from "../release-types";
 
 const REPO = process.env.OPENLLM_DAEMON_RELEASE_REPO ?? "quantidexyz/openllmd";
-const TARGETS = [
-  "darwin-arm64",
-  "darwin-x64",
-  "linux-x64",
-  "linux-arm64",
-] as const;
+// Single source of truth (packages/daemon/release-types.ts) — don't re-declare.
+const TARGETS = DAEMON_TARGETS;
 const DIST = "packages/daemon/dist";
 const MANIFEST = "packages/daemon/release.ts";
 const ROOT_PKG = "package.json";
@@ -93,8 +90,14 @@ const bumpVersion = (current: string, kind: TBump, preid: string): string => {
         ? `${major}.${minor}.${patch}`
         : `${major}.${minor}.${patch + 1}`;
     case "prerelease":
-      return preName !== undefined && preNum !== undefined
-        ? `${major}.${minor}.${patch}-${preName}.${Number(preNum) + 1}`
+      // Continue the SAME prerelease channel only when --preid matches it;
+      // a different --preid starts a fresh channel on the current version,
+      // and a release version starts one on the next patch.
+      if (preName === preid && preNum !== undefined) {
+        return `${major}.${minor}.${patch}-${preName}.${Number(preNum) + 1}`;
+      }
+      return preName !== undefined
+        ? `${major}.${minor}.${patch}-${preid}.0`
         : `${major}.${minor}.${patch + 1}-${preid}.0`;
   }
 };

@@ -46,13 +46,21 @@ const readPort = (): number => {
 const main = async (): Promise<void> => {
   const port = readPort();
 
-  // Last-resort crash logging. The daemon is headless under launchd/systemd,
+  // Last-resort crash handling. The daemon is headless under launchd/systemd,
   // so an uncaught throw or rejected promise would otherwise die silently —
-  // capture it to `~/.openllm/openllmd.log` before the process goes down.
-  process.on("uncaughtException", (err) => logError("uncaughtException", err));
-  process.on("unhandledRejection", (reason) =>
-    logError("unhandledRejection", reason),
-  );
+  // log it to `~/.openllm/openllmd.log`, then EXIT non-zero. Registering a
+  // handler does NOT stop the runtime from terminating, and continuing after a
+  // fatal error leaves the process in an indeterminate state; exiting lets the
+  // launch agent / systemd unit restart it clean. `logError` writes
+  // synchronously (appendFileSync), so the line is flushed before exit.
+  process.on("uncaughtException", (err) => {
+    logError("uncaughtException", err);
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (reason) => {
+    logError("unhandledRejection", reason);
+    process.exit(1);
+  });
 
   // Pull the catalog + routing config. This NEVER throws — when there's
   // no API key yet (the daemon installs keyless; the dashboard sets the

@@ -97,14 +97,17 @@ const runCommandInner = async (
         const slug = payload.slug;
         // Mark installing + push ONE interim status BEFORE the (blocking)
         // download, so the card shows a synced "Installing…" immediately
-        // instead of going dark until the install finishes. Cleared in the
-        // finally; the post-command status push then carries `cli_installed`.
+        // instead of going dark until the install finishes. The push is INSIDE
+        // the try so a failure in computeStatus/reportStatus can't bypass the
+        // finally — `clearInstalling` always runs, never leaving the provider
+        // stuck in `installing: true`. The post-command status push then
+        // carries `cli_installed`.
         setInstalling(slug);
-        await reportStatus({
-          active: true,
-          status: await computeStatus(),
-        }).catch(() => {});
         try {
+          await reportStatus({
+            active: true,
+            status: await computeStatus(),
+          }).catch(() => {});
           const r = await installCli(slug as TCliProvider);
           return { id: cmd.id, status: "done", result: r };
         } finally {

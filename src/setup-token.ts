@@ -30,12 +30,20 @@ const OAT_PREFIX = "sk-ant-oat01-";
 // from a stored value, so trailing terminal junk that slipped past capture
 // (newlines, a fused log line, etc.) can never reach the upstream as a corrupt
 // Bearer — we send only the matched token, never the raw file/env contents.
-const OAT_RE = /sk-ant-oat01-[A-Za-z0-9_-]+/;
+// Exported as the single source of truth for "what a setup-token looks like"
+// so capture (claude-code delegate) + storage + reload can't drift.
+export const SETUP_TOKEN_RE = /sk-ant-oat01-[A-Za-z0-9_-]+/;
 
 const extractOat = (raw: string | null | undefined): string | null => {
   if (raw === null || raw === undefined) return null;
-  return raw.match(OAT_RE)?.[0] ?? null;
+  return raw.match(SETUP_TOKEN_RE)?.[0] ?? null;
 };
+
+// Provider names become a path segment under the state dir, so reject anything
+// that isn't a plain slug — `..`, slashes, etc. must never traverse out.
+const VALID_PROVIDER_RE = /^[a-z][a-z0-9_]*$/;
+const isValidProvider = (provider: string): boolean =>
+  VALID_PROVIDER_RE.test(provider);
 
 const setupTokenDir = (): string => join(stateDir(), "setup-token");
 const tokenFile = (provider: string): string => join(setupTokenDir(), provider);
@@ -49,6 +57,7 @@ const envVarFor = (provider: string): string | null =>
  * value with the `sk-ant-oat01-` subscription prefix is accepted.
  */
 export const loadSetupToken = (provider: string): string | null => {
+  if (!isValidProvider(provider)) return null;
   try {
     const fromFile = extractOat(readFileSync(tokenFile(provider), "utf-8"));
     if (fromFile !== null) return fromFile;
@@ -72,6 +81,7 @@ export const setSetupToken = (
   provider: string,
   token: string | null,
 ): boolean => {
+  if (!isValidProvider(provider)) return false;
   const trimmed = token?.trim() ?? "";
   if (trimmed.length > 0 && !trimmed.startsWith(OAT_PREFIX)) return false;
   try {

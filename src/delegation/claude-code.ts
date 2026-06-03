@@ -33,7 +33,12 @@ import type { TProviderUsageSnapshot } from "@openllm/schema";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
 import { logError, logInfo } from "../logger";
-import { hasSetupToken, loadSetupToken, setSetupToken } from "../setup-token";
+import {
+  hasSetupToken,
+  loadSetupToken,
+  SETUP_TOKEN_RE,
+  setSetupToken,
+} from "../setup-token";
 import type { TProviderDelegate } from "./types";
 import {
   cliVersion,
@@ -267,9 +272,9 @@ const authStatusLoggedIn = async (): Promise<boolean | null> => {
  * residual ANSI, and match the base64url token body (`[A-Za-z0-9_-]`, NOT `.`,
  * so a trailing sentence can't bleed in). A redacted diagnostic is logged so a
  * future "grabbed extra text" report can be pinned from `~/.openllm/openllmd.log`.
+ * The token matcher is the SHARED `SETUP_TOKEN_RE` from `../setup-token`, so
+ * capture, storage, and reload never disagree on what a valid token is.
  */
-const SETUP_TOKEN_RE = /sk-ant-oat01-[A-Za-z0-9_-]+/;
-
 const captureSetupToken = async (): Promise<
   { token: string } | { error: string }
 > => {

@@ -147,7 +147,10 @@ export const chatgptDelegate: TProviderDelegate = {
     const proc = Bun.spawn([bin(), "login", "--device-auth"], {
       stdin: "ignore",
       stdout: "pipe",
-      stderr: "pipe",
+      // The process stays alive polling for the whole login; only stdout is
+      // read (for the device prompt). Leaving stderr piped + undrained could
+      // fill its pipe and stall the child, so discard it.
+      stderr: "ignore",
       env: { ...process.env, ...env() },
     });
     deviceProcs.add(proc);

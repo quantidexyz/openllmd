@@ -47,13 +47,21 @@ const write = (
   message: string,
   meta?: Record<string, unknown>,
 ): void => {
-  const line = `${JSON.stringify({
-    ts: new Date().toISOString(),
-    level,
-    scope,
-    message,
-    ...(meta !== undefined ? { meta } : {}),
-  })}\n`;
+  let line: string;
+  try {
+    // Serialize INSIDE the guard: a circular / BigInt `meta` would otherwise
+    // throw here and escape the logger despite its "never throws" contract.
+    line = `${JSON.stringify({
+      ts: new Date().toISOString(),
+      level,
+      scope,
+      message,
+      ...(meta !== undefined ? { meta } : {}),
+    })}\n`;
+  } catch {
+    // Unserializable meta — drop it rather than throw; keep the message.
+    line = `${JSON.stringify({ ts: new Date().toISOString(), level, scope, message })}\n`;
+  }
   try {
     mkdirSync(stateDir(), { recursive: true });
     rotateIfBig(logFile());
