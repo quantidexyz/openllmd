@@ -32,7 +32,7 @@ import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllm/schema";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
-import { hasSetupToken, loadSetupToken } from "../setup-token";
+import { hasSetupToken, loadSetupToken, setSetupToken } from "../setup-token";
 import type { TProviderDelegate } from "./types";
 import {
   cliVersion,
@@ -266,6 +266,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
         cli_installed: installed,
         ...(version !== null ? { cli_version: version } : {}),
         detail: "connected via setup token",
+        auth_mode: "setup_token",
         last_login_at_ms: null,
       };
     }
@@ -292,7 +293,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
       cli_installed: true,
       ...(version !== null ? { cli_version: version } : {}),
       ...(connected
-        ? { last_login_at_ms: null }
+        ? { auth_mode: "login" as const, last_login_at_ms: null }
         : { detail: "claude CLI installed but not signed in" }),
     };
   },
@@ -343,6 +344,39 @@ export const claudeCodeDelegate: TProviderDelegate = {
           ? result.output.slice(0, 300)
           : `claude auth login exited ${result.code} without a stored credential`,
     };
+  },
+
+  // ⚠️ RESEARCH: `claude setup-token`'s exact stdout shape isn't validated
+  // against a live login. We match the `sk-ant-oat01-` token ANYWHERE in the
+  // combined output, which is robust to surrounding prose across versions.
+  // Confirm hands-on.
+  connectSetupToken: async () => {
+    if (!(await cliInstallState(PROVIDER)).installed) {
+      return {
+        connected: false,
+        detail: "Install the Claude Code CLI from the Providers tab first.",
+      };
+    }
+    // macOS: `setup-token` is still an OAuth login, so the isolated keychain
+    // must exist (it may write session state alongside printing the token).
+    await ensureIsolatedKeychain(cliHome(PROVIDER));
+    // `claude setup-token` opens the browser (the daemon's machine — this
+    // machine, or loopback-forwarded for a remote box) and PRINTS a
+    // long-lived `sk-ant-oat01-` token. Blocks until it exits; we capture
+    // the token and store it on the box. It never crosses the cloud.
+    const result = await spawnLogin([bin(), "setup-token"], env());
+    const match = result.output.match(/sk-ant-oat01-[A-Za-z0-9._-]+/);
+    if (match === null) {
+      return {
+        connected: false,
+        detail:
+          result.output.length > 0
+            ? result.output.slice(0, 300)
+            : `claude setup-token exited ${result.code} without a token`,
+      };
+    }
+    setSetupToken(PROVIDER, match[0]);
+    return { connected: true, detail: "setup token saved" };
   },
 
   usage: async (): Promise<TProviderUsageSnapshot> => {

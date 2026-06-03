@@ -70,6 +70,26 @@ const runCommand = async (cmd: TDaemonCommand): Promise<TDaemonCommandAck> => {
         const r = await installCli(payload.slug as TCliProvider);
         return { id: cmd.id, status: "done", result: r };
       }
+      case "connect_setup_token": {
+        // Obtain a setup-token via the provider's own flow (Claude only) —
+        // the daemon runs `claude setup-token`, captures the printed token,
+        // and stores it on the box. Same control-surface path as `connect`.
+        const delegate =
+          payload.slug !== undefined ? getDelegate(payload.slug) : null;
+        if (delegate?.connectSetupToken === undefined) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: "setup token not supported for this provider" },
+          };
+        }
+        const r = await delegate.connectSetupToken();
+        return {
+          id: cmd.id,
+          status: r.connected || r.pending === true ? "done" : "error",
+          result: r,
+        };
+      }
       case "logout": {
         // Sign out of a subscription provider's CLI-LOGIN credential on this
         // daemon (per-key: the cloud delivered this only to the target key).

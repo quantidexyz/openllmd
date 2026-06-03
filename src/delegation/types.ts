@@ -34,6 +34,20 @@ export type TProviderDelegate = {
   }>;
 
   /**
+   * Obtain a long-lived SETUP-TOKEN via the official CLI's own flow (Claude
+   * Code only: `claude setup-token` — a browser login that mints a portable
+   * `sk-ant-oat01-` token), then store it on the box. Same shape + browser
+   * mechanics as `connect` (loopback-forwarded for a remote box); the token
+   * is captured locally and never crosses the cloud. Absent on providers
+   * without a setup-token flow (chatgpt/kimi use device-code).
+   */
+  connectSetupToken?: () => Promise<{
+    connected: boolean;
+    detail?: string;
+    pending?: boolean;
+  }>;
+
+  /**
    * Read this provider's usage locally using the official CLI's own
    * credential + identity. Metadata only.
    */
