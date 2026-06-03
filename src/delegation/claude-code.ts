@@ -31,6 +31,7 @@ import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllm/schema";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
+import { hasSetupToken, loadSetupToken } from "../setup-token";
 import type { TProviderDelegate } from "./types";
 import {
   cliVersion,
@@ -167,6 +168,15 @@ const readToken = async (): Promise<{
   accessToken: string;
   expiresAtMs: number | null;
 } | null> => {
+  // On-box setup-token (sk-ant-oat01-) wins: a long-lived Pro/Max
+  // subscription credential the user delivered to this box (env /
+  // `set-token`). It carries no refresh token, so there's nothing to
+  // self-refresh — used verbatim until it expires (the user re-sets it).
+  // This path needs NO isolated `claude` CLI install or `auth login`.
+  const setupToken = loadSetupToken(PROVIDER);
+  if (setupToken !== null) {
+    return { accessToken: setupToken, expiresAtMs: null };
+  }
   const store = await loadStore();
   const oauth = store?.claudeAiOauth;
   if (oauth?.accessToken === undefined || oauth.accessToken.length === 0) {
@@ -246,6 +256,18 @@ export const claudeCodeDelegate: TProviderDelegate = {
 
   status: async () => {
     const { installed, version } = await cliInstallState(PROVIDER);
+    // Setup-token mode: connected via the on-box subscription token,
+    // independent of any isolated CLI install / `auth login`.
+    if (hasSetupToken(PROVIDER)) {
+      return {
+        provider: PROVIDER,
+        connected: true,
+        cli_installed: installed,
+        ...(version !== null ? { cli_version: version } : {}),
+        detail: "connected via setup token",
+        last_login_at_ms: null,
+      };
+    }
     if (!installed) {
       return {
         provider: PROVIDER,
@@ -275,6 +297,11 @@ export const claudeCodeDelegate: TProviderDelegate = {
   },
 
   connect: async () => {
+    // Already authenticated via an on-box setup token — there's no browser
+    // login to run; the dashboard surfaces token instructions, not Connect.
+    if (hasSetupToken(PROVIDER)) {
+      return { connected: true, detail: "connected via setup token" };
+    }
     if (!(await cliInstallState(PROVIDER)).installed) {
       return {
         connected: false,

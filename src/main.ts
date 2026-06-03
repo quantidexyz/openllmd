@@ -22,6 +22,7 @@ import { getCloudState, refreshBootstrap } from "./config";
 import { reportControlInactive, startControlRelay } from "./control-relay";
 import { isDevMode } from "./env";
 import { handleInference } from "./listener";
+import { setSetupToken } from "./setup-token";
 import { DAEMON_VERSION } from "./version";
 
 const DEFAULT_PORT = 8787;
@@ -134,4 +135,34 @@ const main = async (): Promise<void> => {
   );
 };
 
-void main();
+/**
+ * `openllmd set-token <provider> <sk-ant-oat01-…>` — persist an on-box
+ * subscription setup-token for a delegate (Claude Code today), then exit.
+ * The on-box delivery path (docs/proposals/daemon-auth-loopback-forwarding.md
+ * §7.4 b): the user mints the token in their own browser (`claude
+ * setup-token`) and sets it here — it never transits the cloud. Run with an
+ * empty/absent token to clear it. `argv` is scanned (not indexed) so it works
+ * both from source (`bun src/main.ts set-token …`) and the compiled binary.
+ */
+const runSetTokenSubcommand = (): boolean => {
+  const i = process.argv.indexOf("set-token");
+  if (i === -1) return false;
+  const provider = process.argv[i + 1];
+  const token = process.argv[i + 2] ?? null;
+  if (provider === undefined || provider.length === 0) {
+    process.stderr.write("usage: openllmd set-token <provider> <token>\n");
+    process.exit(2);
+  }
+  if (!setSetupToken(provider, token)) {
+    process.stderr.write(
+      "refused: that doesn't look like a setup token (expected sk-ant-oat01-…)\n",
+    );
+    process.exit(1);
+  }
+  process.stdout.write(
+    `setup token ${token !== null && token.length > 0 ? "saved" : "cleared"} for ${provider}\n`,
+  );
+  process.exit(0);
+};
+
+if (!runSetTokenSubcommand()) void main();
