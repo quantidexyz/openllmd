@@ -37,6 +37,12 @@ import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllm/schema";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
+import {
+  clearPendingAuth,
+  getPendingAuth,
+  pendingAuthDetail,
+  setPendingAuth,
+} from "../pending-auth";
 import type { TProviderDelegate } from "./types";
 import { cliVersion, readJsonFile } from "./util";
 
@@ -376,6 +382,7 @@ const startBackgroundLogin = (
         const res = await pollToken(auth.deviceCode, headers);
         if (res.kind === "success") {
           writeCredential(res.wire);
+          clearPendingAuth(PROVIDER);
           return;
         }
         if (res.kind === "stop") return;
@@ -501,6 +508,8 @@ export const kimiCodeDelegate: TProviderDelegate = {
   status: async () => {
     const { installed, version } = await cliInstallState(PROVIDER);
     const token = installed ? await readToken() : null;
+    if (token !== null) clearPendingAuth(PROVIDER);
+    const pending = token === null ? getPendingAuth(PROVIDER) : null;
     return {
       provider: PROVIDER,
       connected: token !== null,
@@ -508,9 +517,12 @@ export const kimiCodeDelegate: TProviderDelegate = {
       ...(version !== null ? { cli_version: version } : {}),
       ...(token === null
         ? {
-            detail: installed
-              ? "kimi CLI installed but not signed in"
-              : "kimi CLI not installed",
+            detail:
+              pending !== null
+                ? pendingAuthDetail(pending)
+                : installed
+                  ? "kimi CLI installed but not signed in"
+                  : "kimi CLI not installed",
           }
         : { last_login_at_ms: null }),
     };
@@ -547,6 +559,14 @@ export const kimiCodeDelegate: TProviderDelegate = {
           "Couldn't start Kimi sign-in (device authorization failed). Check your connection and retry.",
       };
     }
+    // Surface the URL + code to the dashboard (the daemon may be on a
+    // different machine than the user's browser — for a remote box `openUrl`
+    // opens nothing useful, but the dashboard shows these so the user
+    // authorizes from THEIR machine). Cleared when the credential lands.
+    setPendingAuth(PROVIDER, {
+      url: auth.verificationUriComplete,
+      code: auth.userCode,
+    });
     openUrl(auth.verificationUriComplete);
     startBackgroundLogin(auth, headers);
     return {

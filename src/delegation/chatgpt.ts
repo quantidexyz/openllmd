@@ -22,6 +22,12 @@ import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllm/schema";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
+import {
+  clearPendingAuth,
+  getPendingAuth,
+  pendingAuthDetail,
+  setPendingAuth,
+} from "../pending-auth";
 import type { TProviderDelegate } from "./types";
 import { cliVersion, readJsonFile, runCapture, spawnLogin } from "./util";
 
@@ -30,6 +36,32 @@ const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 
 const bin = (): string => cliBin(PROVIDER);
 const env = (): Record<string, string> => cliEnv(PROVIDER);
+
+// Keep spawned device-auth processes referenced so they aren't GC'd while
+// they poll in the background (they exit on success / expiry).
+const deviceProcs = new Set<ReturnType<typeof Bun.spawn>>();
+
+// Built via RegExp so the literal ESC control char is not in a regex literal.
+const ANSI_RE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
+
+/**
+ * Parse the verification URL + one-time code from `codex login --device-auth`
+ * stdout. ⚠️ RESEARCH: format inferred from ref/codex
+ * `login/src/device_code_auth.rs` (an ANSI-wrapped prompt — a `…/codex/device`
+ * URL line, then a "one-time code" line). Matched leniently; confirm live.
+ */
+const parseDevicePrompt = (
+  raw: string,
+): { url: string; code: string } | null => {
+  const clean = raw.replace(ANSI_RE, "");
+  const url =
+    clean.match(/https?:\/\/\S+\/codex\/device\b/)?.[0] ??
+    clean.match(/https?:\/\/\S+/)?.[0];
+  const code = clean.match(
+    /one-time code[^\n]*\n\s*([A-Z0-9][A-Z0-9-]{3,})/i,
+  )?.[1];
+  return url !== undefined && code !== undefined ? { url, code } : null;
+};
 
 type TCodexStore = {
   readonly tokens?: {
@@ -72,6 +104,8 @@ export const chatgptDelegate: TProviderDelegate = {
   status: async () => {
     const { installed, version } = await cliInstallState(PROVIDER);
     const token = installed ? await readToken() : null;
+    if (token !== null) clearPendingAuth(PROVIDER);
+    const pending = token === null ? getPendingAuth(PROVIDER) : null;
     return {
       provider: PROVIDER,
       connected: token !== null,
@@ -79,11 +113,91 @@ export const chatgptDelegate: TProviderDelegate = {
       ...(version !== null ? { cli_version: version } : {}),
       ...(token === null
         ? {
-            detail: installed
-              ? "codex CLI installed but not signed in"
-              : "codex CLI not installed",
+            detail:
+              pending !== null
+                ? pendingAuthDetail(pending)
+                : installed
+                  ? "codex CLI installed but not signed in"
+                  : "codex CLI not installed",
           }
         : { last_login_at_ms: null }),
+    };
+  },
+
+  // Device-code login for a REMOTE/headless box: the daemon runs `codex login
+  // --device-auth`, captures the verification URL + one-time code, and
+  // surfaces them (pending-auth → status) so the user authorizes in THEIR
+  // browser. The spawned process keeps polling and writes auth.json on
+  // success; the status watcher flips the card. ⚠️ RESEARCH: device-auth
+  // stdout shape unverified against a live login.
+  connectDeviceCode: async () => {
+    if (!(await cliInstallState(PROVIDER)).installed) {
+      return {
+        connected: false,
+        detail: "Install the Codex CLI from the Providers tab first.",
+      };
+    }
+    if ((await readToken()) !== null) {
+      clearPendingAuth(PROVIDER);
+      return { connected: true, detail: "signed in via Codex" };
+    }
+    const proc = Bun.spawn([bin(), "login", "--device-auth"], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, ...env() },
+    });
+    deviceProcs.add(proc);
+    void proc.exited.finally(() => deviceProcs.delete(proc));
+
+    // One reader loop: resolves the moment the device prompt appears, then
+    // keeps draining stdout for the process's lifetime so a full pipe can't
+    // block codex's background polling.
+    const found = await new Promise<{ url: string; code: string } | null>(
+      (resolve) => {
+        let settled = false;
+        const settle = (v: { url: string; code: string } | null): void => {
+          if (!settled) {
+            settled = true;
+            resolve(v);
+          }
+        };
+        const timer = setTimeout(() => settle(null), 30_000);
+        void (async () => {
+          const decoder = new TextDecoder();
+          let buf = "";
+          try {
+            const reader = proc.stdout.getReader();
+            for (;;) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              buf += decoder.decode(value, { stream: true });
+              const p = parseDevicePrompt(buf);
+              if (p !== null) settle(p);
+            }
+          } catch {
+            /* ignore — settle(null) in finally */
+          } finally {
+            clearTimeout(timer);
+            settle(null);
+          }
+        })();
+      },
+    );
+
+    if (found === null) {
+      proc.kill();
+      return {
+        connected: false,
+        detail:
+          "Couldn't start Codex device sign-in. Retry, or run `codex login --device-auth` on the box.",
+      };
+    }
+    setPendingAuth(PROVIDER, found);
+    return {
+      connected: false,
+      pending: true,
+      detail: pendingAuthDetail(found),
     };
   },
 

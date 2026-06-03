@@ -70,6 +70,28 @@ const runCommand = async (cmd: TDaemonCommand): Promise<TDaemonCommandAck> => {
         const r = await installCli(payload.slug as TCliProvider);
         return { id: cmd.id, status: "done", result: r };
       }
+      case "connect_device_code": {
+        // Start a device-code login (codex remote; kimi falls back to its
+        // normal device-code `connect`). Surfaces the URL+code via status.
+        const delegate =
+          payload.slug !== undefined ? getDelegate(payload.slug) : null;
+        if (delegate === null) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: "unknown provider" },
+          };
+        }
+        const r =
+          delegate.connectDeviceCode !== undefined
+            ? await delegate.connectDeviceCode()
+            : await delegate.connect();
+        return {
+          id: cmd.id,
+          status: r.connected || r.pending === true ? "done" : "error",
+          result: r,
+        };
+      }
       case "connect_setup_token": {
         // Obtain a setup-token via the provider's own flow (Claude only) —
         // the daemon runs `claude setup-token`, captures the printed token,

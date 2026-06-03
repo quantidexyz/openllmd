@@ -48,6 +48,19 @@ export type TProviderDelegate = {
   }>;
 
   /**
+   * Device-code login for a REMOTE/headless box (codex; kimi uses its only
+   * login which is already device-code): start the vendor's device flow,
+   * surface the verification URL + one-time code (via pending-auth → status)
+   * so the user authorizes in THEIR browser, and let it complete in the
+   * background. Absent on providers without a device-code flow.
+   */
+  connectDeviceCode?: () => Promise<{
+    connected: boolean;
+    detail?: string;
+    pending?: boolean;
+  }>;
+
+  /**
    * Read this provider's usage locally using the official CLI's own
    * credential + identity. Metadata only.
    */
