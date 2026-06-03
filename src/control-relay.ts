@@ -28,9 +28,14 @@ import {
 import { latestVersion, refreshBootstrap } from "./config";
 import { getDelegate } from "./delegation";
 import { hasApiKey } from "./env";
-import { clearInstalling, setInstalling } from "./installing-state";
+import {
+  anyInstalling,
+  clearInstalling,
+  setInstalling,
+} from "./installing-state";
 import { openSealed, sealTo } from "./keypair";
 import { logError } from "./logger";
+import { hasPendingAuth } from "./pending-auth";
 import { maybeSelfUpdate } from "./self-update";
 import { setSetupToken } from "./setup-token";
 import { computeStatus } from "./status";
@@ -283,6 +288,79 @@ const runCommandInner = async (
   }
 };
 
+// ─── Change-detected status push + flow-gated watcher ───────────────────
+//
+// The relay only pushes a status snapshot after running a command (and on a
+// `cloud_state` change, from main.ts). But a provider's state can change with
+// NO command in flight — most visibly a device-code login: the spawned vendor
+// process keeps polling and writes its credential in the BACKGROUND, so
+// `connected` flips on the box but never reaches the cloud until the next
+// command (which is why the card used to sit on "connecting" until a manual
+// Refresh). We close that gap with a change-detected push driven by a watcher
+// that runs ONLY while a background flow is in flight. See
+// `docs/proposals/daemon-browser-status-sync.md` §2.
+
+// Fingerprint of the last snapshot we pushed — every push site updates it so
+// the watcher never re-sends an unchanged snapshot.
+let lastFingerprint: string | null = null;
+
+/**
+ * Recompute the status snapshot and push it ONLY if it changed since the last
+ * push. The de-dupe makes it safe to call on a timer. No-op when keyless.
+ */
+export const pushStatusIfChanged = async (): Promise<void> => {
+  if (!hasApiKey()) return;
+  const status = await computeStatus();
+  // Fingerprint = JSON of the snapshot. `computeStatus()` builds the object
+  // with a fixed key order (status.ts), and V8 (Node/Bun) preserves insertion
+  // order, so JSON.stringify is a stable identity here — equal snapshots
+  // stringify equally and we skip the redundant push. If computeStatus ever
+  // becomes non-deterministic in key order, this would need a canonical
+  // serialize; the only downside today is a spurious push (the cloud just
+  // re-stores the same status), and a failed push resets the fp so we retry.
+  const fp = JSON.stringify(status);
+  if (fp === lastFingerprint) return;
+  lastFingerprint = fp;
+  try {
+    await reportStatus({ active: true, status });
+  } catch {
+    // Failed to push — forget the fingerprint so the next tick retries.
+    lastFingerprint = null;
+  }
+};
+
+// "A background flow that can complete WITHOUT a further command is running":
+// a provider awaiting device-code authorization, or a CLI install in progress.
+// While true, the watcher ticks; once false it stands down (zero steady-state
+// cost on an idle daemon).
+const aFlowIsInFlight = (): boolean => hasPendingAuth() || anyInstalling();
+
+// Cheap enough to tick while a flow is live; the change-detection in
+// `pushStatusIfChanged` means at most one push per actual change.
+const WATCH_MS = 2_500;
+let watcher: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Arm the status-change watcher if a background flow is in flight (idempotent).
+ * It pushes on every snapshot change and disarms itself once nothing is
+ * pending — so a device-code login completing in the background flips the card
+ * within ~{@link WATCH_MS}, with no manual refresh.
+ */
+export const armStatusWatcher = (): void => {
+  if (watcher !== null || !aFlowIsInFlight()) return;
+  watcher = setInterval(() => {
+    void (async () => {
+      // Push the final state BEFORE disarming, so the completing flow's
+      // terminal snapshot (connected / expired) is always delivered.
+      await pushStatusIfChanged();
+      if (!aFlowIsInFlight() && watcher !== null) {
+        clearInterval(watcher);
+        watcher = null;
+      }
+    })();
+  }, WATCH_MS);
+};
+
 let running = false;
 
 /**
@@ -309,7 +387,9 @@ const loop = async (): Promise<void> => {
     }
     try {
       if (!pushedInitial) {
-        await reportStatus({ active: true, status: await computeStatus() });
+        const status = await computeStatus();
+        lastFingerprint = JSON.stringify(status);
+        await reportStatus({ active: true, status });
         pushedInitial = true;
       }
       const { commands } = await pollControl(
@@ -318,14 +398,20 @@ const loop = async (): Promise<void> => {
       if (commands.length > 0) {
         const acks: TDaemonCommandAck[] = [];
         for (const cmd of commands) acks.push(await runCommand(cmd));
-        await reportStatus({
-          active: true,
-          status: await computeStatus(),
-          acks,
-        });
+        const status = await computeStatus();
+        lastFingerprint = JSON.stringify(status);
+        await reportStatus({ active: true, status, acks });
+        // A command may have STARTED a background flow that finishes with no
+        // further command (device-code awaiting auth, a CLI install) — arm the
+        // change-detected watcher so its completion is pushed automatically.
+        armStatusWatcher();
+      } else {
+        // Empty batch = the poll's hold elapsed (the poll itself refreshed
+        // presence cloud-side). Catch any out-of-band drift since the last push
+        // (a credential changed in the user's own terminal, a token expiry)
+        // with a change-detected push before re-dialing.
+        await pushStatusIfChanged();
       }
-      // Empty batch = the poll's hold elapsed; immediately re-dial (the poll
-      // itself refreshed presence cloud-side).
       lastLoopError = ""; // a clean pass — let the next failure log afresh.
     } catch (err) {
       // Invalid/absent key or an unreachable/stalled cloud — back off, then
@@ -360,7 +446,9 @@ const loop = async (): Promise<void> => {
 export const pushStatus = async (): Promise<void> => {
   if (!hasApiKey()) return;
   try {
-    await reportStatus({ active: true, status: await computeStatus() });
+    const status = await computeStatus();
+    lastFingerprint = JSON.stringify(status);
+    await reportStatus({ active: true, status });
   } catch {
     // best-effort — the relay loop re-pushes on its next command anyway
   }

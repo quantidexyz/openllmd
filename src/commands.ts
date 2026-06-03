@@ -21,6 +21,11 @@ export const COMMANDS: readonly TCommand[] = [
   { name: "status", description: "Show service registration and run status" },
   { name: "restart", description: "Stop then start the daemon" },
   {
+    name: "uninstall",
+    args: "[--yes]",
+    description: "Remove the daemon and ALL state (credentials, service)",
+  },
+  {
     name: "set-token",
     args: "<provider> <token>",
     description: "Store a subscription setup-token (omit token to clear)",

@@ -31,6 +31,11 @@ export const clearPendingAuth = (slug: string): void => {
   pending.delete(slug);
 };
 
+/** Any provider awaiting device-code authorization — gates the status-change
+ *  watcher so a background login completing flips the card without a manual
+ *  refresh. See `docs/proposals/daemon-browser-status-sync.md` §2.2. */
+export const hasPendingAuth = (): boolean => pending.size > 0;
+
 /** A human-facing one-liner for the dashboard `detail` while a code is live. */
 export const pendingAuthDetail = (auth: TPendingAuth): string =>
   `Open ${auth.url} in your browser and enter the code ${auth.code} to authorize. This updates automatically once you're done.`;

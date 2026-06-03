@@ -52,9 +52,10 @@ daemon/
   scripts/install-local.ts  build host binary + install locally (no release)
   src/
     main.ts                 boot: runCli() dispatch, else refresh bootstrap → Bun.serve(127.0.0.1)
-    cli.ts                  `openllmd <cmd>` dispatch (start/stop/status/restart/set-token/completion/help)
-    service.ts              self-managed launch agent / systemd unit (start = self-restore; stop = disable)
-    completion.ts           bash/zsh/fish shell completion (emit + `completion install`)
+    cli.ts                  `openllmd <cmd>` dispatch (start/stop/status/restart/uninstall/set-token/completion/help)
+    service.ts              self-managed launch agent / systemd unit (start = self-restore; stop = disable; serviceUninstall = stop + delete registration)
+    uninstall.ts            `openllmd uninstall` — confirm → stop+unregister → strip completion + owned PATH symlink → delete all state (credentials)
+    completion.ts           bash/zsh/fish shell completion (emit + `completion install` / `uninstallCompletion`)
     harden-binary.ts        macOS dequarantine + ad-hoc sign (shared by service + self-update)
     listener.ts             /v1/* inference: parse → validate → runWalker (the only path)
     walker.ts               coreless §3.3 plan-walker — the daemon's sole data path; @openllm/core-free
@@ -329,10 +330,16 @@ linger) in **full self-restore mode** and (re)starts it; `stop` stops it
 AND disables all self-restore (launchd `bootout`+`disable`, systemd
 `disable --now`) so it stays down until the next `start`. The service runs
 `process.execPath`, so a from-source run (`0.0.0-dev`) is refused — only the
-compiled binary registers. `openllmd completion <bash|zsh|fish|install>`
-emits/installs shell completion for every subcommand. The CLI surface is
-defined once in `src/commands.ts` (consumed by both `cli.ts`'s help and
-`completion.ts`). See
+compiled binary registers. `openllmd uninstall [--yes]` is the full inverse
+of install (`src/uninstall.ts`): after a typed-`yes` confirmation (warning it
+deletes credentials), it stops + **unregisters** the service (deletes the
+plist / unit, not just `stop`'s disable), strips shell completion, removes the
+owned `PATH` symlink, and deletes the entire state dir — leaving the machine
+clean. It only ever removes a symlink resolving to our own `bin/openllmd` and
+files under the state dir, never an unrelated `openllmd`. `openllmd completion
+<bash|zsh|fish|install>` emits/installs shell completion for every subcommand.
+The CLI surface is defined once in `src/commands.ts` (consumed by both
+`cli.ts`'s help and `completion.ts`). See
 [`daemon-self-managing-cli.md`](../../docs/proposals/daemon-self-managing-cli.md).
 
 **Local install without a release.** `scripts/install-local.ts` (run via

@@ -22,7 +22,7 @@
  * refused; use the compiled binary (`bun run daemon:install`).
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { daemonEnv, stateDir } from "./env";
@@ -254,6 +254,28 @@ export const serviceStop = (): void => {
 export const serviceRestart = (): void => {
   serviceStop();
   serviceStart();
+};
+
+/**
+ * Stop the service AND remove its registration entirely (full uninstall) —
+ * stronger than `stop`, which only disables self-restore but leaves the launch
+ * agent / systemd unit file on disk. Stops the running daemon + any self-restore
+ * first (so nothing relaunches mid-removal), then deletes the plist / unit file
+ * and reloads the user manager on Linux. Returns the path it removed, or null if
+ * no registration was present. Best-effort + idempotent. Used by
+ * `openllmd uninstall`.
+ */
+export const serviceUninstall = (): string | null => {
+  // 1. Stop + disable self-restore so nothing respawns while we tear down.
+  if (isMac) stopMac();
+  else stopLinux();
+  // 2. Remove the registration file itself.
+  const path = isMac ? plistPath() : unitPath();
+  const existed = existsSync(path);
+  rmSync(path, { force: true });
+  // Linux: drop the removed unit from the in-memory view so it's fully gone.
+  if (!isMac && existed) tryRun("systemctl", ["--user", "daemon-reload"]);
+  return existed ? path : null;
 };
 
 /** Print the service's registration + run state. */

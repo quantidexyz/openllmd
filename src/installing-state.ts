@@ -22,3 +22,6 @@ export const clearInstalling = (slug: string): void => {
 };
 
 export const isInstalling = (slug: string): boolean => installing.has(slug);
+
+/** Any provider currently installing — gates the status-change watcher. */
+export const anyInstalling = (): boolean => installing.size > 0;

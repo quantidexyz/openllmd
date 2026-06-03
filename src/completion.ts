@@ -11,8 +11,10 @@
  */
 import {
   appendFileSync,
+  existsSync,
   mkdirSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -101,6 +103,11 @@ export const completionScript = (shell: TCompletionShell): string => {
 const isShell = (v: string): v is TCompletionShell =>
   (COMPLETION_SHELLS as readonly string[]).includes(v);
 
+/** The fish completions file `install`/`uninstall` write + remove. Single
+ *  source so the two paths can't drift. */
+const fishCompletionPath = (): string =>
+  join(homedir(), ".config", "fish", "completions", "openllmd.fish");
+
 /** The current login shell name from `$SHELL`, or null if not recognized. */
 const detectShell = (): TCompletionShell | null => {
   const sh = basename(process.env.SHELL ?? "");
@@ -129,13 +136,7 @@ export const installCompletion = (): string | null => {
   const shell = detectShell();
   if (shell === null) return null;
   if (shell === "fish") {
-    const file = join(
-      homedir(),
-      ".config",
-      "fish",
-      "completions",
-      "openllmd.fish",
-    );
+    const file = fishCompletionPath();
     mkdirSync(dirname(file), { recursive: true });
     writeFileSync(file, fishScript());
     return file;
@@ -148,6 +149,52 @@ export const installCompletion = (): string | null => {
     marker,
   );
   return rc;
+};
+
+// The trailing comment installCompletion stamps on the rc line — the stable,
+// unique marker we strip on uninstall (the line text itself derives from the
+// shell, so match on this).
+const RC_MARKER = "# openllmd-completion";
+
+/**
+ * Remove everything {@link installCompletion} may have written: the sourced
+ * line from BOTH `~/.zshrc` and `~/.bashrc` (the login shell may have changed
+ * since install, so clean both) and the fish completions file. Best-effort +
+ * idempotent. Returns the files it actually changed/removed (for reporting).
+ * Used by `openllmd uninstall`.
+ */
+export const uninstallCompletion = (): string[] => {
+  const touched: string[] = [];
+  for (const name of [".zshrc", ".bashrc"]) {
+    const rc = join(homedir(), name);
+    let text: string;
+    try {
+      text = readFileSync(rc, "utf-8");
+    } catch {
+      continue; // rc doesn't exist — nothing to strip
+    }
+    if (!text.includes(RC_MARKER)) continue;
+    const cleaned = text
+      .split("\n")
+      .filter((line) => !line.includes(RC_MARKER))
+      .join("\n");
+    try {
+      writeFileSync(rc, cleaned);
+      touched.push(rc);
+    } catch {
+      // best-effort — a read-only rc shouldn't fail the whole uninstall
+    }
+  }
+  const fish = fishCompletionPath();
+  if (existsSync(fish)) {
+    try {
+      rmSync(fish, { force: true });
+      touched.push(fish);
+    } catch {
+      // best-effort
+    }
+  }
+  return touched;
 };
 
 /**

@@ -12,6 +12,7 @@
  *   openllmd stop                 stop + disable self-restore
  *   openllmd status               show service + run status
  *   openllmd restart              stop then start
+ *   openllmd uninstall [--yes]    remove the daemon + ALL state (credentials)
  *   openllmd set-token <p> <tok>  store a subscription setup-token
  *   openllmd completion <shell>   emit / install shell completion
  *   openllmd -h | --help          show help
@@ -26,6 +27,7 @@ import {
   serviceStop,
 } from "./service";
 import { setSetupToken } from "./setup-token";
+import { runUninstall } from "./uninstall";
 import { DAEMON_VERSION } from "./version";
 
 const COL = 36;
@@ -110,6 +112,9 @@ export const runCli = (): boolean => {
       break;
     case "set-token":
       runSetToken(rest);
+      break;
+    case "uninstall":
+      runUninstall(rest);
       break;
     case "completion":
       runCompletion(rest);
