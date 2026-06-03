@@ -22,6 +22,7 @@ import { getCloudState, refreshBootstrap } from "./config";
 import { reportControlInactive, startControlRelay } from "./control-relay";
 import { isDevMode } from "./env";
 import { handleInference } from "./listener";
+import { logError, logInfo } from "./logger";
 import { setSetupToken } from "./setup-token";
 import { DAEMON_VERSION } from "./version";
 
@@ -44,6 +45,14 @@ const readPort = (): number => {
 
 const main = async (): Promise<void> => {
   const port = readPort();
+
+  // Last-resort crash logging. The daemon is headless under launchd/systemd,
+  // so an uncaught throw or rejected promise would otherwise die silently —
+  // capture it to `~/.openllm/openllmd.log` before the process goes down.
+  process.on("uncaughtException", (err) => logError("uncaughtException", err));
+  process.on("unhandledRejection", (reason) =>
+    logError("unhandledRejection", reason),
+  );
 
   // Pull the catalog + routing config. This NEVER throws — when there's
   // no API key yet (the daemon installs keyless; the dashboard sets the
@@ -104,6 +113,7 @@ const main = async (): Promise<void> => {
         try {
           res = await handleInference(req);
         } catch (err) {
+          logError("inference", err, { path: url.pathname });
           res = new Response(
             JSON.stringify({
               error: {
@@ -133,6 +143,7 @@ const main = async (): Promise<void> => {
   process.stdout.write(
     `openllmd v${DAEMON_VERSION}${isDevMode() ? " (dev)" : ""} listening on http://127.0.0.1:${port}\n`,
   );
+  logInfo("boot", `openllmd v${DAEMON_VERSION} listening on :${port}`);
 };
 
 /**

@@ -13,9 +13,13 @@ export const DAEMON_RELEASE: TDaemonRelease = {
   tag: "v1.3.0-alpha.0",
   targets: ["darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64"],
   sha256: {
-    "darwin-arm64": "1f0481426e057f360924edb9792a814c1fa4e796ab54fd93a30de70106c804b5",
-    "darwin-x64": "4e99764988511d76831f657e72e67a570e5d8745427592c5b2fc7dd3b69979e6",
-    "linux-x64": "8b770ae6f9c87af737798461187c21c9e869fb26bd06be12547fa99dc13ae3b3",
-    "linux-arm64": "bbf7c63d1ceb91d77f3c7e6e5c2b9871f77e2c5b289f85f61667f414dafe9adb",
+    "darwin-arm64":
+      "8316179092cc386c95425fa2dcbe08d095ff8151c1def30ee981b1187c16b580",
+    "darwin-x64":
+      "fea938d0fe4fd17bc8cc2af95aa979dcbd2f9aab3262eb47ad8e5810ea9fa1ad",
+    "linux-x64":
+      "c59ca1a78fe20835731ce8b1c3a2e7b53f8ebc589ccb8fc28e3ed504c0950f2b",
+    "linux-arm64":
+      "5bd234cc1d668d50a676a33316aa22031c2b0076207736f3ce82715eb8a1e110",
   },
 };

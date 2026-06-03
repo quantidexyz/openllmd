@@ -16,17 +16,25 @@ import { readFile, writeFile } from "node:fs/promises";
  * tag + checksums. Then COMMIT release.ts and deploy.
  *
  * Versioning: with no version flag the current root `package.json` version is
- * reused. `--bump <major|minor|patch|prerelease>` computes the next semver,
- * writes it back to `package.json` (so the compiled binary embeds it), and
- * tags the release with it. `--preid <id>` (default `alpha`) names a new
- * prerelease line. `--tag`/`--version` pin an explicit value (no bump/write).
+ * reused. `--bump <major|minor|patch|prerelease>` computes the next semver and
+ * writes it back to the root `package.json`. `--preid <id>` (default `alpha`)
+ * names a new prerelease line. `--tag`/`--version` pin an explicit value (no
+ * bump). Either way the resolved version is stamped into the daemon's OWN
+ * `packages/daemon/package.json` BEFORE compiling, so the binary + package
+ * both carry it.
+ *
+ * Overwrite: by default the script REFUSES to touch an already-published
+ * version (protects real releases). Pass `--overwrite` to replace it in place
+ * (clobber the same tag's assets) — the dev workflow, so trial builds reuse
+ * one version instead of flooding the releases page + git tags.
  *
  * Usage:
  *   bun packages/daemon/scripts/release.ts                 # tag = v<pkg.version>
+ *   bun packages/daemon/scripts/release.ts --overwrite     # re-release same version
  *   bun packages/daemon/scripts/release.ts --bump patch    # 1.3.1 → write + tag
  *   bun packages/daemon/scripts/release.ts --bump prerelease           # alpha.0 → alpha.1
  *   bun packages/daemon/scripts/release.ts --bump prerelease --preid beta
- *   bun packages/daemon/scripts/release.ts --tag v1.2.3    # explicit, no write
+ *   bun packages/daemon/scripts/release.ts --tag v1.2.3    # explicit version
  *   bun packages/daemon/scripts/release.ts --no-compile    # reuse existing dist
  *   bun packages/daemon/scripts/release.ts --draft
  *
@@ -47,6 +55,7 @@ const TARGETS = [
 const DIST = "packages/daemon/dist";
 const MANIFEST = "packages/daemon/release.ts";
 const ROOT_PKG = "package.json";
+const DAEMON_PKG = "packages/daemon/package.json";
 
 const BUMPS = ["major", "minor", "patch", "prerelease"] as const;
 type TBump = (typeof BUMPS)[number];
@@ -58,6 +67,11 @@ const flag = (name: string): string | undefined => {
 };
 const skipCompile = argv.includes("--no-compile");
 const draft = argv.includes("--draft");
+// Re-release an EXISTING version in place (clobber its assets) instead of
+// erroring. Dev workflow: keep overwriting one trial version rather than
+// minting a new tag + release per build (which floods the releases page and
+// piles up git tags). Real releases are protected without this flag.
+const overwrite = argv.includes("--overwrite");
 
 /** Compute the next semver from `current`. Mirrors npm-version semantics. */
 const bumpVersion = (current: string, kind: TBump, preid: string): string => {
@@ -85,14 +99,17 @@ const bumpVersion = (current: string, kind: TBump, preid: string): string => {
   }
 };
 
-/** Rewrite the root package.json `version` in place (text-preserving). */
-const setRootVersion = async (next: string): Promise<void> => {
-  const text = await readFile(ROOT_PKG, "utf-8");
-  const updated = text.replace(/("version":\s*")[^"]+(")/, `$1${next}$2`);
-  if (updated === text) {
-    throw new Error("Could not find a version field to update in package.json");
+const VERSION_RE = /("version":\s*")[^"]+(")/;
+
+/** Rewrite a package.json `version` in place (text-preserving). No-op if it's
+ *  already `next`; throws only when the file has no version field at all. */
+const setPkgVersion = async (pkgPath: string, next: string): Promise<void> => {
+  const text = await readFile(pkgPath, "utf-8");
+  if (!VERSION_RE.test(text)) {
+    throw new Error(`No version field to update in ${pkgPath}`);
   }
-  await writeFile(ROOT_PKG, updated, "utf-8");
+  const updated = text.replace(VERSION_RE, `$1${next}$2`);
+  if (updated !== text) await writeFile(pkgPath, updated, "utf-8");
 };
 
 // Resolve the target version + whether we mutate package.json.
@@ -161,10 +178,27 @@ const main = async (): Promise<void> => {
     process.exit(1);
   }
 
-  if (bumped) {
-    console.log(`Bumping version ${rootPkg.version} → ${version}`);
-    await setRootVersion(version);
+  // Refuse to clobber an existing release unless asked — and check BEFORE the
+  // (slow) compile so a duplicate-version run fails fast.
+  const exists =
+    (await $`gh release view ${tag} -R ${REPO}`.nothrow().quiet()).exitCode ===
+    0;
+  if (exists && !overwrite) {
+    console.error(
+      `Release ${tag} already exists on ${REPO}.\n` +
+        `Re-run with --overwrite to replace it in place, or bump the version (--bump …).`,
+    );
+    process.exit(1);
   }
+
+  // Stamp the version BEFORE compiling so the binary embeds it. The daemon's
+  // own package.json is always synced to the released version; the root
+  // package.json is moved too when this run bumped it.
+  if (bumped) {
+    console.log(`Bumping root version ${rootPkg.version} → ${version}`);
+    await setPkgVersion(ROOT_PKG, version);
+  }
+  await setPkgVersion(DAEMON_PKG, version);
 
   if (!skipCompile) {
     console.log(`Compiling daemon binaries for ${tag}...`);
@@ -175,12 +209,9 @@ const main = async (): Promise<void> => {
   const sha: Record<string, string> = {};
   for (const t of TARGETS) sha[t] = await sha256(`${DIST}/openllmd-${t}`);
 
-  const exists =
-    (await $`gh release view ${tag} -R ${REPO}`.nothrow().quiet()).exitCode ===
-    0;
   if (exists) {
     console.log(
-      `Release ${tag} exists on ${REPO} — uploading assets (--clobber).`,
+      `Overwriting release ${tag} on ${REPO} (clobbering assets, same tag)…`,
     );
     await $`gh release upload ${tag} ${files} -R ${REPO} --clobber`;
   } else {
@@ -190,10 +221,12 @@ const main = async (): Promise<void> => {
   }
 
   await writeFile(MANIFEST, manifestSource(sha), "utf-8");
-  const toCommit = bumped ? `${ROOT_PKG} ${MANIFEST}` : MANIFEST;
-  console.log(
-    `\nWrote ${MANIFEST}${bumped ? ` + ${ROOT_PKG}` : ""}. Commit + deploy:`,
-  );
+  // The manifest is COMMITTED, so it must pass `biome check`. Its sha256 lines
+  // exceed the line width; let biome wrap them rather than hand-matching its
+  // formatter. Best-effort — a missing biome shouldn't fail the release.
+  await $`bunx biome format --write ${MANIFEST}`.nothrow().quiet();
+  const toCommit = `${bumped ? `${ROOT_PKG} ` : ""}${DAEMON_PKG} ${MANIFEST}`;
+  console.log(`\nWrote ${MANIFEST} + ${DAEMON_PKG}. Commit + deploy:`);
   console.log(
     `  git add ${toCommit} && git commit -m "release: openllmd ${tag}"`,
   );

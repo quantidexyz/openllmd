@@ -28,6 +28,7 @@ import {
 import { getDelegate } from "./delegation";
 import { hasApiKey } from "./env";
 import { openSealed, sealTo } from "./keypair";
+import { logError } from "./logger";
 import { setSetupToken } from "./setup-token";
 import { computeStatus } from "./status";
 
@@ -43,8 +44,26 @@ const sleep = (ms: number): Promise<void> =>
  * Execute one delivered command via the existing control handlers. Returns
  * the terminal ack. Unknown kinds are acked as errors rather than thrown so
  * one bad command can't stall the batch.
+ *
+ * Every error ack is also written to the local error log — the cloud records
+ * the ack, but a user debugging on the box (e.g. a relay 404, or a sealed
+ * credential that wouldn't open) needs it in `~/.openllm/openllmd.log`.
  */
 const runCommand = async (cmd: TDaemonCommand): Promise<TDaemonCommandAck> => {
+  const ack = await runCommandInner(cmd);
+  if (ack.status === "error") {
+    const reason = (ack.result as { error?: string } | undefined)?.error;
+    logError("command", reason ?? "command failed", {
+      kind: cmd.kind,
+      id: cmd.id,
+    });
+  }
+  return ack;
+};
+
+const runCommandInner = async (
+  cmd: TDaemonCommand,
+): Promise<TDaemonCommandAck> => {
   try {
     const payload = (cmd.payload ?? {}) as {
       slug?: string;
@@ -249,6 +268,9 @@ const loop = async (): Promise<void> => {
   // Push an initial snapshot once a key is present so the dashboard has
   // state immediately, not only after the first command.
   let pushedInitial = false;
+  // Last logged loop-error message — for throttling repeated identical errors
+  // (see the catch below). Reset to "" so a recovered→failed transition logs.
+  let lastLoopError = "";
   for (;;) {
     if (!hasApiKey()) {
       await sleep(BACKOFF_MS);
@@ -273,12 +295,24 @@ const loop = async (): Promise<void> => {
       }
       // Empty batch = the poll's hold elapsed; immediately re-dial (the poll
       // itself refreshed presence cloud-side).
+      lastLoopError = ""; // a clean pass — let the next failure log afresh.
     } catch (err) {
       // Invalid/absent key or an unreachable/stalled cloud — back off, then
       // re-try. A freshly set key (or recovered network) is picked up on the
       // next iteration. Re-push the initial snapshot after a key change.
       if (err instanceof InvalidApiKeyError || err instanceof NoApiKeyError) {
         pushedInitial = false;
+      }
+      // Log, but throttle: the loop retries every BACKOFF_MS, so an ongoing
+      // outage would otherwise flood the log with the same line. Only write
+      // when the error MESSAGE changes (i.e. a real transition), and never
+      // for the benign "no key yet" state.
+      if (!(err instanceof NoApiKeyError)) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg !== lastLoopError) {
+          lastLoopError = msg;
+          logError("control-loop", err);
+        }
       }
       await sleep(BACKOFF_MS);
     }
