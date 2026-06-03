@@ -23,6 +23,10 @@ export const computeStatus = async (): Promise<TDaemonStatus> => {
       // Attach a metadata-only usage snapshot for connected providers so the
       // dashboard can show remaining quota (read locally; never a token).
       if (!conn.connected) return conn;
+      // A setup-token connection (claude_code) can't reliably query the vendor
+      // usage endpoint — it 429s — and the panel is optional, so skip it for
+      // that mode. CLI-login usage is unaffected.
+      if (conn.auth_mode === "setup_token") return conn;
       try {
         return { ...conn, usage: await d.usage() };
       } catch {
