@@ -26,6 +26,7 @@
  *     2023-06-01`, `User-Agent: claude-cli/<version>`.
  *   - Usage: GET https://api.anthropic.com/api/oauth/usage.
  */
+import { rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllm/schema";
@@ -438,5 +439,26 @@ export const claudeCodeDelegate: TProviderDelegate = {
         "user-agent": await userAgent(),
       },
     };
+  },
+
+  logout: async () => {
+    // Clear the CLI-LOGIN credential only (NOT an on-box setup-token —
+    // that's `remove_setup_token`). `claude auth logout` clears the isolated
+    // store (keychain item on macOS, .credentials.json on Linux).
+    if ((await cliInstallState(PROVIDER)).installed) {
+      await ensureIsolatedKeychain(cliHome(PROVIDER)); // macOS: reach the store
+      await runCapture([bin(), "auth", "logout"], env());
+    }
+    // Belt-and-braces on Linux: drop the credentials file if it lingers.
+    if (platform() !== "darwin") {
+      await rm(join(cliConfigDir(PROVIDER), ".credentials.json"), {
+        force: true,
+      }).catch(() => {});
+    }
+    const cleared =
+      (await loadStore())?.claudeAiOauth?.accessToken === undefined;
+    return cleared
+      ? { ok: true, detail: "signed out of Claude Code" }
+      : { ok: false, detail: "credential still present after logout" };
   },
 };

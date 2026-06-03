@@ -48,4 +48,14 @@ export type TProviderDelegate = {
     readonly access_token: string;
     readonly headers: Readonly<Record<string, string>>;
   }>;
+
+  /**
+   * Sign out of the official CLI's LOGIN credential on this box: run the
+   * vendor's own logout (revoking server-side where it supports it) and/or
+   * clear the isolated store. Does NOT touch an on-box setup-token (that's
+   * cleared separately) — they're independent credential sources. Idempotent:
+   * already-signed-out is success. Returns `ok:false` only if a credential
+   * survives the attempt.
+   */
+  logout: () => Promise<{ readonly ok: boolean; readonly detail?: string }>;
 };

@@ -17,12 +17,13 @@
  *     `ChatGPT-Account-Id: <account_id>`.
  *   - Usage: GET https://chatgpt.com/backend-api/wham/usage.
  */
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllm/schema";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
 import type { TProviderDelegate } from "./types";
-import { cliVersion, readJsonFile, spawnLogin } from "./util";
+import { cliVersion, readJsonFile, runCapture, spawnLogin } from "./util";
 
 const PROVIDER = "chatgpt" as const;
 const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
@@ -203,5 +204,20 @@ export const chatgptDelegate: TProviderDelegate = {
           : {}),
       },
     };
+  },
+
+  logout: async () => {
+    // `codex logout` revokes the token server-side; then ensure the isolated
+    // auth.json is gone regardless of CLI version.
+    if ((await cliInstallState(PROVIDER)).installed) {
+      await runCapture([bin(), "logout"], env());
+    }
+    await rm(join(cliConfigDir(PROVIDER), "auth.json"), {
+      force: true,
+    }).catch(() => {});
+    const cleared = (await readToken()) === null;
+    return cleared
+      ? { ok: true, detail: "signed out of Codex" }
+      : { ok: false, detail: "credential still present after logout" };
   },
 };

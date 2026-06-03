@@ -26,6 +26,7 @@ import {
 } from "./cloud-client";
 import { getDelegate } from "./delegation";
 import { hasApiKey } from "./env";
+import { setSetupToken } from "./setup-token";
 import { computeStatus } from "./status";
 
 // No key / unreachable / rejected → back off before re-dialing.
@@ -68,6 +69,34 @@ const runCommand = async (cmd: TDaemonCommand): Promise<TDaemonCommandAck> => {
         }
         const r = await installCli(payload.slug as TCliProvider);
         return { id: cmd.id, status: "done", result: r };
+      }
+      case "logout": {
+        // Sign out of a subscription provider's CLI-LOGIN credential on this
+        // daemon (per-key: the cloud delivered this only to the target key).
+        const delegate =
+          payload.slug !== undefined ? getDelegate(payload.slug) : null;
+        if (delegate === null) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: "unknown provider" },
+          };
+        }
+        const r = await delegate.logout();
+        return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
+      }
+      case "remove_setup_token": {
+        // Clear an on-box setup-token (Claude). Independent of `logout` —
+        // they're separate credential sources for claude_code.
+        if (payload.slug === undefined || getDelegate(payload.slug) === null) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: "unknown provider" },
+          };
+        }
+        setSetupToken(payload.slug, null);
+        return { id: cmd.id, status: "done", result: { ok: true } };
       }
       // A bare refresh: nothing to do — the status push below carries the
       // fresh snapshot back.

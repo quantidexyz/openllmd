@@ -31,6 +31,7 @@
  *   - Usage: GET https://api.kimi.com/coding/v1/usages.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { arch, hostname, release, type } from "node:os";
 import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllm/schema";
@@ -631,5 +632,15 @@ export const kimiCodeDelegate: TProviderDelegate = {
       access_token: token.accessToken,
       headers: await identityHeaders(),
     };
+  },
+
+  logout: async () => {
+    // Kimi's CLI has no spawnable logout (device-code only) — clear the
+    // isolated credential file. The device_id is kept (stable per box).
+    await rm(credentialPath(), { force: true }).catch(() => {});
+    const cleared = (await readToken()) === null;
+    return cleared
+      ? { ok: true, detail: "removed Kimi Code credential" }
+      : { ok: false, detail: "credential still present after logout" };
   },
 };
