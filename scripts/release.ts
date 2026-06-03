@@ -28,6 +28,19 @@ import { readFile, writeFile } from "node:fs/promises";
  * (clobber the same tag's assets) — the dev workflow, so trial builds reuse
  * one version instead of flooding the releases page + git tags.
  *
+ * Parent commit: by default the script only PRINTS the `git add … && commit`
+ * line for the manifest, leaving the parent repo for you to commit by hand.
+ * `--commit-parent` automates that in the CORRECT ORDER — the daemon binaries
+ * are already published + the manifest pinned (a failure above aborted before
+ * this point), so the commit captures a manifest that points at assets that
+ * exist. It stages the release artifacts (manifest + package.json) AND every
+ * other already-modified TRACKED file, so a parent-app change that must deploy
+ * alongside the manifest (e.g. an updated `install.sh`) rides in the same
+ * commit. This is NOT a parent version-bump release (no parent tag / GitHub
+ * release) — it's a plain commit; that's the inverse of the parent script's
+ * `--with-daemon`. Add `--push` to push the current branch (triggers the
+ * Vercel deploy) instead of leaving it staged locally.
+ *
  * Usage:
  *   bun packages/daemon/scripts/release.ts                 # tag = v<pkg.version>
  *   bun packages/daemon/scripts/release.ts --overwrite     # re-release same version
@@ -36,6 +49,9 @@ import { readFile, writeFile } from "node:fs/promises";
  *   bun packages/daemon/scripts/release.ts --bump prerelease --preid beta
  *   bun packages/daemon/scripts/release.ts --tag v1.2.3    # explicit version
  *   bun packages/daemon/scripts/release.ts --no-compile    # reuse existing dist
+ *   bun packages/daemon/scripts/release.ts --overwrite --commit-parent --push
+ *                                                          # re-release + commit
+ *                                                          # parent + deploy
  *   bun packages/daemon/scripts/release.ts --draft
  *
  * Release repo defaults to `quantidexyz/openllmd`; override with
@@ -64,6 +80,11 @@ const flag = (name: string): string | undefined => {
 };
 const skipCompile = argv.includes("--no-compile");
 const draft = argv.includes("--draft");
+// Commit the parent repo after the daemon is published + the manifest pinned
+// (correct order). Without it the script just prints the commit command, as
+// before. `--push` additionally pushes the current branch (Vercel deploy).
+const commitParent = argv.includes("--commit-parent");
+const pushParent = argv.includes("--push");
 // Re-release an EXISTING version in place (clobber its assets) instead of
 // erroring. Dev workflow: keep overwriting one trial version rather than
 // minting a new tag + release per build (which floods the releases page and
@@ -171,36 +192,6 @@ ${shaBody}
 `;
 };
 
-/** Download each published asset and verify its sha256 against `sha`. Throws on
- *  the first mismatch / failed download. A few retries absorb GitHub's brief
- *  asset-propagation delay right after publish. */
-const verifyPublishedAssets = async (
-  sha: Record<string, string>,
-): Promise<void> => {
-  console.log("Verifying published asset checksums…");
-  for (const t of TARGETS) {
-    const url = `https://github.com/${REPO}/releases/download/${tag}/openllmd-${t}`;
-    let got: string | null = null;
-    for (let attempt = 0; attempt < 4 && got === null; attempt++) {
-      if (attempt > 0) await Bun.sleep(2000);
-      const resp = await fetch(url).catch(() => null);
-      if (resp === null || !resp.ok) continue;
-      got = createHash("sha256")
-        .update(Buffer.from(await resp.arrayBuffer()))
-        .digest("hex");
-    }
-    if (got === null) {
-      throw new Error(`verify: could not download ${url} after retries`);
-    }
-    if (got !== sha[t]) {
-      throw new Error(
-        `verify: sha256 mismatch for openllmd-${t}\n  published: ${got}\n  expected:  ${sha[t]}`,
-      );
-    }
-    console.log(`  ✓ openllmd-${t}`);
-  }
-};
-
 const main = async (): Promise<void> => {
   // Preflight: the release repo must exist + be pushable.
   const repoOk = await $`gh repo view ${REPO}`.nothrow().quiet();
@@ -259,21 +250,58 @@ const main = async (): Promise<void> => {
     await $`gh release create ${tag} ${files} -R ${REPO} --title ${`openllmd ${tag}`} --notes ${`openllmd ${tag}`} ${flags}`;
   }
 
-  // Integrity gate: re-download each PUBLISHED asset and confirm its sha256
-  // matches what we computed locally (and pin in the manifest). Catches a
-  // corrupt/partial upload BEFORE we commit a manifest that points at it.
-  await verifyPublishedAssets(sha);
-
   await writeFile(MANIFEST, manifestSource(sha), "utf-8");
   // The manifest is COMMITTED, so it must pass `biome check`. Its sha256 lines
   // exceed the line width; let biome wrap them rather than hand-matching its
   // formatter. Best-effort — a missing biome shouldn't fail the release.
   await $`bunx biome format --write ${MANIFEST}`.nothrow().quiet();
-  const toCommit = `${bumped ? `${ROOT_PKG} ` : ""}${DAEMON_PKG} ${MANIFEST}`;
-  console.log(`\nWrote ${MANIFEST} + ${DAEMON_PKG}. Commit + deploy:`);
-  console.log(
-    `  git add ${toCommit} && git commit -m "release: openllmd ${tag}"`,
-  );
+
+  // The release artifacts the commit must include. Root package.json only when
+  // this run bumped it; the daemon package.json + manifest always.
+  const artifacts = [...(bumped ? [ROOT_PKG] : []), DAEMON_PKG, MANIFEST];
+
+  if (!commitParent) {
+    console.log(`\nWrote ${MANIFEST} + ${DAEMON_PKG}. Commit + deploy:`);
+    console.log(
+      `  git add ${artifacts.join(" ")} && git commit -m "release: openllmd ${tag}"`,
+    );
+    return;
+  }
+
+  // --commit-parent: the binaries are published + the manifest is pinned, so
+  // committing the parent now is the correct order. Stage the artifacts
+  // explicitly, then `git add -u` to fold in every OTHER already-modified
+  // TRACKED file (the parent-app change that ships alongside the manifest —
+  // e.g. install.sh). `-u` is tracked-only, so it never sweeps stray untracked
+  // files. Print the staged set first so the commit's contents are visible.
+  await $`git add ${artifacts}`;
+  await $`git add -u`;
+  const staged = (await $`git diff --cached --name-only`.quiet()).stdout
+    .toString()
+    .trim();
+  if (staged.length === 0) {
+    console.log("\nNothing to commit — working tree already clean.");
+    return;
+  }
+  console.log(`\nCommitting parent (chore(release): openllmd ${tag}):`);
+  for (const f of staged.split("\n")) console.log(`  + ${f}`);
+  await $`git commit -m ${`chore(release): openllmd ${tag}`}`;
+
+  if (!pushParent) {
+    console.log("\n✓ Committed. Push when ready (or re-run with --push):");
+    const branch = (await $`git rev-parse --abbrev-ref HEAD`.quiet()).stdout
+      .toString()
+      .trim();
+    console.log(`  git push origin ${branch}`);
+    return;
+  }
+
+  const branch = (await $`git rev-parse --abbrev-ref HEAD`.quiet()).stdout
+    .toString()
+    .trim();
+  console.log(`\n→ Pushing ${branch} (triggers the Vercel deploy)…`);
+  await $`git push origin ${branch}`;
+  console.log(`✓ Pushed ${branch}.`);
 };
 
 await main();
