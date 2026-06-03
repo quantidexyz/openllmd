@@ -515,6 +515,9 @@ export const kimiCodeDelegate: TProviderDelegate = {
       connected: token !== null,
       cli_installed: installed,
       ...(version !== null ? { cli_version: version } : {}),
+      ...(pending !== null
+        ? { pending_auth: { url: pending.url, code: pending.code } }
+        : {}),
       ...(token === null
         ? {
             detail:

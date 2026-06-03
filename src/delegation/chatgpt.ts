@@ -111,6 +111,9 @@ export const chatgptDelegate: TProviderDelegate = {
       connected: token !== null,
       cli_installed: installed,
       ...(version !== null ? { cli_version: version } : {}),
+      ...(pending !== null
+        ? { pending_auth: { url: pending.url, code: pending.code } }
+        : {}),
       ...(token === null
         ? {
             detail:
@@ -148,7 +151,13 @@ export const chatgptDelegate: TProviderDelegate = {
       env: { ...process.env, ...env() },
     });
     deviceProcs.add(proc);
-    void proc.exited.finally(() => deviceProcs.delete(proc));
+    void proc.exited.then(async () => {
+      deviceProcs.delete(proc);
+      // The process stays alive polling until the user authorizes; once it
+      // exits WITHOUT a stored credential the flow expired / was cancelled /
+      // errored — drop the stale code so the card stops showing a dead one.
+      if ((await readToken()) === null) clearPendingAuth(PROVIDER);
+    });
 
     // One reader loop: resolves the moment the device prompt appears, then
     // keeps draining stdout for the process's lifetime so a full pipe can't

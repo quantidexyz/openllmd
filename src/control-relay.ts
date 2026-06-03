@@ -27,6 +27,7 @@ import {
 } from "./cloud-client";
 import { getDelegate } from "./delegation";
 import { hasApiKey } from "./env";
+import { clearInstalling, setInstalling } from "./installing-state";
 import { openSealed, sealTo } from "./keypair";
 import { logError } from "./logger";
 import { setSetupToken } from "./setup-token";
@@ -93,8 +94,22 @@ const runCommandInner = async (
             result: { error: "unknown provider" },
           };
         }
-        const r = await installCli(payload.slug as TCliProvider);
-        return { id: cmd.id, status: "done", result: r };
+        const slug = payload.slug;
+        // Mark installing + push ONE interim status BEFORE the (blocking)
+        // download, so the card shows a synced "Installing…" immediately
+        // instead of going dark until the install finishes. Cleared in the
+        // finally; the post-command status push then carries `cli_installed`.
+        setInstalling(slug);
+        await reportStatus({
+          active: true,
+          status: await computeStatus(),
+        }).catch(() => {});
+        try {
+          const r = await installCli(slug as TCliProvider);
+          return { id: cmd.id, status: "done", result: r };
+        } finally {
+          clearInstalling(slug);
+        }
       }
       case "connect_device_code": {
         // Start a device-code login (codex remote; kimi falls back to its
