@@ -252,6 +252,37 @@ const authStatusLoggedIn = async (): Promise<boolean | null> => {
   }
 };
 
+/**
+ * Run `claude setup-token` (a browser login on THIS box that prints a
+ * long-lived `sk-ant-oat01-` token) and capture the token. Used by the
+ * this-machine `connectSetupToken` (store locally) AND the remote-copy
+ * `mintSetupToken` (return for sealing — never stored here). ⚠️ RESEARCH:
+ * setup-token stdout shape unverified; matched anywhere in the output.
+ */
+const captureSetupToken = async (): Promise<
+  { token: string } | { error: string }
+> => {
+  if (!(await cliInstallState(PROVIDER)).installed) {
+    return {
+      error: "Install the Claude Code CLI from the Providers tab first.",
+    };
+  }
+  // macOS: setup-token is still an OAuth login, so the isolated keychain must
+  // exist (it may write session state alongside printing the token).
+  await ensureIsolatedKeychain(cliHome(PROVIDER));
+  const result = await spawnLogin([bin(), "setup-token"], env());
+  const match = result.output.match(/sk-ant-oat01-[A-Za-z0-9._-]+/);
+  if (match === null) {
+    return {
+      error:
+        result.output.length > 0
+          ? result.output.slice(0, 300)
+          : `claude setup-token exited ${result.code} without a token`,
+    };
+  }
+  return { token: match[0] };
+};
+
 export const claudeCodeDelegate: TProviderDelegate = {
   slug: "claude_code",
 
@@ -346,38 +377,21 @@ export const claudeCodeDelegate: TProviderDelegate = {
     };
   },
 
-  // ⚠️ RESEARCH: `claude setup-token`'s exact stdout shape isn't validated
-  // against a live login. We match the `sk-ant-oat01-` token ANYWHERE in the
-  // combined output, which is robust to surrounding prose across versions.
-  // Confirm hands-on.
+  // This-machine setup-token: mint it here AND store it here (used when the
+  // daemon you're connecting IS this machine). The remote case uses
+  // `mintSetupToken` below + a sealed copy.
   connectSetupToken: async () => {
-    if (!(await cliInstallState(PROVIDER)).installed) {
-      return {
-        connected: false,
-        detail: "Install the Claude Code CLI from the Providers tab first.",
-      };
-    }
-    // macOS: `setup-token` is still an OAuth login, so the isolated keychain
-    // must exist (it may write session state alongside printing the token).
-    await ensureIsolatedKeychain(cliHome(PROVIDER));
-    // `claude setup-token` opens the browser (the daemon's machine — this
-    // machine, or loopback-forwarded for a remote box) and PRINTS a
-    // long-lived `sk-ant-oat01-` token. Blocks until it exits; we capture
-    // the token and store it on the box. It never crosses the cloud.
-    const result = await spawnLogin([bin(), "setup-token"], env());
-    const match = result.output.match(/sk-ant-oat01-[A-Za-z0-9._-]+/);
-    if (match === null) {
-      return {
-        connected: false,
-        detail:
-          result.output.length > 0
-            ? result.output.slice(0, 300)
-            : `claude setup-token exited ${result.code} without a token`,
-      };
-    }
-    setSetupToken(PROVIDER, match[0]);
+    const r = await captureSetupToken();
+    if ("error" in r) return { connected: false, detail: r.error };
+    setSetupToken(PROVIDER, r.token);
     return { connected: true, detail: "setup token saved" };
   },
+
+  // Remote-copy mint: run `claude setup-token` on THIS (the browser) machine
+  // and RETURN the token so the caller can SEAL it to a remote daemon's key
+  // and relay the ciphertext. Deliberately does NOT store it here — this box
+  // isn't the one being authenticated.
+  mintSetupToken: async () => captureSetupToken(),
 
   usage: async (): Promise<TProviderUsageSnapshot> => {
     const token = await readToken();

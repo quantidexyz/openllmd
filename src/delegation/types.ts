@@ -48,6 +48,14 @@ export type TProviderDelegate = {
   }>;
 
   /**
+   * Remote-copy mint (Claude only): run the setup-token flow in the user's
+   * browser on THIS machine and RETURN the captured token so the caller can
+   * seal it to a remote daemon's key and relay the ciphertext. Does NOT store
+   * it locally (this box isn't the one being authenticated).
+   */
+  mintSetupToken?: () => Promise<{ token: string } | { error: string }>;
+
+  /**
    * Device-code login for a REMOTE/headless box (codex; kimi uses its only
    * login which is already device-code): start the vendor's device flow,
    * surface the verification URL + one-time code (via pending-auth → status)

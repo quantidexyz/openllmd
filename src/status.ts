@@ -10,6 +10,7 @@ import type { TDaemonStatus } from "@openllm/schema";
 import { getCloudState } from "./config";
 import { DELEGATES } from "./delegation";
 import { hasApiKey } from "./env";
+import { daemonPublicKey } from "./keypair";
 import { DAEMON_VERSION } from "./version";
 
 export const computeStatus = async (): Promise<TDaemonStatus> => {
@@ -30,6 +31,7 @@ export const computeStatus = async (): Promise<TDaemonStatus> => {
     daemon_version: DAEMON_VERSION,
     key_configured: hasApiKey(),
     cloud_state: getCloudState(),
+    pubkey: daemonPublicKey(),
     connections,
   };
 };

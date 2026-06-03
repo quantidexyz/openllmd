@@ -22,10 +22,12 @@ import {
   InvalidApiKeyError,
   NoApiKeyError,
   pollControl,
+  relayCredential,
   reportStatus,
 } from "./cloud-client";
 import { getDelegate } from "./delegation";
 import { hasApiKey } from "./env";
+import { openSealed, sealTo } from "./keypair";
 import { setSetupToken } from "./setup-token";
 import { computeStatus } from "./status";
 
@@ -44,7 +46,12 @@ const sleep = (ms: number): Promise<void> =>
  */
 const runCommand = async (cmd: TDaemonCommand): Promise<TDaemonCommandAck> => {
   try {
-    const payload = (cmd.payload ?? {}) as { slug?: string };
+    const payload = (cmd.payload ?? {}) as {
+      slug?: string;
+      target_key?: string;
+      target_pubkey?: string;
+      sealed?: string;
+    };
     switch (cmd.kind) {
       case "connect": {
         const delegate =
@@ -126,6 +133,71 @@ const runCommand = async (cmd: TDaemonCommand): Promise<TDaemonCommandAck> => {
         }
         const r = await delegate.logout();
         return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
+      }
+      case "mint_setup_token": {
+        // LOCAL daemon (this machine, browser signed in): mint a Claude
+        // setup-token here, SEAL it to the TARGET daemon's pubkey, and relay
+        // the ciphertext via the cloud. The token never touches this box's
+        // store nor the cloud in the clear.
+        const delegate =
+          payload.slug !== undefined ? getDelegate(payload.slug) : null;
+        if (
+          delegate?.mintSetupToken === undefined ||
+          payload.target_key === undefined ||
+          payload.target_pubkey === undefined
+        ) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: "mint_setup_token: bad payload / unsupported" },
+          };
+        }
+        const minted = await delegate.mintSetupToken();
+        if ("error" in minted) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: minted.error },
+          };
+        }
+        try {
+          const sealed = sealTo(payload.target_pubkey, minted.token);
+          await relayCredential(payload.target_key, sealed);
+        } catch (err) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: {
+              error: err instanceof Error ? err.message : "relay failed",
+            },
+          };
+        }
+        return {
+          id: cmd.id,
+          status: "done",
+          result: { relayed: true },
+        };
+      }
+      case "receive_setup_token": {
+        // TARGET daemon: open the sealed setup-token with our own key and
+        // store it. We're now authenticated via the caller's browser identity.
+        if (payload.sealed === undefined) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: "receive_setup_token: missing sealed blob" },
+          };
+        }
+        const token = openSealed(payload.sealed);
+        if (token === null) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: "could not open sealed credential" },
+          };
+        }
+        setSetupToken("claude_code", token);
+        return { id: cmd.id, status: "done", result: { received: true } };
       }
       case "remove_setup_token": {
         // Clear an on-box setup-token (Claude). Independent of `logout` —

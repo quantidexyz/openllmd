@@ -123,6 +123,29 @@ export const searchViaCloud = async (
 };
 
 /**
+ * Relay a SEALED credential to another of the user's daemons:
+ * `POST /api/daemon/relay-credential`. The minting daemon (this machine, the
+ * browser) seals a Claude setup-token to the target daemon's pubkey and posts
+ * the ciphertext here; the cloud (verifying same-user ownership of
+ * `targetKey`) enqueues a `receive_setup_token` command to it. The cloud only
+ * ever sees ciphertext. Throws on a non-2xx so the caller can ack the failure.
+ */
+export const relayCredential = async (
+  targetKey: string,
+  sealed: string,
+): Promise<void> => {
+  const resp = await fetch(cloudUrl("/api/daemon/relay-credential"), {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({ target_key: targetKey, sealed }),
+  });
+  if (resp.status === 401 || resp.status === 403) {
+    throw new InvalidApiKeyError(resp.status);
+  }
+  if (!resp.ok) throw new Error(`relay-credential failed: ${resp.status}`);
+};
+
+/**
  * The daemon's control long-poll: `GET /api/daemon/poll`. Held open
  * server-side (~25s) until a command is queued for this key or the deadline
  * passes. The poll itself stamps presence cloud-side (the open poll IS the
