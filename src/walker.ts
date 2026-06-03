@@ -47,6 +47,7 @@ import {
   type TChatCompletionRequest,
   type TChatCompletionResponse,
   type TDaemonRecordRequest,
+  type TErrorEnvelope,
   type TRequestStatus,
   type TToolCall,
 } from "@openllm/schema";
@@ -56,11 +57,14 @@ import {
   chunksToResponsesSseBytes,
   toResponsesResponse,
 } from "@openllm/wire/adapters/responses";
+import { classifyHopError } from "@openllm/wire/lib/error-class";
 import { accumulateChunksToResponse } from "@openllm/wire/lib/streaming/accumulate";
 import {
   chunksToSseBytes,
   decodeProviderEventStream,
 } from "@openllm/wire/lib/streaming/provider-decode";
+import { responseToChunkStream } from "@openllm/wire/lib/streaming/response-stream";
+import { withFrameAlignedHeartbeat } from "@openllm/wire/lib/streaming/sse";
 import { fromAnthropicResponse } from "@openllm/wire/providers/anthropic/response";
 import {
   fromAnthropicStreamEvent,
@@ -86,6 +90,7 @@ import {
   buildToolResultMessages,
   extractQueryFromToolCall,
   functionNameUsesWebSearch,
+  MAX_WEB_SEARCH_ROUNDS,
   toolCallUsesWebSearch,
 } from "@openllm/wire/tools/web-search/helpers";
 import { Schema } from "effect";
@@ -222,14 +227,53 @@ export const canWalkPlan = (hops: ReadonlyArray<THop>): boolean => {
 };
 
 /**
- * Pre-stream retry classifier — the thin replacement for the core
- * router's error-class. 429 / 408 / 5xx fall through to the next hop;
- * everything else (incl. 401 — the delegate refreshes the token on read,
- * so a 401 here is post-refresh and terminal) commits. Mid-stream failure
- * is intentionally out of scope (commit-on-first-byte).
+ * Pre-stream retry classifier — the thin, DELIBERATELY narrow daemon policy
+ * (the cloud's full `classifyHopError` treats most 4xx as transient; the
+ * daemon does not). 429 / 408 / 5xx fall through to the next hop; everything
+ * else (incl. 401 — the delegate refreshes the token on read, so a 401 here
+ * is post-refresh and terminal) commits. The ONE exception, handled
+ * separately via `transient400Envelope`, is a 400 whose envelope is a
+ * content-filter / context-length / capability refusal — there a different
+ * model on the chain may accept the request, so we walk like the cloud.
+ * Mid-stream failure is intentionally out of scope (commit-on-first-byte).
  */
 export const retryable = (status: number): boolean =>
   status === 429 || status === 408 || (status >= 500 && status <= 599);
+
+/** Map the daemon's upstream wire to the classifier's provider format
+ *  (chatgpt + kimi both speak the OpenAI error-envelope shape). */
+const hopFormat = (wire: TUpstreamWire): "openai" | "anthropic" =>
+  wire === "anthropic" ? "anthropic" : "openai";
+
+/**
+ * Is a 400's error body a transient refusal (content-filter / context-length
+ * / capability) that a different chain hop might accept? Defers to the shared
+ * `classifyHopError` so the daemon and cloud agree on what a transient 400
+ * looks like. `raw` is the upstream error body (best-effort JSON parse).
+ */
+export const transient400Envelope = (
+  raw: string,
+  wire: TUpstreamWire,
+): boolean => {
+  let envelope: TErrorEnvelope | undefined;
+  try {
+    const json = JSON.parse(raw) as { error?: unknown };
+    envelope =
+      json.error !== null && typeof json.error === "object"
+        ? { error: json.error as TErrorEnvelope["error"] }
+        : undefined;
+  } catch {
+    envelope = undefined;
+  }
+  return (
+    classifyHopError({
+      status: 400,
+      envelope,
+      providerFormat: hopFormat(wire),
+      aborted: false,
+    }).kind === "transient"
+  );
+};
 
 const statusFor = (httpStatus: number): TRequestStatus =>
   httpStatus < 400
@@ -330,8 +374,9 @@ const tokensFromCanonical = (
 });
 
 // ─── web_search (§5) ──────────────────────────────────────────────────
-// Bound the agentic loop so a misbehaving model can't spin forever.
-const MAX_SEARCH_ROUNDS = 4;
+// The agentic round cap (`MAX_WEB_SEARCH_ROUNDS`) is shared with the cloud
+// orchestrator via `@openllm/wire/tools/web-search/helpers` so both paths
+// agent the same depth.
 
 /** Does the request ask the gateway to run web_search (an openllm function
  *  tool, NOT a vendor-native server tool)? */
@@ -352,38 +397,6 @@ const shouldInterceptWebSearch = (
 ): boolean =>
   requestDeclaresWebSearch(canonical) &&
   !(up.wire === "anthropic" && clientWireOf(surface) === "anthropic");
-
-/** Turn a finished canonical response into a one-shot chunk stream so the
- *  loop's accumulated result can still be emitted to a streaming client.
- *  (The intermediate search rounds can't stream — they're accumulated to
- *  detect the tool calls — so the final answer arrives as one chunk.) */
-const responseToChunkStream = (
-  resp: TChatCompletionResponse,
-): ReadableStream<TChatCompletionChunk> => {
-  const choice = resp.choices[0];
-  const content =
-    typeof choice?.message.content === "string" ? choice.message.content : "";
-  const chunk = {
-    id: resp.id,
-    object: "chat.completion.chunk",
-    created: resp.created,
-    model: resp.model,
-    choices: [
-      {
-        index: 0,
-        delta: { role: "assistant" as const, content },
-        finish_reason: choice?.finish_reason ?? "stop",
-      },
-    ],
-    ...(resp.usage !== undefined ? { usage: resp.usage } : {}),
-  } as TChatCompletionChunk;
-  return new ReadableStream<TChatCompletionChunk>({
-    start(c) {
-      c.enqueue(chunk);
-      c.close();
-    },
-  });
-};
 
 /** Splice native `server_tool_use` + `web_search_tool_result` blocks to the
  *  front of an Anthropic response's content so Claude Code's WebSearch
@@ -460,7 +473,7 @@ const serveWithWebSearch = async (
   }> = [];
   let final: TChatCompletionResponse | null = null;
 
-  for (let round = 0; round < MAX_SEARCH_ROUNDS; round++) {
+  for (let round = 0; round < MAX_WEB_SEARCH_ROUNDS; round++) {
     // Accumulated cross-wire body (chatgpt still streams + is drained).
     const body = canonicalToUpstreamBody(
       up.wire,
@@ -483,6 +496,15 @@ const serveWithWebSearch = async (
     if (!resp.ok) {
       if (round === 0 && retryable(resp.status)) return "retry";
       const detail = await resp.text().catch(() => "");
+      // Parity with serveSubscription: a content-filter / context-length /
+      // capability 400 is transient — walk to the next hop (round 0 only).
+      if (
+        round === 0 &&
+        resp.status === 400 &&
+        transient400Envelope(detail, up.wire)
+      ) {
+        return "retry";
+      }
       return new Response(detail.length > 0 ? detail : null, {
         status: resp.status,
         headers: { "content-type": "application/json" },
@@ -556,7 +578,7 @@ const serveWithWebSearch = async (
   if (final === null) {
     return errorJson(
       502,
-      `web_search: exceeded ${MAX_SEARCH_ROUNDS} rounds without a final answer`,
+      `web_search: exceeded ${MAX_WEB_SEARCH_ROUNDS} rounds without a final answer`,
     );
   }
 
@@ -649,7 +671,23 @@ const serveSubscription = async (
   } catch {
     return "retry"; // network error — pre-stream, fall through
   }
-  if (!resp.ok && retryable(resp.status)) return "retry";
+  if (!resp.ok) {
+    if (retryable(resp.status)) return "retry";
+    const raw = await resp.text().catch(() => "");
+    // A content-filter / context-length / capability 400 is transient — walk
+    // to the next hop like the cloud does.
+    if (resp.status === 400 && transient400Envelope(raw, up.wire)) {
+      return "retry";
+    }
+    // Every other non-OK is terminal: surface the upstream error verbatim.
+    // Returning here (instead of falling through) keeps an error body out of
+    // the success path, which would otherwise try to decode it as a chat
+    // response or stream it as SSE.
+    return new Response(raw.length > 0 ? raw : null, {
+      status: resp.status,
+      headers: passthroughHeaders(resp),
+    });
+  }
 
   if (!resp.body) return "retry";
 
@@ -692,6 +730,20 @@ const serveSubscription = async (
       "cache-control": "no-cache",
       connection: "keep-alive",
     } as const;
+    // Keep the (localhost) client connection warm while the upstream is
+    // quiet during a long reasoning / tool run — the same "chat stopped
+    // while it was actually doing something" symptom the cloud guards. The
+    // daemon does NOT add `withStreamDeadline`: that exists only to beat
+    // Vercel's `maxDuration` guillotine (a cloud-only concept), and a daemon
+    // crash can't emit a terminator regardless. Frame-aligned so a beat is
+    // never spliced inside a half-sent SSE event.
+    const heartbeat = (
+      bytes: ReadableStream<Uint8Array>,
+    ): ReadableStream<Uint8Array> =>
+      withFrameAlignedHeartbeat(bytes, {
+        intervalMs: 15_000,
+        kind: args.surface === "messages" ? "anthropic_ping" : "comment",
+      });
     // Meter token usage off a tee'd canonical branch (never blocks the
     // client; accurate counts come from the final chunk's usage).
     const meter = (chunks: ReadableStream<TChatCompletionChunk>): void => {
@@ -705,7 +757,7 @@ const serveSubscription = async (
       // decoded purely to meter.
       const [toClient, toMeter] = resp.body.tee();
       meter(decodeUpstreamStream(up, toMeter, hop.providerModelId));
-      return new Response(toClient, {
+      return new Response(heartbeat(toClient), {
         status: resp.status,
         headers: passthroughHeaders(resp),
       });
@@ -723,7 +775,7 @@ const serveSubscription = async (
         : clientWire === "anthropic"
           ? chunksToMessagesSseBytes(toClient)
           : chunksToSseBytes(toClient);
-    return new Response(clientBytes, {
+    return new Response(heartbeat(clientBytes), {
       status: resp.status,
       headers: sseHeaders,
     });
