@@ -1,12 +1,10 @@
-import { DAEMON_BINARIES } from "./generated";
-
 /**
- * Daemon binary access — the runtime read side of the precompute-and-inline
- * pattern (mirrors `packages/{plugin,skill,setup}/scanner.ts`). The binaries
- * are compiled by `scripts/compile.ts` and base64-inlined into
- * `generated.ts` by the repo's `scripts/generate-bundles.ts`, so the cloud's
- * `/api/daemon/binary/:target` handler serves them without ever touching
- * `packages/daemon/dist` at runtime (which wouldn't ship with the function).
+ * Daemon binary targets. The bytes themselves are NOT here — each target is
+ * base64-inlined into its own `generated/<target>.ts` module (produced by the
+ * repo's `scripts/generate-bundles.ts` from `scripts/compile.ts` output) and
+ * served by its own static route, so a Vercel function never carries more than
+ * the single binary it serves (the four together exceed the 250MB function
+ * limit). The checksum route reads `generated/sha256.ts`.
  */
 
 export const DAEMON_TARGETS = [
@@ -17,10 +15,3 @@ export const DAEMON_TARGETS = [
 ] as const;
 
 export type TDaemonTarget = (typeof DAEMON_TARGETS)[number];
-
-/** Decode the inlined binary for one target, or null if it hasn't been built. */
-export const getDaemonBinary = (target: string): Buffer | null => {
-  const b64 = DAEMON_BINARIES[target];
-  if (b64 === undefined) return null;
-  return Buffer.from(b64, "base64");
-};
