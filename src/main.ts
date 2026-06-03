@@ -18,11 +18,21 @@
  * This file is compiled into a source-free standalone binary with
  * `bun build --compile --minify --bytecode` (see scripts/compile.ts).
  */
-import { getCloudState, refreshBootstrap } from "./config";
-import { reportControlInactive, startControlRelay } from "./control-relay";
+import { getCloudState, latestVersion, refreshBootstrap } from "./config";
+import {
+  pushStatus,
+  reportControlInactive,
+  startControlRelay,
+} from "./control-relay";
 import { isDevMode } from "./env";
 import { handleInference } from "./listener";
 import { logError, logInfo } from "./logger";
+import {
+  beginRequest,
+  endRequest,
+  maybeSelfUpdate,
+  trackBodyDone,
+} from "./self-update";
 import { setSetupToken } from "./setup-token";
 import { DAEMON_VERSION } from "./version";
 
@@ -71,11 +81,22 @@ const main = async (): Promise<void> => {
   // just-set key (or a `next dev` that just finished booting) is picked
   // up within seconds, not after a 5-minute wait.
   await refreshBootstrap();
+  // Converge to the cloud's published daemon version (no-op from source / when
+  // already current). Fire-and-forget: it self-guards and, when it updates,
+  // swaps the binary + exits once `/v1` is idle so the supervisor relaunches.
+  void maybeSelfUpdate(latestVersion());
   const scheduleBootstrap = (): void => {
     const delay =
       getCloudState() === "ok" ? BOOTSTRAP_TTL_MS : BOOTSTRAP_RETRY_MS;
     setTimeout(async () => {
-      await refreshBootstrap();
+      // A retry that flips cloud_state (e.g. a boot-time `unreachable`
+      // recovering to `ok` once the network/cloud is up) must re-push the
+      // status, or the dashboard stays stuck on the stale value until the next
+      // command. The relay only pushes on commands, so do it here on change.
+      const changed = await refreshBootstrap();
+      if (changed) await pushStatus();
+      // Periodic version check — picks up a release published while running.
+      void maybeSelfUpdate(latestVersion());
       scheduleBootstrap();
     }, delay);
   };
@@ -117,6 +138,13 @@ const main = async (): Promise<void> => {
         // throw in `handleInference` becomes a clean error envelope
         // instead of a bare runtime 500. Body is passed through
         // untouched so streaming responses keep streaming.
+        //
+        // Count this request as in-flight so a self-update holds the restart
+        // until it finishes (no cut streams). A streaming body keeps flowing
+        // AFTER this handler returns, so `endRequest` must fire when the BODY
+        // completes (or cancels/errors), not when the handler resolves —
+        // `trackBodyDone` wraps the stream to do exactly that.
+        beginRequest();
         let res: Response;
         try {
           res = await handleInference(req);
@@ -133,7 +161,15 @@ const main = async (): Promise<void> => {
         }
         const headers = new Headers(res.headers);
         headers.set("x-openllm-served-by", "daemon");
-        return new Response(res.body, {
+        if (res.body === null) {
+          endRequest();
+          return new Response(null, {
+            status: res.status,
+            statusText: res.statusText,
+            headers,
+          });
+        }
+        return new Response(trackBodyDone(res.body, endRequest), {
           status: res.status,
           statusText: res.statusText,
           headers,

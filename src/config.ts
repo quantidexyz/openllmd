@@ -49,8 +49,15 @@ export const getCloudState = (): TCloudState => cloudState;
  * Never throws — classifies the failure instead so the control surface
  * and dashboard can react (the daemon stays up and serving on a stale /
  * empty snapshot regardless).
+ *
+ * Returns `true` when `cloudState` CHANGED, so the caller can re-push the
+ * daemon's status: a transient boot-time `unreachable` that recovers to `ok`
+ * on the next retry must surface immediately, not wait for the next command
+ * (otherwise the dashboard shows "can't reach the cloud" indefinitely even
+ * though everything is working — the bug this fixes).
  */
-export const refreshBootstrap = async (): Promise<void> => {
+export const refreshBootstrap = async (): Promise<boolean> => {
+  const prev = cloudState;
   try {
     snapshot = await fetchBootstrap();
     byModelId = new Map(snapshot.catalog.map((e) => [e.model_id, e]));
@@ -60,6 +67,7 @@ export const refreshBootstrap = async (): Promise<void> => {
     else if (err instanceof InvalidApiKeyError) cloudState = "invalid_key";
     else cloudState = "unreachable";
   }
+  return cloudState !== prev;
 };
 
 /**
@@ -69,6 +77,14 @@ export const refreshBootstrap = async (): Promise<void> => {
  */
 export const planSigningKey = (): string | null =>
   snapshot.plan_signing_key ?? null;
+
+/**
+ * The daemon version the cloud currently publishes (bare semver), from the last
+ * bootstrap. Null when unpublished or the cloud is too old to advertise it. The
+ * self-updater compares it to `DAEMON_VERSION`. See `self-update.ts`.
+ */
+export const latestVersion = (): string | null =>
+  snapshot.latest_version ?? null;
 
 /**
  * Look up a model id in the cached catalog → its `{ provider,

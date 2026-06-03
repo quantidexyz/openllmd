@@ -10,6 +10,7 @@
  * No subscription token or user content ever appears in these payloads
  * (the no-off-box-exfiltration invariant — see the proposal §6).
  */
+import { hostname } from "node:os";
 import type {
   TDaemonBootstrap,
   TDaemonPollResponse,
@@ -17,7 +18,11 @@ import type {
   TDaemonSearchResponse,
   TDaemonStatusReport,
 } from "@openllm/schema";
-import { daemonEnv } from "./env";
+import {
+  DAEMON_DEVICE_ID_HEADER,
+  DAEMON_DEVICE_LABEL_HEADER,
+} from "@openllm/schema";
+import { daemonEnv, deviceId } from "./env";
 
 /** Thrown when no API key is configured yet — the daemon is keyless. */
 export class NoApiKeyError extends Error {
@@ -35,12 +40,28 @@ export class InvalidApiKeyError extends Error {
   }
 }
 
+// `os.hostname()` is almost always plain ASCII, but a header value must be —
+// strip anything outside printable ASCII and cap the length so an exotic
+// hostname can't make `fetch` throw on an invalid header.
+const deviceLabel = (): string =>
+  hostname()
+    .replace(/[^\x20-\x7E]/g, "")
+    .trim()
+    .slice(0, 120);
+
 const authHeaders = (): Record<string, string> => {
   const { apiKey } = daemonEnv();
   if (apiKey === null) throw new NoApiKeyError();
   return {
     authorization: `Bearer ${apiKey}`,
     "content-type": "application/json",
+    // Device identity (metadata only): the cloud records the latest value per
+    // key on `api_key_activity` so the dashboard tells two daemons behind one
+    // NAT apart — device code + IP, not IP alone. Rides EVERY control call so
+    // the most frequent one (the poll) keeps it fresh. See
+    // `docs/proposals/daemon-device-aware-this-machine.md`.
+    [DAEMON_DEVICE_ID_HEADER]: deviceId(),
+    [DAEMON_DEVICE_LABEL_HEADER]: deviceLabel(),
   };
 };
 

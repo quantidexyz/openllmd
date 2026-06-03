@@ -25,11 +25,13 @@ import {
   relayCredential,
   reportStatus,
 } from "./cloud-client";
+import { latestVersion, refreshBootstrap } from "./config";
 import { getDelegate } from "./delegation";
 import { hasApiKey } from "./env";
 import { clearInstalling, setInstalling } from "./installing-state";
 import { openSealed, sealTo } from "./keypair";
 import { logError } from "./logger";
+import { maybeSelfUpdate } from "./self-update";
 import { setSetupToken } from "./setup-token";
 import { computeStatus } from "./status";
 
@@ -254,6 +256,17 @@ const runCommandInner = async (
       case "refresh":
       case "status":
         return { id: cmd.id, status: "done" };
+      // Force a self-update check now (the daemon also checks on every bootstrap
+      // tick). Refresh the bootstrap first so a release published since the last
+      // tick is seen — otherwise a forced check would read a stale
+      // `latestVersion()`. Fire-and-forget: it self-guards and, if it updates,
+      // swaps the binary + exits once idle so the supervisor relaunches it.
+      case "update":
+        void (async () => {
+          await refreshBootstrap();
+          await maybeSelfUpdate(latestVersion());
+        })();
+        return { id: cmd.id, status: "done", result: { checking: true } };
       default:
         return {
           id: cmd.id,
@@ -334,6 +347,22 @@ const loop = async (): Promise<void> => {
       }
       await sleep(BACKOFF_MS);
     }
+  }
+};
+
+/**
+ * Push the current status snapshot now (best-effort, keeps the daemon online).
+ * The relay loop only re-pushes after a command, so a `cloud_state` change that
+ * happens between commands (e.g. a retried bootstrap recovering from
+ * `unreachable` → `ok`) would otherwise stay invisible to the dashboard. The
+ * bootstrap scheduler calls this on every state change. No-op when keyless.
+ */
+export const pushStatus = async (): Promise<void> => {
+  if (!hasApiKey()) return;
+  try {
+    await reportStatus({ active: true, status: await computeStatus() });
+  } catch {
+    // best-effort — the relay loop re-pushes on its next command anyway
   }
 };
 
