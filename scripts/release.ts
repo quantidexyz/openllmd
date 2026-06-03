@@ -192,6 +192,36 @@ ${shaBody}
 `;
 };
 
+/** Download each published asset and verify its sha256 against `sha`. Throws on
+ *  the first mismatch / failed download. A few retries absorb GitHub's brief
+ *  asset-propagation delay right after publish. */
+const verifyPublishedAssets = async (
+  sha: Record<string, string>,
+): Promise<void> => {
+  console.log("Verifying published asset checksums…");
+  for (const t of TARGETS) {
+    const url = `https://github.com/${REPO}/releases/download/${tag}/openllmd-${t}`;
+    let got: string | null = null;
+    for (let attempt = 0; attempt < 4 && got === null; attempt++) {
+      if (attempt > 0) await Bun.sleep(2000);
+      const resp = await fetch(url).catch(() => null);
+      if (resp === null || !resp.ok) continue;
+      got = createHash("sha256")
+        .update(Buffer.from(await resp.arrayBuffer()))
+        .digest("hex");
+    }
+    if (got === null) {
+      throw new Error(`verify: could not download ${url} after retries`);
+    }
+    if (got !== sha[t]) {
+      throw new Error(
+        `verify: sha256 mismatch for openllmd-${t}\n  published: ${got}\n  expected:  ${sha[t]}`,
+      );
+    }
+    console.log(`  ✓ openllmd-${t}`);
+  }
+};
+
 const main = async (): Promise<void> => {
   // Preflight: the release repo must exist + be pushable.
   const repoOk = await $`gh repo view ${REPO}`.nothrow().quiet();
@@ -249,6 +279,11 @@ const main = async (): Promise<void> => {
     ];
     await $`gh release create ${tag} ${files} -R ${REPO} --title ${`openllmd ${tag}`} --notes ${`openllmd ${tag}`} ${flags}`;
   }
+
+  // Integrity gate: re-download each PUBLISHED asset and confirm its sha256
+  // matches what we computed locally (and pin in the manifest). Catches a
+  // corrupt/partial upload BEFORE we commit a manifest that points at it.
+  await verifyPublishedAssets(sha);
 
   await writeFile(MANIFEST, manifestSource(sha), "utf-8");
   // The manifest is COMMITTED, so it must pass `biome check`. Its sha256 lines
