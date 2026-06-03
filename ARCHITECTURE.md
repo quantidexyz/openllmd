@@ -49,8 +49,13 @@ cloud at runtime** (not compiled in) to keep the closure clean.
 daemon/
   index.ts                  re-exports
   scripts/compile.ts        bun build --compile --minify --bytecode (4 targets)
+  scripts/install-local.ts  build host binary + install locally (no release)
   src/
-    main.ts                 boot: refresh bootstrap → Bun.serve(127.0.0.1)
+    main.ts                 boot: runCli() dispatch, else refresh bootstrap → Bun.serve(127.0.0.1)
+    cli.ts                  `openllmd <cmd>` dispatch (start/stop/status/restart/set-token/completion/help)
+    service.ts              self-managed launch agent / systemd unit (start = self-restore; stop = disable)
+    completion.ts           bash/zsh/fish shell completion (emit + `completion install`)
+    harden-binary.ts        macOS dequarantine + ad-hoc sign (shared by service + self-update)
     listener.ts             /v1/* inference: parse → validate → runWalker (the only path)
     walker.ts               coreless §3.3 plan-walker — the daemon's sole data path; @openllm/core-free
     control.ts              localhost control surface (/status,/events,/connect,/cli-install,/usage,/config)
@@ -306,10 +311,36 @@ Windows). Compile-time defaults are injected via `--define` GLOBALS
 `process.env.*`, which would clobber the runtime env read. Distribution is
 the `packages/setup/daemon` install target (`includeBundle:false`,
 `requires_key:false` so the installer runs with a plain `curl … | bash` —
-no key piped in): `install.sh` downloads + checksum-verifies the binary
-from `/api/daemon/binary/<target>`, installs a launch agent / systemd
-unit, and writes the env file with the cloud + dashboard origins and port
-(NO API key — that's set from the dashboard's Providers tab afterwards).
+no key piped in): `install.sh` downloads the binary from
+`/api/daemon/binary/<target>` and verifies it against the published
+`.sha256` (a checksum sidecar, not a detached signature), symlinks it onto
+`PATH` as `openllmd`, writes `~/.openllm/daemon.env` with just
+`OPENLLM_CLOUD_ORIGIN` + `OPENLLM_DAEMON_PORT` (the API key is persisted
+separately to `~/.openllm/api-key`, mode `0600`, by the same script — set
+from the dashboard's Providers tab afterward), then hands off to `openllmd
+start`.
+
+**The binary supervises itself.** Service registration is NOT open-coded in
+`install.sh` — it lives in `src/service.ts`, exposed as the `openllmd
+start|stop|status|restart` CLI (`src/cli.ts`), so the installer and a user
+run the exact same code path. `start` writes + enables the launch agent
+(`KeepAlive`+`RunAtLoad`) / systemd unit (`Restart=always` + boot start +
+linger) in **full self-restore mode** and (re)starts it; `stop` stops it
+AND disables all self-restore (launchd `bootout`+`disable`, systemd
+`disable --now`) so it stays down until the next `start`. The service runs
+`process.execPath`, so a from-source run (`0.0.0-dev`) is refused — only the
+compiled binary registers. `openllmd completion <bash|zsh|fish|install>`
+emits/installs shell completion for every subcommand. The CLI surface is
+defined once in `src/commands.ts` (consumed by both `cli.ts`'s help and
+`completion.ts`). See
+[`daemon-self-managing-cli.md`](../../docs/proposals/daemon-self-managing-cli.md).
+
+**Local install without a release.** `scripts/install-local.ts` (run via
+`bun run daemon:install` from the repo root, or `daemon:uninstall` to
+reverse) compiles the host binary, drops it under `~/.openllm/bin/openllmd`,
+symlinks it onto `PATH`, and hands off to `openllmd start` — the same flow
+`install.sh` runs, but from source. `OPENLLM_CLOUD_ORIGIN=… bun run
+daemon:install` bakes a dev cloud origin in.
 
 ## Layering rules
 

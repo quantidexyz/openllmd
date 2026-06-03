@@ -21,7 +21,6 @@
  * attempt marker + cooldown bounds restart loops if a release is mis-published.
  */
 
-import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -34,6 +33,7 @@ import { dirname, join } from "node:path";
 import type { TDaemonTarget } from "../release-types";
 import { DAEMON_TARGETS } from "../release-types";
 import { daemonEnv, stateDir } from "./env";
+import { hardenMacBinary } from "./harden-binary";
 import { logError, logInfo, logWarn } from "./logger";
 import { DAEMON_VERSION } from "./version";
 
@@ -160,38 +160,6 @@ const fetchDigest = async (url: string): Promise<string> => {
     throw new Error("checksum response was not a sha-256 digest");
   }
   return hex.toLowerCase();
-};
-
-// On macOS the downloaded binary is unnotarized and (for cross-compiled
-// targets) unsigned, so on Apple Silicon the kernel SIGKILLs it the moment the
-// supervisor relaunches it — the daemon would "shut down and not restart" after
-// every update. Mirror the installer: strip quarantine + ad-hoc sign the
-// swapped binary so the relaunch can exec. Best-effort; a notarized future
-// build still verifies, so we only re-sign when the signature is missing.
-const hardenMacBinary = (path: string): void => {
-  if (process.platform !== "darwin") return;
-  try {
-    execFileSync("xattr", ["-dr", "com.apple.quarantine", path], {
-      stdio: "ignore",
-    });
-  } catch {
-    // no quarantine xattr / xattr unavailable — fine
-  }
-  try {
-    execFileSync("codesign", ["--verify", "--quiet", path], {
-      stdio: "ignore",
-    });
-    return; // already validly signed — don't disturb it
-  } catch {
-    // not signed (or invalid) — ad-hoc sign below
-  }
-  try {
-    execFileSync("codesign", ["--force", "--sign", "-", path], {
-      stdio: "ignore",
-    });
-  } catch (err) {
-    logWarn("self-update", `could not codesign updated binary: ${String(err)}`);
-  }
 };
 
 const waitUntilIdle = async (): Promise<void> => {

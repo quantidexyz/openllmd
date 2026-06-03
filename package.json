@@ -11,7 +11,10 @@
     "openllmd": "./src/main.ts"
   },
   "scripts": {
-    "compile": "bun scripts/compile.ts"
+    "compile": "bun scripts/compile.ts",
+    "compile:host": "bun scripts/compile.ts --host",
+    "install:local": "bun scripts/install-local.ts",
+    "uninstall:local": "bun scripts/install-local.ts --uninstall"
   },
   "dependencies": {
     "@openllm/schema": "workspace:*",
