@@ -34,6 +34,8 @@ import {
   clearInstalling,
   setInstalling,
 } from "./installing-state";
+import type { TIntegrationKind } from "./integrations";
+import { runIntegration } from "./integrations";
 import { openSealed, sealTo } from "./keypair";
 import { logDebug, logError, logInfo } from "./logger";
 import { hasPendingAuth } from "./pending-auth";
@@ -92,7 +94,9 @@ const runCommand = async (cmd: TDaemonCommand): Promise<TDaemonCommandAck> => {
   return ack;
 };
 
-const runCommandInner = async (
+// Exported for the relay-dispatch test — exercises the kind→handler mapping
+// (e.g. the integration install/uninstall payload guard) without the loop.
+export const runCommandInner = async (
   cmd: TDaemonCommand,
 ): Promise<TDaemonCommandAck> => {
   try {
@@ -101,6 +105,8 @@ const runCommandInner = async (
       target_key?: string;
       target_pubkey?: string;
       sealed?: string;
+      kind?: string;
+      target?: string;
     };
     switch (cmd.kind) {
       case "connect": {
@@ -143,6 +149,35 @@ const runCommandInner = async (
         } finally {
           clearInstalling(slug);
         }
+      }
+      case "install_integration":
+      case "uninstall_integration": {
+        // Run a skill/plugin/setup install or uninstall on THIS machine via the
+        // same shared executor the CLI uses. The dashboard enqueues this against
+        // the selected daemon key; the executor fetches the gateway script,
+        // verifies it (fail-closed), and shells out. See
+        // `docs/proposals/daemon-integration-triggers.md` §5.
+        const integrationKinds = ["skill", "plugin", "setup"];
+        if (
+          payload.kind === undefined ||
+          !integrationKinds.includes(payload.kind) ||
+          payload.slug === undefined
+        ) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: `${cmd.kind}: bad payload` },
+          };
+        }
+        const action =
+          cmd.kind === "install_integration" ? "install" : "uninstall";
+        const r = await runIntegration(
+          payload.kind as TIntegrationKind,
+          action,
+          payload.slug,
+          payload.target,
+        );
+        return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
       }
       case "connect_device_code": {
         // Start a device-code login (codex remote; kimi falls back to its

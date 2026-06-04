@@ -20,7 +20,14 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { TCompletionShell } from "./commands";
-import { COMMANDS, COMPLETION_SHELLS, FLAGS, PROVIDERS } from "./commands";
+import {
+  COMMANDS,
+  COMPLETION_SHELLS,
+  FLAGS,
+  INTEGRATION_ACTIONS,
+  INTEGRATION_GROUPS,
+  PROVIDERS,
+} from "./commands";
 
 export type { TCompletionShell } from "./commands";
 
@@ -28,6 +35,8 @@ export type { TCompletionShell } from "./commands";
 const TOP_LEVEL = [...COMMANDS.map((c) => c.name), ...FLAGS.map((f) => f.name)];
 /** `completion`'s own argument choices. */
 const COMPLETION_ARGS = [...COMPLETION_SHELLS, "install"];
+/** The integration groups' shared `<install|uninstall|list>` action choices. */
+const INTEGRATION_ARGS = [...INTEGRATION_ACTIONS];
 
 const bashScript = (): string => {
   const top = TOP_LEVEL.join(" ");
@@ -43,6 +52,7 @@ _openllmd() {
   case "$cmd" in
     completion) COMPREPLY=( $(compgen -W "${COMPLETION_ARGS.join(" ")}" -- "$cur") ) ;;
     set-token)  [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=( $(compgen -W "${PROVIDERS.join(" ")}" -- "$cur") ) ;;
+    ${INTEGRATION_GROUPS.join("|")}) [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=( $(compgen -W "${INTEGRATION_ARGS.join(" ")}" -- "$cur") ) ;;
   esac
 }
 complete -F _openllmd openllmd
@@ -68,6 +78,7 @@ _openllmd() {
       case "$line[1]" in
         completion) _values 'shell' ${COMPLETION_ARGS.join(" ")} ;;
         set-token)  _values 'provider' ${PROVIDERS.join(" ")} ;;
+        ${INTEGRATION_GROUPS.join("|")}) _values 'action' ${INTEGRATION_ARGS.join(" ")} ;;
       esac ;;
   esac
 }
@@ -83,6 +94,7 @@ const fishScript = (): string => {
   lines.push(
     `complete -c openllmd -n '__fish_seen_subcommand_from completion' -a '${COMPLETION_ARGS.join(" ")}'`,
     `complete -c openllmd -n '__fish_seen_subcommand_from set-token' -a '${PROVIDERS.join(" ")}'`,
+    `complete -c openllmd -n '__fish_seen_subcommand_from ${INTEGRATION_GROUPS.join(" ")}' -a '${INTEGRATION_ARGS.join(" ")}'`,
     `complete -c openllmd -s h -l help -d 'Show help'`,
     `complete -c openllmd -l version -d 'Print the version'`,
   );

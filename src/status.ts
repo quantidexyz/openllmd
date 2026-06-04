@@ -11,6 +11,7 @@ import { getCloudState } from "./config";
 import { DELEGATES } from "./delegation";
 import { daemonPort, hasApiKey } from "./env";
 import { isInstalling } from "./installing-state";
+import { detectInstalledIntegrations } from "./integrations-detect";
 import { daemonPublicKey } from "./keypair";
 import { cachedUsage } from "./usage-cache";
 import { DAEMON_VERSION } from "./version";
@@ -48,5 +49,6 @@ export const computeStatus = async (): Promise<TDaemonStatus> => {
     pubkey: daemonPublicKey(),
     port: daemonPort(),
     connections,
+    integrations: detectInstalledIntegrations(),
   };
 };

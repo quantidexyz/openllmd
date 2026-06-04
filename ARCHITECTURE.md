@@ -52,7 +52,9 @@ daemon/
   scripts/install-local.ts  build host binary + install locally (no release)
   src/
     main.ts                 boot: runCli() dispatch, else refresh bootstrap → Bun.serve(127.0.0.1)
-    cli.ts                  `openllmd <cmd>` dispatch (start/stop/status/restart/uninstall/set-token/completion/help)
+    cli.ts                  `openllmd <cmd>` dispatch (start/stop/status/restart/skill/plugin/setup/uninstall/set-token/completion/help)
+    integrations.ts         shared executor: fetch a gateway install/uninstall script → verify SHA-256 (fail-closed) → bash. Behind the CLI verbs + the relay's install/uninstall_integration kinds
+    integrations-detect.ts  best-effort claude-code footprint scan → DaemonStatus.integrations (stateful dashboard buttons)
     service.ts              self-managed launch agent / systemd unit (start = self-restore; stop = disable; serviceUninstall = stop + delete registration)
     uninstall.ts            `openllmd uninstall` — confirm → stop+unregister → strip completion + owned PATH symlink → delete all state (credentials)
     completion.ts           bash/zsh/fish shell completion (emit + `completion install` / `uninstallCompletion`)
@@ -78,6 +80,33 @@ daemon/
                             token URL from the CLI binary (drift-safe), cached + fallback
       claude-code.ts chatgpt.ts kimi-code.ts util.ts index.ts
 ```
+
+## Integration triggers (skill / plugin / setup install + uninstall)
+
+The daemon can install/uninstall any catalogued **skill**, **plugin**, or
+**setup** on its own machine, two ways through ONE executor
+(`integrations.ts`, coreless — `fetch` + `Bun.spawn`):
+
+- **CLI:** `openllmd {skill|plugin|setup} <install|uninstall|list> [slug]` —
+  foreground one-shot (no server boot), completion-derived from `commands.ts`.
+- **Relay:** the dashboard's "Install with the daemon" button enqueues an
+  `install_integration` / `uninstall_integration` command (via the existing
+  `POST /api/daemon/cmd` → poll), dispatched in `control-relay.ts`.
+
+`runIntegration` fetches the gateway's EXISTING
+`/api/<area>/<slug>/<action>.sh` (so no install logic is forked onto the box —
+the script already encapsulates the per-target footprint) and pipes it to
+`bash` with `OPENLLM_API_KEY` in its env. **Fail-closed integrity:** before any
+execution it fetches the gateway's separately-served SHA-256
+(`/api/daemon/integrity`), refuses on mismatch / missing digest, and places the
+key into the executed env ONLY after verification — mirroring the binary
+checksum gate in `packages/setup/daemon/install.sh`.
+
+`integrations-detect.ts` scans the claude-code footprint
+(`~/.claude/skills|plugins/<slug>/`, the `settings.json` / codex / kimi config
+markers) and reports it on `DaemonStatus.integrations`, so the dashboard renders
+a stateful Install vs ✓ installed / Uninstall button. See
+[`docs/proposals/daemon-integration-triggers.md`](../../docs/proposals/daemon-integration-triggers.md).
 
 ## Coreless walker (the data path)
 
