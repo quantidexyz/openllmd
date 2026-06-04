@@ -100,24 +100,21 @@ import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
 import { forwardToCloud } from "./forward";
 
-// Upstream endpoints + wire per subscription provider. URLs are the
-// vendors' public endpoints (stable); the walker hardcodes them rather
-// than pulling from the cloud catalog — `__plan` carries only model ids.
+// Upstream WIRE per subscription provider — structural (which adapter to run),
+// the one constant that stays in the walker. The upstream URL is no longer
+// hardcoded here: it's resolved per hop from the delegate's exec fixture
+// (`credentialForUpstream().url`), captured from the real CLI request. See
+// `docs/proposals/delegation-exec-fixtures.md`.
 type TUpstreamWire = "anthropic" | "chatgpt" | "openai";
-type TSubUpstream = { readonly url: string; readonly wire: TUpstreamWire };
-const SUBSCRIPTION_UPSTREAM: Readonly<Record<string, TSubUpstream>> = {
-  claude_code: {
-    url: "https://api.anthropic.com/v1/messages",
-    wire: "anthropic",
-  },
-  chatgpt: {
-    url: "https://chatgpt.com/backend-api/codex/responses",
-    wire: "chatgpt",
-  },
-  kimi_code: {
-    url: "https://api.kimi.com/coding/v1/chat/completions",
-    wire: "openai",
-  },
+const UPSTREAM_WIRE: Readonly<Record<string, TUpstreamWire>> = {
+  claude_code: "anthropic",
+  chatgpt: "chatgpt",
+  // Kimi gated its OpenAI-wire `/chat/completions` to approved coding agents
+  // (403 `access_terminated_error`); its Anthropic-compatible
+  // `/coding/v1/messages` endpoint serves the same subscription to Claude Code.
+  // So we delegate over the anthropic wire (URL from the delegate's
+  // `credentialForUpstream`). See `kimi-code.ts`.
+  kimi_code: "anthropic",
 };
 
 // The chatgpt Responses API emits freeform JSON events (no strict schema);
@@ -221,7 +218,7 @@ export const verifyPlanSignature = (
 export const canWalkPlan = (hops: ReadonlyArray<THop>): boolean => {
   for (const hop of hops) {
     if (!isSubscriptionSlug(hop.provider)) continue; // API-key → forwardable
-    if (SUBSCRIPTION_UPSTREAM[hop.provider] === undefined) return false;
+    if (UPSTREAM_WIRE[hop.provider] === undefined) return false;
   }
   return true;
 };
@@ -312,12 +309,12 @@ const decodeAnthropicResponse = Schema.decodeUnknownSync(AnthropicResponse);
 
 /** Decode an upstream SSE stream into canonical chunks, per upstream wire. */
 const decodeUpstreamStream = (
-  up: TSubUpstream,
+  wire: TUpstreamWire,
   body: ReadableStream<Uint8Array>,
   providerModelId: string,
 ): ReadableStream<TChatCompletionChunk> => {
   const options = { providerModelId };
-  if (up.wire === "anthropic") {
+  if (wire === "anthropic") {
     return decodeProviderEventStream(
       body,
       {
@@ -328,7 +325,7 @@ const decodeUpstreamStream = (
       options,
     );
   }
-  if (up.wire === "chatgpt") {
+  if (wire === "chatgpt") {
     return decodeProviderEventStream(
       body,
       {
@@ -353,11 +350,11 @@ const decodeUpstreamStream = (
 
 /** Decode an upstream non-streaming JSON body into a canonical response. */
 const decodeUpstreamJson = (
-  up: TSubUpstream,
+  wire: TUpstreamWire,
   json: unknown,
   providerModelId: string,
 ): TChatCompletionResponse => {
-  if (up.wire === "anthropic") {
+  if (wire === "anthropic") {
     const anthropic: TAnthropicResponse = decodeAnthropicResponse(json);
     return fromAnthropicResponse(anthropic, { providerModelId });
   }
@@ -391,12 +388,12 @@ const requestDeclaresWebSearch = (req: TChatCompletionRequest): boolean =>
  * `webSearchTool.appliesTo` (all combos but `messages.anthropic.passthrough`).
  */
 const shouldInterceptWebSearch = (
-  up: TSubUpstream,
+  wire: TUpstreamWire,
   surface: TWalkArgs["surface"],
   canonical: TChatCompletionRequest,
 ): boolean =>
   requestDeclaresWebSearch(canonical) &&
-  !(up.wire === "anthropic" && clientWireOf(surface) === "anthropic");
+  !(wire === "anthropic" && clientWireOf(surface) === "anthropic");
 
 /** Splice native `server_tool_use` + `web_search_tool_result` blocks to the
  *  front of an Anthropic response's content so Claude Code's WebSearch
@@ -412,20 +409,28 @@ const spliceAnthropicWebSearchBlocks = (
 };
 
 /**
- * Resolve the provider's delegate + read the official CLI's credential into
- * the BASE headers (its genuine identity + bearer). The wire-derived headers
- * (anthropic-version / anthropic-beta / content-type) are layered on by
- * `buildUpstreamRequest`/`buildUpstreamHeaders`. Returns "retry" when no
- * usable local credential is available, so the walker falls through.
+ * Resolve the provider's delegate + read the official CLI's credential into the
+ * BASE headers (its genuine identity + bearer) AND the upstream URL — both come
+ * from the delegate's exec fixture (`credentialForUpstream`), captured from the
+ * real CLI request. The wire-derived headers (anthropic-version / anthropic-beta
+ * / content-type) are layered on by `buildUpstreamRequest`/`buildUpstreamHeaders`.
+ * Returns "retry" when no usable local credential is available, so the walker
+ * falls through.
  */
-const acquireBaseHeaders = async (
+const acquireUpstream = async (
   provider: string,
-): Promise<Record<string, string> | "retry"> => {
+): Promise<{ headers: Record<string, string>; url: string } | "retry"> => {
   const delegate = getDelegate(provider);
   if (delegate === null) return "retry";
   try {
     const cred = await delegate.credentialForUpstream();
-    return { ...cred.headers, authorization: `Bearer ${cred.access_token}` };
+    return {
+      headers: {
+        ...cred.headers,
+        authorization: `Bearer ${cred.access_token}`,
+      },
+      url: cred.url,
+    };
   } catch {
     return "retry";
   }
@@ -447,23 +452,24 @@ const inboundBetaOf = (args: TWalkArgs): string | null =>
  */
 const serveWithWebSearch = async (
   hop: THop,
-  up: TSubUpstream,
+  wire: TUpstreamWire,
   args: TWalkArgs,
   initialCanonical: TChatCompletionRequest,
 ): Promise<Response | "retry"> => {
-  const baseHeaders = await acquireBaseHeaders(hop.provider);
-  if (baseHeaders === "retry") return "retry";
+  const acquired = await acquireUpstream(hop.provider);
+  if (acquired === "retry") return "retry";
+  const { headers: baseHeaders, url } = acquired;
   // Headers are computed once; the body is rebuilt per round from the
   // accumulated canonical (web_search appends tool results between rounds).
   const headers = buildUpstreamHeaders({
     surface: args.surface,
-    upstreamWire: up.wire,
+    upstreamWire: wire,
     rawBody: args.rawBody,
     providerModelId: hop.providerModelId,
     stream: false,
     baseHeaders,
     inboundBeta: inboundBetaOf(args),
-    isOAuth: up.wire === "anthropic",
+    isOAuth: wire === "anthropic",
   });
 
   let canonical = initialCanonical;
@@ -476,14 +482,14 @@ const serveWithWebSearch = async (
   for (let round = 0; round < MAX_WEB_SEARCH_ROUNDS; round++) {
     // Accumulated cross-wire body (chatgpt still streams + is drained).
     const body = canonicalToUpstreamBody(
-      up.wire,
+      wire,
       canonical,
       hop.providerModelId,
       false,
     );
     let resp: Response;
     try {
-      resp = await fetch(up.url, {
+      resp = await fetch(url, {
         method: "POST",
         headers,
         body: JSON.stringify(body),
@@ -501,7 +507,7 @@ const serveWithWebSearch = async (
       if (
         round === 0 &&
         resp.status === 400 &&
-        transient400Envelope(detail, up.wire)
+        transient400Envelope(detail, wire)
       ) {
         return "retry";
       }
@@ -517,13 +523,13 @@ const serveWithWebSearch = async (
     let roundResp: TChatCompletionResponse;
     try {
       roundResp =
-        up.wire === "chatgpt"
+        wire === "chatgpt"
           ? await accumulateChunksToResponse(
-              decodeUpstreamStream(up, resp.body, hop.providerModelId),
+              decodeUpstreamStream(wire, resp.body, hop.providerModelId),
               hop.providerModelId,
             )
           : decodeUpstreamJson(
-              up,
+              wire,
               JSON.parse(await resp.text()),
               hop.providerModelId,
             );
@@ -640,11 +646,12 @@ const serveWithWebSearch = async (
  */
 const serveSubscription = async (
   hop: THop,
-  up: TSubUpstream,
+  wire: TUpstreamWire,
   args: TWalkArgs,
 ): Promise<Response | "retry"> => {
-  const baseHeaders = await acquireBaseHeaders(hop.provider);
-  if (baseHeaders === "retry") return "retry";
+  const acquired = await acquireUpstream(hop.provider);
+  if (acquired === "retry") return "retry";
+  const { headers: baseHeaders, url } = acquired;
 
   const clientWantsStream =
     (args.rawBody as { stream?: unknown } | null)?.stream === true;
@@ -652,17 +659,17 @@ const serveSubscription = async (
   // pairing (the cloud runner calls the same builder).
   const { body, headers } = buildUpstreamRequest({
     surface: args.surface,
-    upstreamWire: up.wire,
+    upstreamWire: wire,
     rawBody: args.rawBody,
     providerModelId: hop.providerModelId,
     stream: clientWantsStream,
     baseHeaders,
     inboundBeta: inboundBetaOf(args),
-    isOAuth: up.wire === "anthropic",
+    isOAuth: wire === "anthropic",
   });
   let resp: Response;
   try {
-    resp = await fetch(up.url, {
+    resp = await fetch(url, {
       method: "POST",
       headers,
       body: JSON.stringify(body),
@@ -676,7 +683,7 @@ const serveSubscription = async (
     const raw = await resp.text().catch(() => "");
     // A content-filter / context-length / capability 400 is transient — walk
     // to the next hop like the cloud does.
-    if (resp.status === 400 && transient400Envelope(raw, up.wire)) {
+    if (resp.status === 400 && transient400Envelope(raw, wire)) {
       return "retry";
     }
     // Every other non-OK is terminal: surface the upstream error verbatim.
@@ -697,13 +704,13 @@ const serveSubscription = async (
   const clientWire = clientWireOf(args.surface);
   // `responses` clients always need a Responses re-encode (never raw upstream
   // bytes), so they never take the verbatim passthrough.
-  const passthrough = up.wire === clientWire && args.surface !== "responses";
+  const passthrough = wire === clientWire && args.surface !== "responses";
   // What the UPSTREAM produced, decided deterministically (not sniffed):
   // chatgpt's Codex/Responses endpoint ALWAYS streams (`toChatGptRequest`
   // forces `stream: true`); anthropic + kimi propagate the request's stream
   // flag, which buildUpstreamBody set from the client's. So upstream is SSE
   // iff chatgpt, or the client asked to stream.
-  const upstreamStreams = up.wire === "chatgpt" || clientWantsStream;
+  const upstreamStreams = wire === "chatgpt" || clientWantsStream;
   const baseRow = {
     model: hop.modelId,
     provider: hop.provider,
@@ -756,7 +763,7 @@ const serveSubscription = async (
       // (no transform round-trip that could alter them); a tee'd copy is
       // decoded purely to meter.
       const [toClient, toMeter] = resp.body.tee();
-      meter(decodeUpstreamStream(up, toMeter, hop.providerModelId));
+      meter(decodeUpstreamStream(wire, toMeter, hop.providerModelId));
       return new Response(heartbeat(toClient), {
         status: resp.status,
         headers: passthroughHeaders(resp),
@@ -764,7 +771,7 @@ const serveSubscription = async (
     }
     // Cross-wire (or chatgpt): decode → tee → re-encode + meter.
     const [toClient, toMeter] = decodeUpstreamStream(
-      up,
+      wire,
       resp.body,
       hop.providerModelId,
     ).tee();
@@ -798,7 +805,7 @@ const serveSubscription = async (
     let canonical: TChatCompletionResponse;
     try {
       canonical = await accumulateChunksToResponse(
-        decodeUpstreamStream(up, resp.body, hop.providerModelId),
+        decodeUpstreamStream(wire, resp.body, hop.providerModelId),
         hop.providerModelId,
       );
     } catch {
@@ -828,7 +835,7 @@ const serveSubscription = async (
   }
   let canonical: TChatCompletionResponse;
   try {
-    canonical = decodeUpstreamJson(up, upstreamJson, hop.providerModelId);
+    canonical = decodeUpstreamJson(wire, upstreamJson, hop.providerModelId);
   } catch {
     recordTokens({ tokens_in: 0, tokens_out: 0 });
     return new Response(text, {
@@ -899,11 +906,11 @@ export const runWalker = async (args: TWalkArgs): Promise<Response> => {
 
   let lastError: string | null = null;
   for (const hop of hops) {
-    const up = SUBSCRIPTION_UPSTREAM[hop.provider];
-    if (up !== undefined) {
-      const served = shouldInterceptWebSearch(up, args.surface, canonical)
-        ? await serveWithWebSearch(hop, up, args, canonical)
-        : await serveSubscription(hop, up, args);
+    const wire = UPSTREAM_WIRE[hop.provider];
+    if (wire !== undefined) {
+      const served = shouldInterceptWebSearch(wire, args.surface, canonical)
+        ? await serveWithWebSearch(hop, wire, args, canonical)
+        : await serveSubscription(hop, wire, args);
       if (served !== "retry") return served; // committed
       lastError = `subscription hop ${hop.modelId} failed pre-stream`;
       continue;

@@ -108,6 +108,36 @@ const ANSI_RE = new RegExp(
  */
 export const stripAnsi = (s: string): string => s.replace(ANSI_RE, "");
 
+/**
+ * Best-effort open a URL in the user's default browser (macOS `open`, Windows
+ * `cmd /c start`, else `xdg-open`). Used by the browser / device-code login
+ * flows to bring up the vendor's auth page FROM the daemon — some vendor CLIs
+ * print the URL but their own auto-open doesn't reach the user's GUI session
+ * when the daemon spawns them (e.g. codex). Never throws; the user can copy the
+ * URL from the card.
+ */
+export const openUrl = (url: string): void => {
+  const os = platform();
+  // Windows: `start` is a cmd builtin, so it must run via `cmd /c`; the empty
+  // "" is the (required) window-title arg, and the URL is quoted so `cmd.exe`
+  // doesn't treat an OAuth URL's `&` as a command separator.
+  const argv: string[] =
+    os === "darwin"
+      ? ["open", url]
+      : os === "win32"
+        ? ["cmd", "/c", "start", "", `"${url}"`]
+        : ["xdg-open", url];
+  try {
+    Bun.spawn(argv, {
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+  } catch {
+    // best-effort — the user can copy the URL from the card detail
+  }
+};
+
 /** Read + JSON-parse a file, or null if absent / unparseable. */
 export const readJsonFile = async <T>(path: string): Promise<T | null> => {
   try {

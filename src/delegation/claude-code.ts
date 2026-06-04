@@ -39,6 +39,11 @@ import {
   SETUP_TOKEN_RE,
   setSetupToken,
 } from "../setup-token";
+import {
+  defaultUpstreamUrl,
+  ensureExecFixture,
+  resolveUpstream,
+} from "./exec-fixture";
 import type { TProviderDelegate } from "./types";
 import {
   cliVersion,
@@ -406,6 +411,9 @@ export const claudeCodeDelegate: TProviderDelegate = {
     const viaAuth = await authStatusLoggedIn();
     const connected = viaAuth !== null ? viaAuth : (await readToken()) !== null;
     if (connected) {
+      // Re-capture the exec fixture now that the identity may have changed
+      // (account-scoped headers). Best-effort + non-blocking.
+      void ensureExecFixture(PROVIDER, { force: true }).catch(() => {});
       return { connected: true, detail: "signed in via Claude Code" };
     }
     return {
@@ -514,19 +522,25 @@ export const claudeCodeDelegate: TProviderDelegate = {
     }
   },
 
+  ensureFixture: (opts) => ensureExecFixture(PROVIDER, opts),
+
   credentialForUpstream: async () => {
     const token = await readToken();
     if (token === null) {
       throw new Error("claude_code: not signed in (no stored credential)");
     }
-    return {
-      access_token: token.accessToken,
+    // Prefer the captured exec fixture (the genuine `claude` request); fall back
+    // to the delegate defaults when no fixture exists. The wire builder still
+    // owns/overrides anthropic-version + the anthropic-beta merge on top.
+    const { url, headers } = await resolveUpstream(PROVIDER, {
+      url: defaultUpstreamUrl(PROVIDER),
       headers: {
         "anthropic-beta": OAUTH_BETA,
         "anthropic-version": "2023-06-01",
         "user-agent": await userAgent(),
       },
-    };
+    });
+    return { access_token: token.accessToken, headers, url };
   },
 
   logout: async () => {

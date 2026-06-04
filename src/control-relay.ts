@@ -35,7 +35,7 @@ import {
   setInstalling,
 } from "./installing-state";
 import { openSealed, sealTo } from "./keypair";
-import { logDebug, logError } from "./logger";
+import { logDebug, logError, logInfo } from "./logger";
 import { hasPendingAuth } from "./pending-auth";
 import { maybeSelfUpdate } from "./self-update";
 import { setSetupToken } from "./setup-token";
@@ -418,6 +418,9 @@ const loop = async (): Promise<void> => {
         AbortSignal.timeout(POLL_TIMEOUT_MS),
       );
       if (commands.length > 0) {
+        logInfo("control-loop", "drained commands", {
+          kinds: commands.map((c) => c.kind),
+        });
         const acks: TDaemonCommandAck[] = [];
         for (const cmd of commands) acks.push(await runCommand(cmd));
         const status = await computeStatus();

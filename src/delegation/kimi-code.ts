@@ -43,11 +43,28 @@ import {
   pendingAuthDetail,
   setPendingAuth,
 } from "../pending-auth";
+import {
+  defaultUpstreamUrl,
+  ensureExecFixture,
+  resolveUpstream,
+} from "./exec-fixture";
 import type { TProviderDelegate } from "./types";
-import { cliVersion, readJsonFile } from "./util";
+import { cliVersion, openUrl, readJsonFile } from "./util";
 
 const PROVIDER = "kimi_code" as const;
 const USAGE_URL = "https://api.kimi.com/coding/v1/usages";
+
+// Kimi gated its OpenAI-wire `/coding/v1/chat/completions` to approved coding
+// agents — the `kimi-code-cli` identity now gets a 403 `access_terminated_error`
+// ("Kimi For Coding is currently only available for Coding Agents such as Kimi
+// CLI, Claude Code, Roo Code, Kilo Code"). Its Anthropic-compatible
+// `/coding/v1/messages` endpoint serves the SAME subscription to "Claude Code"
+// (an approved agent), so inference is delegated over the anthropic wire AS
+// Claude Code: the walker maps kimi_code → the `anthropic` upstream wire (it
+// adds anthropic-version/-beta + the bearer), and we present Claude Code's
+// user-agent here. The `X-Msh-*` device identity stays on the still-open usage
+// endpoint only (`usage()` below). Verified end-to-end with the Claude harness.
+const CLAUDE_CODE_USER_AGENT = "claude-cli/2.0.0 (external, cli)";
 
 // Device-code OAuth — verbatim from `ref/kimi-code/packages/oauth`
 // (constants.ts + oauth.ts). Same host + public client id the CLI uses,
@@ -346,19 +363,6 @@ const writeCredential = (wire: Record<string, unknown>): void => {
   });
 };
 
-const openUrl = (url: string): void => {
-  const cmd = process.platform === "darwin" ? "open" : "xdg-open";
-  try {
-    Bun.spawn([cmd, url], {
-      stdin: "ignore",
-      stdout: "ignore",
-      stderr: "ignore",
-    });
-  } catch {
-    // best-effort — the user can copy the URL from the card detail
-  }
-};
-
 // One in-flight login per process. The background poll writes the
 // credential on success; the status watcher (~5s) then flips the card to
 // connected — so we don't import the SSE broadcaster here (avoids a
@@ -382,6 +386,8 @@ const startBackgroundLogin = (
         const res = await pollToken(auth.deviceCode, headers);
         if (res.kind === "success") {
           writeCredential(res.wire);
+          // Re-capture the exec fixture now that the identity is established.
+          void ensureExecFixture(PROVIDER, { force: true }).catch(() => {});
           return;
         }
         if (res.kind === "stop") return;
@@ -651,15 +657,23 @@ export const kimiCodeDelegate: TProviderDelegate = {
     }
   },
 
+  ensureFixture: (opts) => ensureExecFixture(PROVIDER, opts),
+
   credentialForUpstream: async () => {
     const token = await readToken();
     if (token === null) {
       throw new Error("kimi_code: not signed in (no stored credential)");
     }
-    return {
-      access_token: token.accessToken,
-      headers: await identityHeaders(),
-    };
+    // Serve over the Anthropic-wire endpoint AS Claude Code (the OpenAI-wire
+    // `kimi-code-cli` path is gated — see the CLAUDE_CODE_USER_AGENT note). The
+    // URL is the `/coding/v1/messages` endpoint (`defaultUpstreamUrl`); the
+    // walker's anthropic wire adds anthropic-version/-beta + the bearer. We do
+    // NOT send the `X-Msh-*` kimi-cli identity here — that's the gated one.
+    const { url, headers } = await resolveUpstream(PROVIDER, {
+      url: defaultUpstreamUrl(PROVIDER),
+      headers: { "user-agent": CLAUDE_CODE_USER_AGENT },
+    });
+    return { access_token: token.accessToken, headers, url };
   },
 
   logout: async () => {

@@ -36,6 +36,10 @@ export const clearPendingAuth = (slug: string): void => {
  *  refresh. See `docs/proposals/daemon-browser-status-sync.md` §2.2. */
 export const hasPendingAuth = (): boolean => pending.size > 0;
 
-/** A human-facing one-liner for the dashboard `detail` while a code is live. */
+/** A human-facing one-liner for the dashboard `detail` while a pending auth is
+ *  live. Device-code flows carry a `code`; the browser-OAuth flow (codex) has
+ *  none (the localhost callback completes it), so the code clause is omitted. */
 export const pendingAuthDetail = (auth: TPendingAuth): string =>
-  `Open ${auth.url} in your browser and enter the code ${auth.code} to authorize. This updates automatically once you're done.`;
+  auth.code.length > 0
+    ? `Open ${auth.url} in your browser and enter the code ${auth.code} to authorize. This updates automatically once you're done.`
+    : `Open ${auth.url} in your browser to authorize. This updates automatically once you're done.`;

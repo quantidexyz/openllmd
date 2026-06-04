@@ -71,6 +71,8 @@ daemon/
     record.ts/version/env   request recording, version, env (+ env-file loader)
     delegation/             isolated-CLI delegates per provider
       types.ts              TProviderDelegate contract
+      exec-fixture.ts       capture the real CLI exec request (url + identity
+                            headers) → fixture; the upstream URL + headers source
       claude-code.ts chatgpt.ts kimi-code.ts util.ts index.ts
 ```
 
@@ -249,9 +251,22 @@ runs its OWN copy of each CLI under `<stateDir>/cli/<provider>/`
 Each `TProviderDelegate` wraps the daemon's isolated CLI: `detect`
 (`cliInstallState`), `connect` (trigger the CLI's native login under the
 isolated env), `usage` (read locally with the CLI's own credential), and
-`credentialForUpstream` (bearer + the CLI's real identity headers for the
-local runner). Nothing the delegate reads from a CLI's store is ever sent
-off-box.
+`credentialForUpstream` (bearer + the CLI's real identity headers + the upstream
+URL for the local runner). Nothing the delegate reads from a CLI's store is ever
+sent off-box.
+
+**Identity is captured, not hardcoded (`exec-fixture.ts`).** Rather than
+hand-copy each vendor's inference URL + identity headers (they drift on CLI
+updates, and the daemon must impersonate the CLI byte-for-byte — T2), the daemon
+runs the CLI once in headless `exec` mode (`claude -p`, `codex exec`, `kimi -p`)
+pointed at a loopback recorder, captures the exact request it builds (path +
+headers), kills it before anything reaches the vendor (zero token cost), and
+serves from that fixture. `ensureExecFixture` re-captures on a 6h TTL, a CLI
+version bump, or after a re-login; `resolveUpstream` prefers the captured fixture
+and falls back to the delegate's built-in identity when none exists. The only
+retained constants are the upstream ORIGIN + default path per provider
+(`UPSTREAM_WIRE` in the walker keeps the structural wire). See
+[`delegation-exec-fixtures.md`](../../docs/proposals/delegation-exec-fixtures.md).
 
 Login per provider (the CLI opens the user's browser, the user signs in,
 and the CLI completes via its own localhost callback then exits;
