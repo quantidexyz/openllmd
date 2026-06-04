@@ -1,14 +1,16 @@
 /**
  * OpenLLM local daemon — entrypoint.
  *
- * Headless. Boots a localhost `Bun.serve` that exposes ONE surface — the
- * OpenAI/Anthropic-compatible `/v1/*` inference surface, run locally
- * against `packages/core`'s pipeline for SUBSCRIPTION hops (credentials
- * delegated to the official vendor CLIs). Control (status / connect /
- * cli-install) is NOT served on localhost anymore: the daemon dials OUT to
- * the cloud control channel (`control-relay.ts`) and the dashboard drives
- * it from there — so there's no browser→loopback hop (no Private Network
- * Access prompt). See `docs/proposals/daemon-control-via-neon-longpoll.md`.
+ * Headless. Boots a localhost `Bun.serve` that exposes the
+ * OpenAI/Anthropic-compatible `/v1/*` inference surface (run locally against
+ * `packages/core`'s pipeline for SUBSCRIPTION hops, credentials delegated to
+ * the official vendor CLIs) plus a tiny read-only `/whoami` that returns this
+ * daemon's opaque `device_id` so the dashboard can tell which key's daemon is
+ * on THIS host (`docs/proposals/this-machine-detection-audit.md`). CONTROL
+ * (status / connect / cli-install) is NOT served on localhost: the daemon
+ * dials OUT to the cloud control channel (`control-relay.ts`) and the
+ * dashboard drives it from there. Both loopback routes share one cross-origin
+ * CORS/PNA grant. See `docs/proposals/daemon-control-via-neon-longpoll.md`.
  *
  * It holds NO DEK and decrypts NO vault credential. The only secret it
  * carries is the user's `sk-llm-...` key, used to authenticate cloud
@@ -25,7 +27,8 @@ import {
   reportControlInactive,
   startControlRelay,
 } from "./control-relay";
-import { isDevMode } from "./env";
+import { corsHeaders, isPreflight, preflightResponse } from "./cors";
+import { daemonPort, deviceId, isDevMode } from "./env";
 import { handleInference } from "./listener";
 import { logError, logInfo } from "./logger";
 import {
@@ -36,8 +39,6 @@ import {
 } from "./self-update";
 import { DAEMON_VERSION } from "./version";
 
-const DEFAULT_PORT = 8787;
-
 // Once the cloud snapshot is healthy, refresh every 5 minutes to stay in
 // lockstep with dashboard config changes.
 const BOOTSTRAP_TTL_MS = 5 * 60 * 1000;
@@ -46,15 +47,8 @@ const BOOTSTRAP_TTL_MS = 5 * 60 * 1000;
 // or a `next dev` that finished compiling — without waiting a full TTL.
 const BOOTSTRAP_RETRY_MS = 5 * 1000;
 
-const readPort = (): number => {
-  const raw = process.env.OPENLLM_DAEMON_PORT;
-  if (raw === undefined) return DEFAULT_PORT;
-  const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_PORT;
-};
-
 const main = async (): Promise<void> => {
-  const port = readPort();
+  const port = daemonPort();
 
   // Last-resort crash handling. The daemon is headless under launchd/systemd,
   // so an uncaught throw or rejected promise would otherwise die silently —
@@ -175,8 +169,24 @@ const main = async (): Promise<void> => {
           headers,
         });
       }
-      // The daemon serves ONLY /v1/* locally now — control comes via the
-      // cloud relay, not a browser→loopback call.
+      // `/whoami` — the ONLY non-`/v1` loopback route: returns this daemon's
+      // opaque `device_id` so the dashboard can learn which key's daemon is on
+      // THIS host (a daemon answering your own loopback IS on your machine —
+      // the single authoritative locality signal, replacing the IP heuristic +
+      // localStorage device-code guess). No PII, no token; reuses the same
+      // cross-origin CORS/PNA grant the browser already holds for `/v1/*`. See
+      // `docs/proposals/this-machine-detection-audit.md`.
+      if (url.pathname === "/whoami") {
+        if (isPreflight(req)) return preflightResponse(req);
+        const headers = new Headers(corsHeaders(req));
+        headers.set("content-type", "application/json");
+        return new Response(JSON.stringify({ device_id: deviceId() }), {
+          status: 200,
+          headers,
+        });
+      }
+      // Everything else: control comes via the cloud relay, not a
+      // browser→loopback call.
       return new Response(JSON.stringify({ error: "not found" }), {
         status: 404,
         headers: { "content-type": "application/json" },

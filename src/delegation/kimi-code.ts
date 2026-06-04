@@ -382,7 +382,6 @@ const startBackgroundLogin = (
         const res = await pollToken(auth.deviceCode, headers);
         if (res.kind === "success") {
           writeCredential(res.wire);
-          clearPendingAuth(PROVIDER);
           return;
         }
         if (res.kind === "stop") return;
@@ -392,6 +391,12 @@ const startBackgroundLogin = (
       // swallow — the user can retry Connect
     } finally {
       loginInFlight = false;
+      // Always drop the in-memory device code when the flow ends. On SUCCESS the
+      // credential is now on disk, so `status()` reports Connected from the token
+      // regardless of pending-auth; on expiry / denial / error / deadline this
+      // stops the card from showing a DEAD code forever (and the dashboard from
+      // fast-polling it indefinitely). Mirrors codex's `proc.exited` cleanup.
+      clearPendingAuth(PROVIDER);
     }
   })();
 };

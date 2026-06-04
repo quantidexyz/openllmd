@@ -100,6 +100,27 @@ const loadEnvFile = (): void => {
 export const stateDir = (): string =>
   process.env.OPENLLM_DAEMON_STATE_DIR ?? join(homedir(), ".openllm");
 
+/** The default loopback port for the daemon's `/v1/*` + `/whoami` surface. */
+export const DEFAULT_DAEMON_PORT = 8787;
+
+/**
+ * The loopback port the daemon listens on (`OPENLLM_DAEMON_PORT`, default
+ * `8787`). Single source — `main.ts` binds it and `status.ts` publishes it on
+ * `TDaemonStatus.port` so the dashboard can probe `/whoami` for locality. See
+ * `docs/proposals/this-machine-detection-audit.md`.
+ */
+export const daemonPort = (): number => {
+  // `main()` resolves the port before anything else calls `daemonEnv()`, so load
+  // the env file here too — otherwise a port supplied via `OPENLLM_DAEMON_ENV_FILE`
+  // is ignored for the actual bind. Idempotent (only sets unset vars).
+  loadEnvFile();
+  const raw = process.env.OPENLLM_DAEMON_PORT;
+  if (raw === undefined) return DEFAULT_DAEMON_PORT;
+  // Whole-string integer in the valid TCP range — reject `8787abc`, `0`, > 65535.
+  const n = Number(raw.trim());
+  return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : DEFAULT_DAEMON_PORT;
+};
+
 const apiKeyFile = (): string => join(stateDir(), "api-key");
 
 const deviceIdFile = (): string => join(stateDir(), "device-id");

@@ -24,6 +24,7 @@ import {
   pollControl,
   relayCredential,
   reportStatus,
+  TransientUpstreamError,
 } from "./cloud-client";
 import { latestVersion, refreshBootstrap } from "./config";
 import { getDelegate } from "./delegation";
@@ -34,7 +35,7 @@ import {
   setInstalling,
 } from "./installing-state";
 import { openSealed, sealTo } from "./keypair";
-import { logError } from "./logger";
+import { logDebug, logError } from "./logger";
 import { hasPendingAuth } from "./pending-auth";
 import { maybeSelfUpdate } from "./self-update";
 import { setSetupToken } from "./setup-token";
@@ -42,11 +43,32 @@ import { computeStatus } from "./status";
 
 // No key / unreachable / rejected → back off before re-dialing.
 const BACKOFF_MS = 5_000;
-// Abort a poll that outlives the server's hold + margin, then re-dial.
-const POLL_TIMEOUT_MS = 35_000;
+
+// Abort a poll that outlives the server's worst-case hold, then re-dial.
+// DERIVED from the server's contract (mirrored here — the daemon is
+// `@openllm/core`-free and can't import the cloud constants):
+//   server hold        = packages/api/lib/daemon-poll.ts  POLL_HOLD_MS  (25s)
+//   one in-flight claim = packages/db/neon/client.ts  DB_FETCH_TIMEOUT_MS (8s)
+// The handler enforces the hold as a hard ceiling, so the worst-case response
+// is hold + one bounded claim; we add a small margin so the daemon's abort is
+// always strictly above the server's worst case (never the other way round,
+// which is what produced the 35s-vs-35s race). See
+// `docs/proposals/daemon-poll-db-resilience.md` §3.4.
+const SERVER_POLL_HOLD_MS = 25_000;
+const SERVER_DB_FETCH_TIMEOUT_MS = 8_000;
+const POLL_TIMEOUT_MARGIN_MS = 2_000;
+const POLL_TIMEOUT_MS =
+  SERVER_POLL_HOLD_MS + SERVER_DB_FETCH_TIMEOUT_MS + POLL_TIMEOUT_MARGIN_MS;
 
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
+
+// An aborted/timed-out poll (our own `AbortSignal.timeout`, or the connection
+// dropping) is expected weather, not a fault — `AbortSignal.timeout` rejects
+// with a DOMException named `TimeoutError`; a manual abort, `AbortError`.
+const isAbortOrTimeout = (err: unknown): boolean =>
+  err instanceof Error &&
+  (err.name === "TimeoutError" || err.name === "AbortError");
 
 /**
  * Execute one delivered command via the existing control handlers. Returns
@@ -423,12 +445,21 @@ const loop = async (): Promise<void> => {
       // Log, but throttle: the loop retries every BACKOFF_MS, so an ongoing
       // outage would otherwise flood the log with the same line. Only write
       // when the error MESSAGE changes (i.e. a real transition), and never
-      // for the benign "no key yet" state.
+      // for the benign "no key yet" state. A transient hiccup (our own
+      // abort/timeout on the long-poll, or a soft 503/5xx from the cloud
+      // degrading on Neon weather) is downgraded to `debug` — and we never
+      // emit an empty message (the abort path used to log `""`).
       if (!(err instanceof NoApiKeyError)) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const transient =
+          isAbortOrTimeout(err) || err instanceof TransientUpstreamError;
+        const msg =
+          err instanceof Error && err.message.length > 0
+            ? err.message
+            : "control poll timed out";
         if (msg !== lastLoopError) {
           lastLoopError = msg;
-          logError("control-loop", err);
+          if (transient) logDebug("control-loop", msg);
+          else logError("control-loop", err);
         }
       }
       await sleep(BACKOFF_MS);

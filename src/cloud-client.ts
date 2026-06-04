@@ -40,6 +40,20 @@ export class InvalidApiKeyError extends Error {
   }
 }
 
+/**
+ * Thrown when the cloud returns a transient 503/5xx — a backend hiccup
+ * (a soft-503 from the poll handler degrading on Neon weather, or any upstream
+ * 5xx), NOT a real fault. The control loop backs off QUIETLY on it (debug, not
+ * error) rather than treating it like a hard failure. See
+ * `docs/proposals/daemon-poll-db-resilience.md` §3.5.
+ */
+export class TransientUpstreamError extends Error {
+  constructor(status: number) {
+    super(`cloud transiently unavailable (${status})`);
+    this.name = "TransientUpstreamError";
+  }
+}
+
 // `os.hostname()` is almost always plain ASCII, but a header value must be —
 // strip anything outside printable ASCII and cap the length so an exotic
 // hostname can't make `fetch` throw on an invalid header.
@@ -184,6 +198,11 @@ export const pollControl = async (
   });
   if (resp.status === 401 || resp.status === 403) {
     throw new InvalidApiKeyError(resp.status);
+  }
+  // A soft-503 (the poll handler degrading on Neon weather) or any upstream
+  // 5xx is transient — the loop backs off quietly and re-dials.
+  if (resp.status === 503 || resp.status >= 500) {
+    throw new TransientUpstreamError(resp.status);
   }
   if (!resp.ok) throw new Error(`control poll failed: ${resp.status}`);
   return (await resp.json()) as TDaemonPollResponse;

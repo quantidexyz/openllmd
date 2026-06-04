@@ -21,7 +21,7 @@ const logFile = (): string => join(stateDir(), "openllmd.log");
 // only on errors, and we only need the recent tail to debug).
 const MAX_BYTES = 5 * 1024 * 1024;
 
-type TLevel = "error" | "warn" | "info";
+type TLevel = "error" | "warn" | "info" | "debug";
 
 const serializeErr = (err: unknown): string => {
   if (err instanceof Error) return err.stack ?? `${err.name}: ${err.message}`;
@@ -94,3 +94,14 @@ export const logInfo = (
   message: string,
   meta?: Record<string, unknown>,
 ): void => write("info", scope, message, meta);
+
+/**
+ * Low-severity backoff/weather (a transient cloud hiccup, an abort/timeout on
+ * the long-poll). Recorded for context but NOT a fault — keeps the error log
+ * free of expected re-dials. See `docs/proposals/daemon-poll-db-resilience.md`.
+ */
+export const logDebug = (
+  scope: string,
+  message: string,
+  meta?: Record<string, unknown>,
+): void => write("debug", scope, message, meta);
