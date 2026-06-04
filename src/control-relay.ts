@@ -16,6 +16,7 @@
  */
 
 import type { TDaemonCommand, TDaemonCommandAck } from "@openllm/schema";
+import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { installCli } from "./cli-install";
 import type { TCliProvider } from "./cli-paths";
 import {
@@ -107,6 +108,7 @@ export const runCommandInner = async (
       sealed?: string;
       kind?: string;
       target?: string;
+      enabled?: boolean;
     };
     switch (cmd.kind) {
       case "connect": {
@@ -327,16 +329,54 @@ export const runCommandInner = async (
       case "status":
         return { id: cmd.id, status: "done" };
       // Force a self-update check now (the daemon also checks on every bootstrap
-      // tick). Refresh the bootstrap first so a release published since the last
-      // tick is seen — otherwise a forced check would read a stale
-      // `latestVersion()`. Fire-and-forget: it self-guards and, if it updates,
-      // swaps the binary + exits once idle so the supervisor relaunches it.
+      // tick WHEN auto-update is opted in). This is an EXPLICIT user request, so
+      // it passes `force` to converge regardless of the opt-in preference.
+      // Refresh the bootstrap first so a release published since the last tick is
+      // seen — otherwise a forced check would read a stale `latestVersion()`.
+      // Fire-and-forget: it self-guards and, if it updates, swaps the binary +
+      // exits once idle so the supervisor relaunches it.
       case "update":
         void (async () => {
           await refreshBootstrap();
-          await maybeSelfUpdate(latestVersion());
+          await maybeSelfUpdate(latestVersion(), { force: true });
         })();
         return { id: cmd.id, status: "done", result: { checking: true } };
+      // Toggle the auto-update opt-in from the dashboard. Persisted locally so it
+      // survives restarts; the post-command status push carries the new value
+      // back so the switch reflects it. Enabling kicks off an immediate
+      // convergence check (now that it's allowed) so the daemon catches up
+      // without waiting for the next bootstrap tick.
+      case "set_auto_update": {
+        const enabled = payload.enabled === true;
+        setAutoUpdate(enabled);
+        // Confirm the write actually took before acking success — the persist
+        // can fail silently (read-only state dir / full disk; setAutoUpdate logs
+        // + swallows it). `autoUpdateEnabled` reads the flag back fresh, so a
+        // mismatch means the effective state isn't what was requested → error.
+        const persisted = autoUpdateEnabled();
+        if (persisted !== enabled) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: {
+              error: "failed to persist auto-update preference",
+              auto_update: persisted,
+            },
+          };
+        }
+        // Only converge now if it actually stuck on.
+        if (enabled) {
+          void (async () => {
+            await refreshBootstrap();
+            await maybeSelfUpdate(latestVersion());
+          })();
+        }
+        return {
+          id: cmd.id,
+          status: "done",
+          result: { auto_update: persisted },
+        };
+      }
       default:
         return {
           id: cmd.id,

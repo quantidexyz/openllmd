@@ -15,12 +15,14 @@
  *   openllmd skill  <install|uninstall|list> [slug]   manage a Claude Code skill
  *   openllmd plugin <install|uninstall|list> [slug]   manage a Claude Code plugin
  *   openllmd setup  <install|uninstall|list> [id]     manage a client setup
+ *   openllmd auto-update <on|off|status>  opt in/out of self-update (default on)
  *   openllmd uninstall [--yes]    remove the daemon + ALL state (credentials)
  *   openllmd set-token <p> <tok>  store a subscription setup-token
  *   openllmd completion <shell>   emit / install shell completion
  *   openllmd -h | --help          show help
  *   openllmd --version            show version
  */
+import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { COMMANDS, FLAGS } from "./commands";
 import { runCompletion } from "./completion";
 import { daemonEnv } from "./env";
@@ -84,6 +86,34 @@ const runSetToken = (args: readonly string[]): never => {
     `setup token ${token !== null && token.length > 0 ? "saved" : "cleared"} for ${provider}\n`,
   );
   process.exit(0);
+};
+
+/**
+ * Opt in/out of automatic self-updates (or print the current state), then exit.
+ * Auto-update is OPT-OUT — a fresh daemon keeps itself current until disabled
+ * here or from the dashboard. See `auto-update-pref.ts`.
+ */
+const runAutoUpdate = (args: readonly string[]): never => {
+  const sub = args[0];
+  // Each form takes at most one argument — reject trailing junk
+  // (`auto-update on typo`) instead of silently ignoring it.
+  if (args.length <= 1) {
+    if (sub === "on" || sub === "off") {
+      setAutoUpdate(sub === "on");
+      process.stdout.write(
+        `auto-update ${sub === "on" ? "enabled" : "disabled"}\n`,
+      );
+      process.exit(0);
+    }
+    if (sub === undefined || sub === "status") {
+      process.stdout.write(
+        `auto-update is ${autoUpdateEnabled() ? "on" : "off"}\n`,
+      );
+      process.exit(0);
+    }
+  }
+  process.stderr.write("usage: openllmd auto-update <on|off|status>\n");
+  process.exit(2);
 };
 
 // The `list` endpoint per integration group (setup is singular + keyed by id).
@@ -195,6 +225,9 @@ export const runCli = (): boolean => {
       return true;
     case "set-token":
       runSetToken(rest);
+      break;
+    case "auto-update":
+      runAutoUpdate(rest);
       break;
     case "uninstall":
       runUninstall(rest);

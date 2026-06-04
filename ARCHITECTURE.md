@@ -52,7 +52,8 @@ daemon/
   scripts/install-local.ts  build host binary + install locally (no release)
   src/
     main.ts                 boot: runCli() dispatch, else refresh bootstrap → Bun.serve(127.0.0.1)
-    cli.ts                  `openllmd <cmd>` dispatch (start/stop/status/restart/skill/plugin/setup/uninstall/set-token/completion/help)
+    cli.ts                  `openllmd <cmd>` dispatch (start/stop/status/restart/skill/plugin/setup/auto-update/uninstall/set-token/completion/help)
+    auto-update-pref.ts     persisted self-update opt-out flag (`~/.openllm/auto-update`, default ON); gates self-update.ts + reported on DaemonStatus.auto_update
     integrations.ts         shared executor: fetch a gateway install/uninstall script → verify SHA-256 (fail-closed) → bash. Behind the CLI verbs + the relay's install/uninstall_integration kinds
     integrations-detect.ts  best-effort claude-code footprint scan → DaemonStatus.integrations (stateful dashboard buttons)
     service.ts              self-managed launch agent / systemd unit (start = self-restore; stop = disable; serviceUninstall = stop + delete registration)

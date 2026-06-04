@@ -7,6 +7,7 @@
  * recomputes on a gentle interval and only while a client is listening.
  */
 import type { TDaemonStatus } from "@openllm/schema";
+import { autoUpdateEnabled } from "./auto-update-pref";
 import { getCloudState } from "./config";
 import { DELEGATES } from "./delegation";
 import { daemonPort, hasApiKey } from "./env";
@@ -45,6 +46,7 @@ export const computeStatus = async (): Promise<TDaemonStatus> => {
   return {
     daemon_version: DAEMON_VERSION,
     key_configured: hasApiKey(),
+    auto_update: autoUpdateEnabled(),
     cloud_state: getCloudState(),
     pubkey: daemonPublicKey(),
     port: daemonPort(),

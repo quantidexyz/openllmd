@@ -36,6 +36,12 @@ export const COMMANDS: readonly TCommand[] = [
     description: "Install or remove a client setup on this machine",
   },
   {
+    name: "auto-update",
+    args: "<on|off|status>",
+    description:
+      "Enable or disable automatic daemon self-updates (on by default)",
+  },
+  {
     name: "uninstall",
     args: "[--yes]",
     description: "Remove the daemon and ALL state (credentials, service)",
@@ -67,6 +73,9 @@ export const PROVIDERS = ["claude_code", "chatgpt", "kimi_code"] as const;
 /** Action choices for the `skill` / `plugin` / `setup` integration groups. */
 export const INTEGRATION_GROUPS = ["skill", "plugin", "setup"] as const;
 export const INTEGRATION_ACTIONS = ["install", "uninstall", "list"] as const;
+
+/** Argument choices for the `auto-update` subcommand. */
+export const AUTO_UPDATE_ACTIONS = ["on", "off", "status"] as const;
 
 export const COMPLETION_SHELLS = ["bash", "zsh", "fish"] as const;
 export type TCompletionShell = (typeof COMPLETION_SHELLS)[number];

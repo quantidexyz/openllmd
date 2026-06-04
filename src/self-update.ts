@@ -32,6 +32,7 @@ import {
 import { dirname, join } from "node:path";
 import type { TDaemonTarget } from "../release-types";
 import { DAEMON_TARGETS } from "../release-types";
+import { autoUpdateEnabled } from "./auto-update-pref";
 import { daemonEnv, stateDir } from "./env";
 import { hardenMacBinary } from "./harden-binary";
 import { logError, logInfo, logWarn } from "./logger";
@@ -176,11 +177,25 @@ let updating = false;
 /**
  * Update to `latest` (the cloud's published version) when it differs from this
  * binary, then exit so the supervisor relaunches it. No-op (returns) when not
- * applicable — running from source, already converged, unknown target, no
- * release, or a recent failed attempt. Never throws into the caller.
+ * applicable — auto-update opted out, running from source, already converged,
+ * unknown target, no release, or a recent failed attempt. Never throws into the
+ * caller.
+ *
+ * Self-update is OPT-OUT (on by default): the automatic callers (boot + each
+ * bootstrap tick) are gated on {@link autoUpdateEnabled}, which only returns
+ * false once the user has explicitly disabled it. An EXPLICIT user request —
+ * the dashboard's "update now" command — passes `force: true` to run the
+ * convergence even when disabled. See `packages/daemon/src/auto-update-pref.ts`.
  */
-export const maybeSelfUpdate = async (latest: string | null): Promise<void> => {
+export const maybeSelfUpdate = async (
+  latest: string | null,
+  opts?: { readonly force?: boolean },
+): Promise<void> => {
   if (updating) return;
+  // Opt-out gate: skip automatic updates only when the user disabled them
+  // (default on). A forced (explicit) check bypasses it — the user asked for
+  // this one update.
+  if (opts?.force !== true && !autoUpdateEnabled()) return;
   // Only managed compiled binaries self-update; a from-source run is `0.0.0-dev`.
   if (DAEMON_VERSION === "0.0.0-dev") return;
   if (latest === null || latest.length === 0) return;

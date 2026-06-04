@@ -21,6 +21,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { TCompletionShell } from "./commands";
 import {
+  AUTO_UPDATE_ACTIONS,
   COMMANDS,
   COMPLETION_SHELLS,
   FLAGS,
@@ -37,6 +38,8 @@ const TOP_LEVEL = [...COMMANDS.map((c) => c.name), ...FLAGS.map((f) => f.name)];
 const COMPLETION_ARGS = [...COMPLETION_SHELLS, "install"];
 /** The integration groups' shared `<install|uninstall|list>` action choices. */
 const INTEGRATION_ARGS = [...INTEGRATION_ACTIONS];
+/** `auto-update`'s `<on|off|status>` argument choices. */
+const AUTO_UPDATE_ARGS = [...AUTO_UPDATE_ACTIONS];
 
 const bashScript = (): string => {
   const top = TOP_LEVEL.join(" ");
@@ -52,6 +55,7 @@ _openllmd() {
   case "$cmd" in
     completion) COMPREPLY=( $(compgen -W "${COMPLETION_ARGS.join(" ")}" -- "$cur") ) ;;
     set-token)  [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=( $(compgen -W "${PROVIDERS.join(" ")}" -- "$cur") ) ;;
+    auto-update) [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=( $(compgen -W "${AUTO_UPDATE_ARGS.join(" ")}" -- "$cur") ) ;;
     ${INTEGRATION_GROUPS.join("|")}) [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=( $(compgen -W "${INTEGRATION_ARGS.join(" ")}" -- "$cur") ) ;;
   esac
 }
@@ -78,6 +82,7 @@ _openllmd() {
       case "$line[1]" in
         completion) _values 'shell' ${COMPLETION_ARGS.join(" ")} ;;
         set-token)  _values 'provider' ${PROVIDERS.join(" ")} ;;
+        auto-update) _values 'action' ${AUTO_UPDATE_ARGS.join(" ")} ;;
         ${INTEGRATION_GROUPS.join("|")}) _values 'action' ${INTEGRATION_ARGS.join(" ")} ;;
       esac ;;
   esac
@@ -94,6 +99,7 @@ const fishScript = (): string => {
   lines.push(
     `complete -c openllmd -n '__fish_seen_subcommand_from completion' -a '${COMPLETION_ARGS.join(" ")}'`,
     `complete -c openllmd -n '__fish_seen_subcommand_from set-token' -a '${PROVIDERS.join(" ")}'`,
+    `complete -c openllmd -n '__fish_seen_subcommand_from auto-update' -a '${AUTO_UPDATE_ARGS.join(" ")}'`,
     `complete -c openllmd -n '__fish_seen_subcommand_from ${INTEGRATION_GROUPS.join(" ")}' -a '${INTEGRATION_ARGS.join(" ")}'`,
     `complete -c openllmd -s h -l help -d 'Show help'`,
     `complete -c openllmd -l version -d 'Print the version'`,
