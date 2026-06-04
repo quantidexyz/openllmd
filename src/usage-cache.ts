@@ -24,9 +24,24 @@
  *   - while backing off after a failure, the last good snapshot keeps being
  *     served for up to {@link STALE_TTL_MS} (so the card shows the last known
  *     figures, not an error) — after that the failure reason surfaces;
+ *   - the served snapshot is STAMPED (`stale` + `as_of_ms`) whenever it's a
+ *     fallback rather than a this-instant read, so the dashboard shows the
+ *     last-known figures under a "cached · updated Xm ago" badge instead of
+ *     silently presenting old numbers as live (or a bare error);
+ *   - the last good snapshot is PERSISTED to disk
+ *     (`<stateDir>/usage-cache.json`) once the daemon opts in via
+ *     {@link enableUsagePersistence}, so a daemon RESTART doesn't lose it —
+ *     before this, a restart wiped the in-memory good snapshot and, if the
+ *     first post-restart read 429'd, the card showed a rate-limit error with
+ *     NOTHING to fall back to (the bug behind "it says it shows previous
+ *     results but it doesn't"). The persisted `lastAttemptAtMs` also makes a
+ *     quick restart respect the back-off instead of re-hitting the vendor
+ *     immediately;
  *   - concurrent callers during a refresh share ONE in-flight fetch
  *     (single-flight per provider).
  */
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllm/schema";
 
 // Hit the vendor at most once per this window — applies to BOTH a successful
@@ -54,12 +69,97 @@ const cache = new Map<string, TUsageEntry>();
 const isUsable = (s: TProviderUsageSnapshot): boolean =>
   s.kind !== "unavailable";
 
+// ---------------------------------------------------------------------------
+// Disk persistence (opt-in; the daemon enables it at boot, unit tests don't).
+// ---------------------------------------------------------------------------
+
+type TPersistedEntry = {
+  good: { snapshot: TProviderUsageSnapshot; atMs: number };
+  lastAttemptAtMs: number;
+};
+
+// Directory the cache file lives in, or null when persistence is disabled
+// (the default — keeps this module hermetic for unit tests that import it
+// directly). The daemon sets it once via enableUsagePersistence().
+let persistDir: string | null = null;
+const cacheFile = (): string => join(persistDir as string, "usage-cache.json");
+
+/**
+ * Opt this process into disk-backed survival of the last good usage snapshot
+ * across restarts. Call ONCE at daemon boot with the state dir. Immediately
+ * hydrates the in-memory cache from any prior file so the first status push
+ * after a restart already has figures to serve. No-op'd in unit tests (they
+ * never call this), keeping the cache purely in-memory there.
+ */
+export const enableUsagePersistence = (dir: string): void => {
+  persistDir = dir;
+  hydrate();
+};
+
+// Load persisted good snapshots into the in-memory cache. Never clobbers a
+// slug that already has live state. Best-effort: a missing/corrupt file just
+// starts the cache cold.
+const hydrate = (): void => {
+  if (persistDir === null) return;
+  try {
+    const parsed = JSON.parse(readFileSync(cacheFile(), "utf-8")) as Record<
+      string,
+      TPersistedEntry
+    >;
+    for (const [slug, e] of Object.entries(parsed)) {
+      if (cache.has(slug)) continue;
+      if (e?.good?.snapshot === undefined) continue;
+      cache.set(slug, {
+        good: e.good,
+        failure: null,
+        lastAttemptAtMs:
+          typeof e.lastAttemptAtMs === "number" ? e.lastAttemptAtMs : 0,
+        inFlight: null,
+      });
+    }
+  } catch {
+    // no / unreadable cache file — start cold
+  }
+};
+
+// Write the current good snapshots back to disk (failures + in-flight promises
+// are runtime-only). Best-effort; a write failure just means the next restart
+// starts cold for that provider.
+const persist = (): void => {
+  if (persistDir === null) return;
+  const out: Record<string, TPersistedEntry> = {};
+  for (const [slug, e] of cache.entries()) {
+    if (e.good !== null) {
+      out[slug] = { good: e.good, lastAttemptAtMs: e.lastAttemptAtMs };
+    }
+  }
+  try {
+    mkdirSync(persistDir, { recursive: true });
+    writeFileSync(cacheFile(), JSON.stringify(out), { mode: 0o600 });
+  } catch {
+    // best-effort — losing the cache only costs a cold start next time
+  }
+};
+
+// Stamp a snapshot served as a FALLBACK with its age so the UI can render a
+// "cached · updated Xm ago" badge instead of presenting old figures as live.
+// A fresh read (age < FRESH_TTL_MS) is returned untouched — it IS current.
+const stampStale = (
+  snapshot: TProviderUsageSnapshot,
+  atMs: number,
+  now: number,
+): TProviderUsageSnapshot => {
+  if (snapshot.kind !== "quota" || now - atMs < FRESH_TTL_MS) return snapshot;
+  return { ...snapshot, as_of_ms: atMs, stale: true };
+};
+
 // What to serve right now without calling the vendor: the last good figures if
-// still within STALE_TTL_MS, otherwise the last failure (or a loading
-// placeholder before the first attempt completes).
+// still within STALE_TTL_MS (stamped stale once past the freshness window),
+// otherwise the last failure (or a loading placeholder before the first
+// attempt completes).
 const servable = (entry: TUsageEntry, now: number): TProviderUsageSnapshot => {
   if (entry.good !== null && now - entry.good.atMs < STALE_TTL_MS) {
-    return entry.good.snapshot;
+    return stampStale(entry.good.snapshot, entry.good.atMs, now);
   }
   return entry.failure ?? { kind: "unavailable", reason: "loading" };
 };
@@ -118,6 +218,9 @@ export const cachedUsage = async (
       inFlight: null,
     };
     cache.set(slug, updated);
+    // Persist the good snapshot (+ attempt time) so a daemon restart can serve
+    // it instead of going dark when the post-restart read is rate-limited.
+    persist();
     return servable(updated, at);
   })();
 

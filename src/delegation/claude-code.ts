@@ -481,7 +481,11 @@ export const claudeCodeDelegate: TProviderDelegate = {
             : resp.status === 403
               ? "No active Claude Pro/Max subscription on this account."
               : resp.status === 429
-                ? "Claude usage is rate-limited right now — showing the last known figures."
+                ? // The usage cache serves the last known good figures (stamped
+                  // `stale`) when one exists, so this bare reason only ever
+                  // surfaces when there's NOTHING cached to fall back to — don't
+                  // promise figures we may not have. See `usage-cache.ts`.
+                  "Claude usage is rate-limited right now."
                 : `Claude couldn't report usage (HTTP ${resp.status}).`;
         return { kind: "unavailable", reason };
       }

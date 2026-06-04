@@ -28,7 +28,7 @@ import {
   startControlRelay,
 } from "./control-relay";
 import { corsHeaders, isPreflight, preflightResponse } from "./cors";
-import { daemonPort, deviceId, isDevMode } from "./env";
+import { daemonPort, deviceId, isDevMode, stateDir } from "./env";
 import { handleInference } from "./listener";
 import { logError, logInfo } from "./logger";
 import {
@@ -37,6 +37,7 @@ import {
   maybeSelfUpdate,
   trackBodyDone,
 } from "./self-update";
+import { enableUsagePersistence } from "./usage-cache";
 import { DAEMON_VERSION } from "./version";
 
 // Once the cloud snapshot is healthy, refresh every 5 minutes to stay in
@@ -65,6 +66,13 @@ const main = async (): Promise<void> => {
     logError("unhandledRejection", reason);
     process.exit(1);
   });
+
+  // Opt the usage cache into disk-backed survival across restarts, and hydrate
+  // it from any prior file NOW — before the control relay's first status push —
+  // so a freshly restarted daemon already has last-known figures to serve if
+  // the post-restart usage read is rate-limited (rather than showing an error
+  // with nothing to fall back to). See `usage-cache.ts`.
+  enableUsagePersistence(stateDir());
 
   // Pull the catalog + routing config. This NEVER throws — when there's
   // no API key yet (the daemon installs keyless; the dashboard sets the
