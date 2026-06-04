@@ -10,16 +10,16 @@ import type { TDaemonRelease } from "./release-types";
 
 export const DAEMON_RELEASE: TDaemonRelease = {
   repo: "quantidexyz/openllmd",
-  tag: "v1.3.0-alpha.5",
+  tag: "v1.3.0-alpha.6",
   targets: ["darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64"],
   sha256: {
     "darwin-arm64":
-      "588c61caae7ec9f9781e09d6a462919dda8775e325000bb364eb65e5e860e01c",
+      "478c87352fb41ccb19ad2df3cb27f253c5e1e601abd598707ab75c1e4f367a3c",
     "darwin-x64":
-      "ab8474f6021ea91e5c6c80b146cb26e5fd268972ce9257b405288c7c98f997cc",
+      "bcd5e640d45087a4b85b034a745e0f0b4b62f0a2dffd906f4e5eccdcf39a1f3f",
     "linux-x64":
-      "607d876fc87afd32bb5f60887635ba8046803089a73b10c8eac6a6eef7d610dd",
+      "5be6b60ae6e780a5267e601d9b27bf842bdd92ac375af6633d56ce7e6f68ae68",
     "linux-arm64":
-      "858a6e70b6cdfa63461796d88d414e163af667a25fd3c4a70b9c11d4ac060613",
+      "7e8b069e9bd209787b4fea3c36978b41c08b989b84b2f146903977c4371c7e65",
   },
 };
