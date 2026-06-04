@@ -61,6 +61,7 @@ daemon/
     walker.ts               coreless §3.3 plan-walker — the daemon's sole data path; @openllm/core-free
     control.ts              localhost control surface (/status,/events,/connect,/cli-install,/usage,/config)
     status.ts               computeStatus() — shared snapshot for /status + /events
+    usage-cache.ts          per-provider TTL cache over delegate.usage() (rate-limit safe)
     events.ts               /events SSE: push status on change (replaces polling)
     cors.ts                 shared CORS + PNA preflight for both surfaces
     cli-paths.ts            isolated-CLI paths + per-provider run/install env
@@ -73,6 +74,8 @@ daemon/
       types.ts              TProviderDelegate contract
       exec-fixture.ts       capture the real CLI exec request (url + identity
                             headers) → fixture; the upstream URL + headers source
+      oauth-config.ts       extract Claude's + Codex/ChatGPT's OAuth client_id +
+                            token URL from the CLI binary (drift-safe), cached + fallback
       claude-code.ts chatgpt.ts kimi-code.ts util.ts index.ts
 ```
 
@@ -255,6 +258,18 @@ isolated env), `usage` (read locally with the CLI's own credential), and
 URL for the local runner). Nothing the delegate reads from a CLI's store is ever
 sent off-box.
 
+**Usage reads go through a TTL cache, not live (`usage-cache.ts`).**
+`computeStatus()` runs on every status push — every control-relay poll (~30s)
+and every ~2.5s while a background flow is in flight — but the vendor usage
+endpoints (e.g. Claude's `api/oauth/usage`) rate-limit **independently of
+inference**. Reading them live there 429s after ~5 minutes while inference keeps
+working. `cachedUsage(slug, () => delegate.usage())` hits the vendor at most
+once per few minutes (the quota windows are 5h/7d, so minute-level staleness is
+irrelevant), shares one in-flight fetch across concurrent callers, and serves
+the last good snapshot when a refresh fails (rather than flapping the card to an
+error) until it ages out. So the usage panel no longer couples to the push
+cadence.
+
 **Identity is captured, not hardcoded (`exec-fixture.ts`).** Rather than
 hand-copy each vendor's inference URL + identity headers (they drift on CLI
 updates, and the daemon must impersonate the CLI byte-for-byte — T2), the daemon
@@ -267,6 +282,23 @@ and falls back to the delegate's built-in identity when none exists. The only
 retained constants are the upstream ORIGIN + default path per provider
 (`UPSTREAM_WIRE` in the walker keeps the structural wire). See
 [`delegation-exec-fixtures.md`](../../docs/proposals/delegation-exec-fixtures.md).
+
+**OAuth config is extracted too, not hardcoded (`oauth-config.ts`).** Same
+rationale, different value: refreshing a Claude Pro/Max OR a Codex/ChatGPT token
+needs the OAuth `client_id` + token endpoint, all the vendor's and all DRIFT on
+CLI updates (by Claude CLI 2.1.159 the token host had moved
+`console.anthropic.com` → `platform.claude.com` while the daemon's literal went
+stale). Rather than hand-copy them, `ensureOAuthConfig(provider)` scans the
+installed CLI binary per provider: Claude's JS bundle exposes an embedded prod
+config block (`TOKEN_URL:"…/v1/oauth/token" … CLIENT_ID:"<uuid>"`, anchored on
+the prod host so a local/staging dev block can't be picked up); Codex's Rust
+binary packs `REFRESH_TOKEN_URL` + `CLIENT_ID` as separator-less literals
+(matched at exact length + most-frequent pick). A per-provider format guard
+rejects a mis-extracted/stale-cached value so it self-heals to the fallback. The
+result is cached version-keyed next to the exec-fixture, falling back to a
+CURRENT built-in default when extraction fails. No value is secret (a public app
+id + a published URL) and the binary read stays on-box. Re-extracted on the
+24h TTL, a CLI version bump, and after a re-login / device-code landing.
 
 Login per provider (the CLI opens the user's browser, the user signs in,
 and the CLI completes via its own localhost callback then exits;

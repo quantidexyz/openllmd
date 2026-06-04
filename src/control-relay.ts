@@ -40,6 +40,7 @@ import { hasPendingAuth } from "./pending-auth";
 import { maybeSelfUpdate } from "./self-update";
 import { setSetupToken } from "./setup-token";
 import { computeStatus } from "./status";
+import { invalidateUsage } from "./usage-cache";
 
 // No key / unreachable / rejected → back off before re-dialing.
 const BACKOFF_MS = 5_000;
@@ -281,6 +282,13 @@ const runCommandInner = async (
       // A bare refresh: nothing to do — the status push below carries the
       // fresh snapshot back.
       case "refresh":
+        // Manual refresh: bust the usage cache so the post-command
+        // computeStatus() re-reads the vendor LIVE instead of serving the
+        // cached (possibly backing-off) snapshot. `slug` scopes it to one
+        // provider; the dashboard's whole-daemon refresh sends none → clears
+        // all. `status` is the passive read and keeps the cache.
+        invalidateUsage(payload.slug);
+        return { id: cmd.id, status: "done" };
       case "status":
         return { id: cmd.id, status: "done" };
       // Force a self-update check now (the daemon also checks on every bootstrap

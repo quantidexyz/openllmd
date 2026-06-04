@@ -44,6 +44,7 @@ import {
   ensureExecFixture,
   resolveUpstream,
 } from "./exec-fixture";
+import { ensureOAuthConfig } from "./oauth-config";
 import type { TProviderDelegate } from "./types";
 import {
   cliVersion,
@@ -63,18 +64,24 @@ const KEYCHAIN_SERVICE = "Claude Code-credentials";
 const OAUTH_BETA = "oauth-2025-04-20";
 const OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 
-// The official Claude Code OAuth token endpoint + public client id, used
-// to refresh the access token with the stored refresh token. This is the
-// SAME flow the CLI runs — done here on its behalf, locally, when the
-// daemon needs a token and the CLI hasn't refreshed (the CLI only
-// refreshes mid-inference, which the daemon never triggers; there is no
-// `claude auth refresh` command). The rotated token is written back to
-// the CLI's store so the two stay in sync.
-const OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
-const OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+// The OAuth token endpoint + public client id used to refresh the access
+// token with the stored refresh token. This is the SAME flow the CLI runs —
+// done here on its behalf, locally, when the daemon needs a token and the CLI
+// hasn't refreshed (the CLI only refreshes mid-inference, which the daemon
+// never triggers; there is no `claude auth refresh` command). The rotated
+// token is written back to the CLI's store so the two stay in sync.
+//
+// Both values are Anthropic's and DRIFT on CLI updates (the token host moved
+// console.anthropic.com → platform.claude.com), so they are NOT hardcoded
+// here — `ensureOAuthConfig()` reads them from the installed CLI binary
+// (cached, with a current built-in fallback). See `oauth-config.ts`.
+//
 // Refresh proactively when within this window of expiry (hides clock skew
 // + avoids a guaranteed 401 → refresh → retry on the next call).
 const REFRESH_LEEWAY_MS = 60_000;
+// Hard cap on the token-refresh request so a hung endpoint can't stall the
+// readToken critical path (inference + usage await it).
+const REFRESH_FETCH_TIMEOUT_MS = 10_000;
 
 // Run the isolated `claude` binary with its isolated home/config env.
 const bin = (): string => cliBin(PROVIDER);
@@ -131,7 +138,10 @@ const refreshOAuth = async (
   expiresAtMs: number | null;
 } | null> => {
   try {
-    const resp = await fetch(OAUTH_TOKEN_URL, {
+    // Read the (drift-prone) endpoint + client id from the CLI binary, not a
+    // hardcoded literal. Falls back to current built-in defaults on failure.
+    const { token_url, client_id } = await ensureOAuthConfig(PROVIDER);
+    const resp = await fetch(token_url, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -140,8 +150,11 @@ const refreshOAuth = async (
       body: JSON.stringify({
         grant_type: "refresh_token",
         refresh_token: refreshToken,
-        client_id: OAUTH_CLIENT_ID,
+        client_id,
       }),
+      // Bound the refresh so a hung token endpoint can't stall readToken (and
+      // thus every inference/usage call that awaits it) — abort → caught → null.
+      signal: AbortSignal.timeout(REFRESH_FETCH_TIMEOUT_MS),
     });
     if (!resp.ok) return null;
     const d = (await resp.json()) as {
@@ -198,7 +211,9 @@ const readToken = async (): Promise<{
   const expiresAtMs = toEpochMs(oauth.expiresAt);
   const stale =
     expiresAtMs !== null && expiresAtMs - Date.now() < REFRESH_LEEWAY_MS;
-  if (!stale || oauth.refreshToken === undefined) {
+  // An empty refreshToken is as un-refreshable as a missing one — don't waste
+  // a doomed refresh round-trip on "".
+  if (!stale || !oauth.refreshToken) {
     return { accessToken: oauth.accessToken, expiresAtMs };
   }
 
@@ -411,9 +426,11 @@ export const claudeCodeDelegate: TProviderDelegate = {
     const viaAuth = await authStatusLoggedIn();
     const connected = viaAuth !== null ? viaAuth : (await readToken()) !== null;
     if (connected) {
-      // Re-capture the exec fixture now that the identity may have changed
-      // (account-scoped headers). Best-effort + non-blocking.
+      // Re-capture the exec fixture + re-extract the OAuth config now that the
+      // identity / CLI may have changed (account-scoped headers; a CLI update
+      // can rotate the token endpoint or client id). Best-effort + non-blocking.
       void ensureExecFixture(PROVIDER, { force: true }).catch(() => {});
+      void ensureOAuthConfig(PROVIDER, { force: true }).catch(() => {});
       return { connected: true, detail: "signed in via Claude Code" };
     }
     return {
@@ -463,7 +480,9 @@ export const claudeCodeDelegate: TProviderDelegate = {
             ? "Claude authorization was rejected — re-sign in via the Claude Code CLI."
             : resp.status === 403
               ? "No active Claude Pro/Max subscription on this account."
-              : `Claude couldn't report usage (HTTP ${resp.status}).`;
+              : resp.status === 429
+                ? "Claude usage is rate-limited right now — showing the last known figures."
+                : `Claude couldn't report usage (HTTP ${resp.status}).`;
         return { kind: "unavailable", reason };
       }
       const data = (await resp.json()) as Record<
@@ -532,14 +551,24 @@ export const claudeCodeDelegate: TProviderDelegate = {
     // Prefer the captured exec fixture (the genuine `claude` request); fall back
     // to the delegate defaults when no fixture exists. The wire builder still
     // owns/overrides anthropic-version + the anthropic-beta merge on top.
-    const { url, headers } = await resolveUpstream(PROVIDER, {
-      url: defaultUpstreamUrl(PROVIDER),
-      headers: {
-        "anthropic-beta": OAUTH_BETA,
-        "anthropic-version": "2023-06-01",
-        "user-agent": await userAgent(),
+    //
+    // Setup-token mode: the token was delivered out-of-band (env / `set-token` /
+    // sealed relay), so the isolated CLI is NOT logged in and can't produce a
+    // genuine request — `captureIfMissing: false` serves any pre-existing
+    // fixture (identity-agnostic; the bearer is injected fresh) or the defaults,
+    // without spawning a doomed `claude -p ping` on every inference.
+    const { url, headers } = await resolveUpstream(
+      PROVIDER,
+      {
+        url: defaultUpstreamUrl(PROVIDER),
+        headers: {
+          "anthropic-beta": OAUTH_BETA,
+          "anthropic-version": "2023-06-01",
+          "user-agent": await userAgent(),
+        },
       },
-    });
+      { captureIfMissing: !hasSetupToken(PROVIDER) },
+    );
     return { access_token: token.accessToken, headers, url };
   },
 

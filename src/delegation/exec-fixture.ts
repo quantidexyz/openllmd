@@ -404,10 +404,16 @@ const inFlight = new Map<TCliProvider, Promise<TExecFixture | null>>();
  * cache (or null) if capture fails so serving never hard-breaks. `force`
  * bypasses the cache (used right after a re-login, when identity may have
  * shifted).
+ *
+ * `captureIfMissing: false` NEVER spawns the CLI to capture — it serves the
+ * best cached fixture (even if stale) or null. Use it when the isolated CLI is
+ * NOT the credential source and so can't produce a genuine request anyway: a
+ * Claude setup-token is delivered out-of-band, leaving the isolated CLI logged
+ * OUT, so a capture would spawn a doomed `claude -p ping` on every inference.
  */
 export const ensureExecFixture = async (
   provider: TCliProvider,
-  opts?: { readonly force?: boolean },
+  opts?: { readonly force?: boolean; readonly captureIfMissing?: boolean },
 ): Promise<TExecFixture | null> => {
   const raw = await readFixture(provider);
   // Discard a fixture that captured a non-inference path (legacy/stale) — it
@@ -420,6 +426,9 @@ export const ensureExecFixture = async (
     const ver = await cliVersion(cliBin(provider), cliEnv(provider));
     if (isFresh(cached, ver)) return cached;
   }
+  // No-capture mode: serve the best cached fixture (stale ok) or null → the
+  // delegate's defaults. Never spawn the (logged-out) CLI.
+  if (opts?.captureIfMissing === false) return cached;
   const existing = inFlight.get(provider);
   if (existing !== undefined) return existing;
   const run = captureExecFixture(provider)
@@ -434,13 +443,15 @@ export const ensureExecFixture = async (
  * captured fixture and layering its headers over the delegate's fallback (so
  * captured identity wins, while per-credential headers the fallback supplies —
  * e.g. an account id absent from the fixture — are kept). On no fixture the
- * fallback is used verbatim.
+ * fallback is used verbatim. `opts` is forwarded to {@link ensureExecFixture}
+ * (e.g. `captureIfMissing: false` for the setup-token inference path).
  */
 export const resolveUpstream = async (
   provider: TCliProvider,
   fallback: { readonly url: string; readonly headers: Record<string, string> },
+  opts?: { readonly captureIfMissing?: boolean },
 ): Promise<{ url: string; headers: Record<string, string> }> => {
-  const fixture = await ensureExecFixture(provider).catch(() => null);
+  const fixture = await ensureExecFixture(provider, opts).catch(() => null);
   if (fixture === null) return fallback;
   return {
     url: fixture.url,

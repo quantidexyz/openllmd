@@ -34,6 +34,7 @@ import {
   ensureExecFixture,
   resolveUpstream,
 } from "./exec-fixture";
+import { ensureOAuthConfig } from "./oauth-config";
 import type { TProviderDelegate } from "./types";
 import {
   cliVersion,
@@ -45,6 +46,16 @@ import {
 
 const PROVIDER = "chatgpt" as const;
 const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+
+// Refresh the access token proactively when its JWT `exp` is within this window
+// — matches codex's own `CHATGPT_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES` (5 min),
+// hiding clock skew and avoiding a guaranteed 401 → refresh → retry. The
+// `client_id` + token endpoint are read from the codex binary, not hardcoded
+// (they drift on CLI updates); see `oauth-config.ts`.
+const REFRESH_LEEWAY_MS = 5 * 60_000;
+// Hard cap on the token-refresh request so a hung endpoint can't stall the
+// readToken critical path (inference + usage await it).
+const REFRESH_FETCH_TIMEOUT_MS = 10_000;
 
 const bin = (): string => cliBin(PROVIDER);
 const env = (): Record<string, string> => cliEnv(PROVIDER);
@@ -102,19 +113,117 @@ const parseAuthUrl = (raw: string): string | null => {
   );
 };
 
+type TCodexTokens = {
+  readonly id_token?: string;
+  readonly access_token?: string;
+  readonly refresh_token?: string;
+  readonly account_id?: string;
+};
 type TCodexStore = {
-  readonly tokens?: {
-    readonly id_token?: string;
-    readonly access_token?: string;
-    readonly refresh_token?: string;
-    readonly account_id?: string;
-  };
+  readonly tokens?: TCodexTokens;
   readonly auth_mode?: string;
 };
 
+const authPath = (): string => join(cliConfigDir(PROVIDER), "auth.json");
+
 const loadStore = (): Promise<TCodexStore | null> =>
   // Isolated CODEX_HOME → auth.json lives there.
-  readJsonFile<TCodexStore>(join(cliConfigDir(PROVIDER), "auth.json"));
+  readJsonFile<TCodexStore>(authPath());
+
+// The codex access token is a JWT; its expiry lives in the `exp` claim (codex
+// itself refreshes off this — see ref/codex `should_refresh_proactively`).
+// Returns null when the token isn't a parseable JWT (then we skip the proactive
+// refresh and let a real 401 surface).
+const parseJwtExpMs = (jwt: string): number | null => {
+  const parts = jwt.split(".");
+  if (parts.length < 2) return null;
+  try {
+    const payload = JSON.parse(
+      Buffer.from(parts[1], "base64url").toString("utf8"),
+    ) as { exp?: number };
+    return typeof payload.exp === "number" ? payload.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+};
+
+// Exchange the stored refresh token for a fresh access token (+ rotated refresh
+// / id tokens). Mirrors codex's own refresh request
+// (`{ client_id, grant_type:"refresh_token", refresh_token }` → `{ id_token,
+// access_token, refresh_token }`). Returns null on any failure — the caller
+// falls back to the existing (stale) token, surfacing the upstream's own 401.
+const refreshOAuth = async (
+  refreshToken: string,
+): Promise<{
+  access: string;
+  refresh: string;
+  idToken: string | null;
+} | null> => {
+  try {
+    // Read the (drift-prone) endpoint + client id from the codex binary, not a
+    // hardcoded literal. Falls back to current built-in defaults on failure.
+    const { token_url, client_id } = await ensureOAuthConfig(PROVIDER);
+    const resp = await fetch(token_url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify({
+        client_id,
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+      }),
+      // Bound the refresh so a hung token endpoint can't stall readToken (and
+      // thus every inference/usage call that awaits it) — abort → caught → null.
+      signal: AbortSignal.timeout(REFRESH_FETCH_TIMEOUT_MS),
+    });
+    if (!resp.ok) return null;
+    const d = (await resp.json()) as {
+      access_token?: string;
+      refresh_token?: string;
+      id_token?: string;
+    };
+    if (typeof d.access_token !== "string" || d.access_token.length === 0) {
+      return null;
+    }
+    return {
+      access: d.access_token,
+      // OpenAI rotates the refresh token; keep the old one if absent.
+      refresh:
+        typeof d.refresh_token === "string" ? d.refresh_token : refreshToken,
+      idToken: typeof d.id_token === "string" ? d.id_token : null,
+    };
+  } catch {
+    return null;
+  }
+};
+
+// Persist refreshed tokens back into auth.json so the isolated codex CLI reads
+// the same (rotated) credential next time. Preserve every other field
+// (`OPENAI_API_KEY`, unknown keys) and refresh `last_refresh`, exactly as codex
+// does (`update_tokens`).
+const persistRefresh = async (next: {
+  access: string;
+  refresh: string;
+  idToken: string | null;
+}): Promise<void> => {
+  const raw = (await readJsonFile<Record<string, unknown>>(authPath())) ?? {};
+  const prevTokens = (raw.tokens as TCodexTokens | undefined) ?? {};
+  raw.tokens = {
+    ...prevTokens,
+    access_token: next.access,
+    refresh_token: next.refresh,
+    ...(next.idToken !== null ? { id_token: next.idToken } : {}),
+  };
+  raw.last_refresh = new Date().toISOString();
+  await Bun.write(authPath(), JSON.stringify(raw));
+};
+
+// Single-flight guard: concurrent callers that all see an expiring token share
+// ONE refresh (refresh-token rotation means parallel refreshes invalidate each
+// other).
+let inFlightRefresh: Promise<void> | null = null;
 
 const readToken = async (): Promise<{
   accessToken: string;
@@ -124,6 +233,38 @@ const readToken = async (): Promise<{
   const tokens = store?.tokens;
   if (tokens?.access_token === undefined || tokens.access_token.length === 0) {
     return null;
+  }
+  const expMs = parseJwtExpMs(tokens.access_token);
+  const stale = expMs !== null && expMs - Date.now() < REFRESH_LEEWAY_MS;
+  // An empty refresh_token is as un-refreshable as a missing one — don't waste
+  // a doomed refresh round-trip on "".
+  if (!stale || !tokens.refresh_token) {
+    return {
+      accessToken: tokens.access_token,
+      accountId: tokens.account_id ?? null,
+    };
+  }
+
+  if (inFlightRefresh === null) {
+    const rt = tokens.refresh_token;
+    inFlightRefresh = (async () => {
+      const refreshed = await refreshOAuth(rt);
+      if (refreshed === null) return;
+      await persistRefresh(refreshed);
+    })().finally(() => {
+      inFlightRefresh = null;
+    });
+  }
+  await inFlightRefresh;
+
+  // Re-read the (now-rotated) store. Falls back to the stale token if the
+  // refresh failed — the upstream then 401s and the UI says re-sign-in.
+  const fresh = (await loadStore())?.tokens;
+  if (fresh?.access_token !== undefined && fresh.access_token.length > 0) {
+    return {
+      accessToken: fresh.access_token,
+      accountId: fresh.account_id ?? null,
+    };
   }
   return {
     accessToken: tokens.access_token,
@@ -210,10 +351,19 @@ export const chatgptDelegate: TProviderDelegate = {
     void proc.exited.then(async () => {
       deviceProcs.delete(proc);
       loginInFlight = false;
-      // The process stays alive polling until the user authorizes; once it
-      // exits WITHOUT a stored credential the flow expired / was cancelled /
-      // errored — drop the stale code so the card stops showing a dead one.
-      if ((await readToken()) === null) clearPendingAuth(PROVIDER);
+      if ((await readToken()) !== null) {
+        // Device-code lands the credential on THIS box (the user authorized on
+        // another machine, but auth.json is written here) — refresh the genuine
+        // request fixture + OAuth refresh config now, exactly like the browser
+        // `connect` path does. Best-effort + non-blocking.
+        void ensureExecFixture(PROVIDER, { force: true }).catch(() => {});
+        void ensureOAuthConfig(PROVIDER, { force: true }).catch(() => {});
+      } else {
+        // The process stays alive polling until the user authorizes; once it
+        // exits WITHOUT a stored credential the flow expired / was cancelled /
+        // errored — drop the stale code so the card stops showing a dead one.
+        clearPendingAuth(PROVIDER);
+      }
     });
 
     // One reader loop: resolves the moment the device prompt appears, then
@@ -317,8 +467,11 @@ export const chatgptDelegate: TProviderDelegate = {
       deviceProcs.delete(proc);
       loginInFlight = false;
       if ((await readToken()) !== null) {
-        // Re-capture the exec fixture now that the identity is established.
+        // Re-capture the exec fixture + re-extract the OAuth config now that the
+        // identity is established (a CLI update can rotate the token endpoint or
+        // client id). Best-effort + non-blocking.
         void ensureExecFixture(PROVIDER, { force: true }).catch(() => {});
+        void ensureOAuthConfig(PROVIDER, { force: true }).catch(() => {});
       } else {
         // Exited without a credential (expired / cancelled / errored) — drop
         // the stale pending URL so the card stops showing a dead link.
