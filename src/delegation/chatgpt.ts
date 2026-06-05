@@ -644,6 +644,28 @@ export const chatgptDelegate: TProviderDelegate = {
     return { access_token: token.accessToken, headers: withAccount, url };
   },
 
+  cancelConnect: async () => {
+    // Abort an in-flight `codex login`: kill the spawned process(es) — each
+    // one's `proc.exited` handler flips `loginInFlight` off and (finding no
+    // credential) clears the pending code. Drop the code here too so status
+    // reflects the cancel on the very next push, without waiting on the exit.
+    let killed = 0;
+    for (const proc of deviceProcs) {
+      try {
+        proc.kill();
+        killed += 1;
+      } catch {
+        /* already exited — its handler ran */
+      }
+    }
+    clearPendingAuth(PROVIDER);
+    return {
+      ok: true,
+      detail:
+        killed > 0 ? "Codex sign-in cancelled" : "no sign-in was in progress",
+    };
+  },
+
   logout: async () => {
     // `codex logout` revokes the token server-side; then ensure the isolated
     // auth.json is gone regardless of CLI version.

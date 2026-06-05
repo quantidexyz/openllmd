@@ -368,8 +368,18 @@ const writeCredential = (wire: Record<string, unknown>): void => {
 // connected — so we don't import the SSE broadcaster here (avoids a
 // delegation→events cycle).
 let loginInFlight = false;
+// Set by `cancelConnect` to abort the background poll mid-flight. Checked each
+// iteration; reset when a fresh login starts so a prior cancel can't kill it.
+let loginAborted = false;
 const sleep = (ms: number): Promise<void> =>
   new Promise((r) => setTimeout(r, ms));
+
+/** Abort an in-flight Kimi device-code poll. The loop exits on its next tick;
+ *  the in-memory code is dropped now so status reflects the cancel at once. */
+const cancelBackgroundLogin = (): void => {
+  if (loginInFlight) loginAborted = true;
+  clearPendingAuth(PROVIDER);
+};
 
 const startBackgroundLogin = (
   auth: TDeviceAuth,
@@ -377,13 +387,20 @@ const startBackgroundLogin = (
 ): void => {
   if (loginInFlight) return;
   loginInFlight = true;
+  loginAborted = false;
   void (async () => {
     const deadline = Date.now() + auth.expiresInMs;
     let delayMs = auth.intervalMs;
     try {
       while (Date.now() < deadline) {
+        if (loginAborted) return;
         await sleep(delayMs);
+        if (loginAborted) return;
         const res = await pollToken(auth.deviceCode, headers);
+        // Re-check AFTER the (awaited) poll: a cancel that arrived while the
+        // request was in flight must win, or we'd write a credential — signing
+        // the user in — for a login they just cancelled.
+        if (loginAborted) return;
         if (res.kind === "success") {
           writeCredential(res.wire);
           // Re-capture the exec fixture now that the identity is established.
@@ -587,6 +604,17 @@ export const kimiCodeDelegate: TProviderDelegate = {
       connected: false,
       pending: true,
       detail: `Authorize Kimi in the browser window that just opened (code ${auth.userCode}). This page updates automatically when you're done — or open ${auth.verificationUriComplete}`,
+    };
+  },
+
+  cancelConnect: async () => {
+    const wasInFlight = loginInFlight;
+    cancelBackgroundLogin();
+    return {
+      ok: true,
+      detail: wasInFlight
+        ? "Kimi sign-in cancelled"
+        : "no sign-in was in progress",
     };
   },
 

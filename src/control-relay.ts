@@ -39,7 +39,7 @@ import type { TIntegrationKind } from "./integrations";
 import { runIntegration } from "./integrations";
 import { openSealed, sealTo } from "./keypair";
 import { logDebug, logError, logInfo } from "./logger";
-import { hasPendingAuth } from "./pending-auth";
+import { clearPendingAuth, hasPendingAuth } from "./pending-auth";
 import { maybeSelfUpdate } from "./self-update";
 import { setSetupToken } from "./setup-token";
 import { computeStatus } from "./status";
@@ -222,6 +222,30 @@ export const runCommandInner = async (
           status: r.connected || r.pending === true ? "done" : "error",
           result: r,
         };
+      }
+      case "cancel_connect": {
+        // Abort an in-flight device-code / browser login: the delegate kills
+        // its spawned process / stops its background poll and clears the
+        // pending code. Fall back to clearing the daemon's in-memory
+        // `pending_auth` directly for a provider whose `connect` is synchronous
+        // (no `cancelConnect`) — there's no live flow, so dropping a stale code
+        // is the whole job. The post-command status push (with the cleared
+        // `pending_auth`) flips the card back to Not signed in.
+        const delegate =
+          payload.slug !== undefined ? getDelegate(payload.slug) : null;
+        if (delegate === null || payload.slug === undefined) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: "unknown provider" },
+          };
+        }
+        if (delegate.cancelConnect !== undefined) {
+          const r = await delegate.cancelConnect();
+          return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
+        }
+        clearPendingAuth(payload.slug);
+        return { id: cmd.id, status: "done", result: { ok: true } };
       }
       case "logout": {
         // Sign out of a subscription provider's CLI-LOGIN credential on this

@@ -70,6 +70,19 @@ export type TProviderDelegate = {
   }>;
 
   /**
+   * Abort an IN-FLIGHT login (device-code or browser): kill the spawned vendor
+   * process / stop the background token poll and clear this provider's
+   * `pending_auth`, so the card drops out of "Awaiting authorization" back to
+   * Not signed in. Idempotent — no in-flight flow is success. Absent on
+   * providers whose `connect` is fully synchronous (nothing to cancel). When
+   * absent, the control relay clears `pending_auth` directly as a fallback.
+   */
+  cancelConnect?: () => Promise<{
+    readonly ok: boolean;
+    readonly detail?: string;
+  }>;
+
+  /**
    * Read this provider's usage locally using the official CLI's own
    * credential + identity. Metadata only.
    */
