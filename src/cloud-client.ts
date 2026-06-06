@@ -13,16 +13,19 @@
 import { hostname } from "node:os";
 import type {
   TDaemonBootstrap,
-  TDaemonPollResponse,
   TDaemonRecordRequest,
   TDaemonSearchResponse,
-  TDaemonStatusReport,
+  TRelayChannelResponse,
 } from "@openllm/schema";
 import {
   DAEMON_DEVICE_ID_HEADER,
   DAEMON_DEVICE_LABEL_HEADER,
+  RelayChannelResponse,
 } from "@openllm/schema";
+import { Schema } from "effect";
 import { daemonEnv, deviceId } from "./env";
+
+const decodeChannel = Schema.decodeUnknownSync(RelayChannelResponse);
 
 /** Thrown when no API key is configured yet — the daemon is keyless. */
 export class NoApiKeyError extends Error {
@@ -37,20 +40,6 @@ export class InvalidApiKeyError extends Error {
   constructor(status: number) {
     super(`cloud rejected the API key (${status})`);
     this.name = "InvalidApiKeyError";
-  }
-}
-
-/**
- * Thrown when the cloud returns a transient 503/5xx — a backend hiccup
- * (a soft-503 from the poll handler degrading on Neon weather, or any upstream
- * 5xx), NOT a real fault. The control loop backs off QUIETLY on it (debug, not
- * error) rather than treating it like a hard failure. See
- * `docs/proposals/daemon-poll-db-resilience.md` §3.5.
- */
-export class TransientUpstreamError extends Error {
-  constructor(status: number) {
-    super(`cloud transiently unavailable (${status})`);
-    this.name = "TransientUpstreamError";
   }
 }
 
@@ -71,8 +60,8 @@ const authHeaders = (): Record<string, string> => {
     "content-type": "application/json",
     // Device identity (metadata only): the cloud records the latest value per
     // key on `api_key_activity` so the dashboard tells two daemons behind one
-    // NAT apart — device code + IP, not IP alone. Rides EVERY control call so
-    // the most frequent one (the poll) keeps it fresh. See
+    // NAT apart — device code + IP, not IP alone. Rides every control call
+    // (incl. the channel handshake) so it stays fresh. See
     // `docs/proposals/daemon-device-aware-this-machine.md`.
     [DAEMON_DEVICE_ID_HEADER]: deviceId(),
     [DAEMON_DEVICE_LABEL_HEADER]: deviceLabel(),
@@ -106,6 +95,34 @@ export const fetchBootstrap = async (): Promise<TDaemonBootstrap> => {
   }
   if (!resp.ok) throw new Error(`bootstrap fetch failed: ${resp.status}`);
   return (await resp.json()) as TDaemonBootstrap;
+};
+
+/**
+ * Ask the cloud for a relay channel: `GET /api/daemon/channel`. Returns the
+ * stable per-env WSS URL + a short-lived connect ticket the daemon presents in
+ * its `hello` frame. The daemon then holds ONE WebSocket to the relay — its
+ * only control transport. Throws `NoApiKeyError`/`InvalidApiKeyError` so the
+ * channel loop can back off. See `docs/proposals/daemon-relay-websocket-push.md`.
+ */
+export const fetchChannel = async (): Promise<TRelayChannelResponse> => {
+  const resp = await fetch(cloudUrl("/api/daemon/channel"), {
+    method: "GET",
+    headers: authHeaders(),
+  });
+  if (resp.status === 401 || resp.status === 403) {
+    throw new InvalidApiKeyError(resp.status);
+  }
+  if (!resp.ok) throw new Error(`channel fetch failed: ${resp.status}`);
+  // Validate before we dial: a malformed `wss_url`/`ticket` would otherwise
+  // surface as a cryptic WebSocket construction failure. Throwing here routes
+  // through the channel loop's backoff like any other channel-fetch error.
+  try {
+    return decodeChannel(await resp.json());
+  } catch (err) {
+    throw new Error(
+      `invalid channel response: ${err instanceof Error ? err.message : "decode failed"}`,
+    );
+  }
 };
 
 /**
@@ -178,52 +195,4 @@ export const relayCredential = async (
     throw new InvalidApiKeyError(resp.status);
   }
   if (!resp.ok) throw new Error(`relay-credential failed: ${resp.status}`);
-};
-
-/**
- * The daemon's control long-poll: `GET /api/daemon/poll`. Held open
- * server-side (~25s) until a command is queued for this key or the deadline
- * passes. The poll itself stamps presence cloud-side (the open poll IS the
- * "daemon online" signal). Throws `NoApiKeyError`/`InvalidApiKeyError` so the
- * loop can back off; pass an `AbortSignal` (timeout) so a stalled connection
- * is retried. See `docs/proposals/daemon-control-via-neon-longpoll.md`.
- */
-export const pollControl = async (
-  signal?: AbortSignal,
-): Promise<TDaemonPollResponse> => {
-  const resp = await fetch(cloudUrl("/api/daemon/poll"), {
-    method: "GET",
-    headers: authHeaders(),
-    ...(signal !== undefined ? { signal } : {}),
-  });
-  if (resp.status === 401 || resp.status === 403) {
-    throw new InvalidApiKeyError(resp.status);
-  }
-  // A soft-503 (the poll handler degrading on Neon weather) or any upstream
-  // 5xx is transient — the loop backs off quietly and re-dials.
-  if (resp.status === 503 || resp.status >= 500) {
-    throw new TransientUpstreamError(resp.status);
-  }
-  if (!resp.ok) throw new Error(`control poll failed: ${resp.status}`);
-  return (await resp.json()) as TDaemonPollResponse;
-};
-
-/**
- * Report the daemon's status to the cloud: `POST /api/daemon/status`.
- * Refreshes presence + the per-provider snapshot and acks executed
- * commands; `{ active: false }` is the graceful-exit beacon that flips the
- * key offline immediately. Best-effort — never throws into the caller.
- */
-export const reportStatus = async (
-  report: TDaemonStatusReport,
-): Promise<void> => {
-  try {
-    await fetch(cloudUrl("/api/daemon/status"), {
-      method: "POST",
-      headers: authHeaders(),
-      body: JSON.stringify(report),
-    });
-  } catch {
-    // best-effort — presence also self-heals via the next poll / staleness
-  }
 };

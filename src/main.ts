@@ -8,9 +8,9 @@
  * daemon's opaque `device_id` so the dashboard can tell which key's daemon is
  * on THIS host (`docs/proposals/this-machine-detection-audit.md`). CONTROL
  * (status / connect / cli-install) is NOT served on localhost: the daemon
- * dials OUT to the cloud control channel (`control-relay.ts`) and the
+ * dials OUT to the cloud relay over a WebSocket (`control-channel.ts`) and the
  * dashboard drives it from there. Both loopback routes share one cross-origin
- * CORS/PNA grant. See `docs/proposals/daemon-control-via-neon-longpoll.md`.
+ * CORS/PNA grant. See `docs/proposals/daemon-relay-websocket-push.md`.
  *
  * It holds NO DEK and decrypts NO vault credential. The only secret it
  * carries is the user's `sk-llm-...` key, used to authenticate cloud
@@ -23,10 +23,10 @@
 import { runCli } from "./cli";
 import { getCloudState, latestVersion, refreshBootstrap } from "./config";
 import {
-  pushStatus,
-  reportControlInactive,
-  startControlRelay,
-} from "./control-relay";
+  pushStatusIfChanged,
+  startControlChannel,
+  stopControlChannel,
+} from "./control-channel";
 import { corsHeaders, isPreflight, preflightResponse } from "./cors";
 import { daemonPort, deviceId, isDevMode, stateDir } from "./env";
 import { handleInference } from "./listener";
@@ -91,25 +91,34 @@ const main = async (): Promise<void> => {
     const delay =
       getCloudState() === "ok" ? BOOTSTRAP_TTL_MS : BOOTSTRAP_RETRY_MS;
     setTimeout(async () => {
-      // A retry that flips cloud_state (e.g. a boot-time `unreachable`
-      // recovering to `ok` once the network/cloud is up) must re-push the
-      // status, or the dashboard stays stuck on the stale value until the next
-      // command. The relay only pushes on commands, so do it here on change.
-      const changed = await refreshBootstrap();
-      if (changed) await pushStatus();
-      // Periodic version check — picks up a release published while running.
-      void maybeSelfUpdate(latestVersion());
-      scheduleBootstrap();
+      try {
+        // A retry that flips cloud_state (e.g. a boot-time `unreachable`
+        // recovering to `ok` once the network/cloud is up) must re-push the
+        // status, or the dashboard stays stuck on the stale value. Push it over
+        // the relay socket immediately on change (the channel's own watcher
+        // would catch it within a couple seconds anyway).
+        const changed = await refreshBootstrap();
+        if (changed) await pushStatusIfChanged();
+        // Periodic version check — picks up a release published while running.
+        void maybeSelfUpdate(latestVersion());
+      } catch (err) {
+        // setTimeout doesn't observe the async callback's promise, so an
+        // unguarded throw here is an unhandled rejection AND skips the reschedule
+        // below — silently killing the bootstrap/self-update loop forever. Catch,
+        // log, and always reschedule in `finally`.
+        logError("main", err);
+      } finally {
+        scheduleBootstrap();
+      }
     }, delay);
   };
   scheduleBootstrap();
 
-  // Dial OUT to the cloud control channel: a long-poll that delivers
-  // dashboard commands (connect / cli-install) and, by being held open,
-  // marks this key's daemon "online" server-side — so the dashboard no
-  // longer has to reach loopback (no Private Network Access prompt). See
-  // `docs/proposals/daemon-control-via-neon-longpoll.md`.
-  startControlRelay();
+  // Dial OUT to the cloud relay over a WebSocket: it delivers dashboard
+  // commands and marks this key's daemon "online" server-side — so the
+  // dashboard never reaches loopback (no Private Network Access prompt). See
+  // `docs/proposals/daemon-relay-websocket-push.md`.
+  startControlChannel();
 
   // Graceful-exit beacon: flip the key offline immediately on Ctrl-C /
   // termination instead of waiting for the presence-staleness window.
@@ -117,7 +126,7 @@ const main = async (): Promise<void> => {
   const shutdown = (signal: NodeJS.Signals): void => {
     if (shuttingDown) return;
     shuttingDown = true;
-    void reportControlInactive().finally(() => {
+    void stopControlChannel().finally(() => {
       process.exit(signal === "SIGINT" ? 130 : 143);
     });
   };

@@ -527,17 +527,18 @@ export const chatgptDelegate: TProviderDelegate = {
           "Couldn't start Codex sign-in. Retry, or run `codex login` on the box.",
       };
     }
-    // Open it from the daemon (codex's own open doesn't reach the session) AND
-    // surface it so a remote box / failed open still lets the user click it.
-    logInfo("chatgpt-connect", "parsed authorize URL; opening browser", {
+    // `codex login` already opens the browser itself in a user session, so we do
+    // NOT open it again here — doing so popped a SECOND tab. We only surface the
+    // URL via pending_auth so a remote/headless box (where codex's open can't
+    // reach the user) still lets them click it from the dashboard.
+    logInfo("chatgpt-connect", "parsed authorize URL; surfacing to dashboard", {
       urlLen: url.length,
     });
-    openUrl(url);
     setPendingAuth(PROVIDER, { url, code: "" });
     return {
       connected: false,
       pending: true,
-      detail: `Authorize Codex in the browser window that just opened — or open ${url}. This page updates automatically once you're done.`,
+      detail: `Authorize Codex in the browser window that opened — or open ${url}. This page updates automatically once you're done.`,
     };
   },
 

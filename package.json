@@ -19,7 +19,8 @@
   "dependencies": {
     "@openllm/schema": "workspace:*",
     "@openllm/wire": "workspace:*",
-    "effect": ">=3.20.0"
+    "effect": ">=3.20.0",
+    "partysocket": "^1.1.19"
   },
   "license": "BUSL-1.1"
 }
