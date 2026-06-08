@@ -47,8 +47,25 @@ const PROD_ORIGINS: ReadonlySet<string> = new Set([
  */
 const PREVIEW_ORIGIN = /^https:\/\/openllm-[a-z0-9-]+-quantide\.vercel\.app$/;
 
+/** A real `http(s)://localhost[:port]` origin — parsed, not substring-matched, so
+ *  `https://localhost.attacker.com` / `https://evil-localhost.io` can't slip past
+ *  an `includes("localhost")`. Dev-only trust (see `isTrustedDeploymentOrigin`). */
+const isLocalhostOrigin = (origin: string): boolean => {
+  try {
+    const u = new URL(origin);
+    return (
+      (u.protocol === "http:" || u.protocol === "https:") &&
+      u.hostname === "localhost"
+    );
+  } catch {
+    return false;
+  }
+};
+
 export const isTrustedDeploymentOrigin = (origin: string): boolean =>
-  PROD_ORIGINS.has(origin) || PREVIEW_ORIGIN.test(origin);
+  PROD_ORIGINS.has(origin) ||
+  PREVIEW_ORIGIN.test(origin) ||
+  (process.env.NODE_ENV === "development" && isLocalhostOrigin(origin));
 
 /**
  * The `access-control-allow-origin` to return for THIS request: the request's

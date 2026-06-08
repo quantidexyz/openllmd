@@ -12,7 +12,7 @@ import { Schema } from "effect";
 import { WebSocket as ReconnectingWebSocket } from "partysocket";
 import { fetchChannel } from "./cloud-client";
 import { runCommandInner } from "./control-relay";
-import { logDebug, logInfo } from "./logger";
+import { logDebug, logInfo, logWarn } from "./logger";
 import { computeStatus } from "./status";
 
 const decodeFrame = Schema.decodeUnknownEither(RelayFrame);
@@ -29,6 +29,10 @@ let livenessTimer: ReturnType<typeof setTimeout> | null = null;
 /** Fresh connect ticket, stashed by the url provider for the next `hello`. */
 let ticket = "";
 let lastFingerprint = "";
+/** Whether the socket has opened at least once — lets `onopen` log a first
+ *  "connected" vs a recovery "reconnected", so the log shows the channel coming
+ *  back, not just dropping. */
+let hasConnected = false;
 
 const send = (frame: TRelayFrame): void => {
   if (ws === null || ws.readyState !== ws.OPEN) return;
@@ -171,9 +175,9 @@ const onMessage = (data: unknown): void => {
 const armLiveness = (): void => {
   if (livenessTimer !== null) clearTimeout(livenessTimer);
   livenessTimer = setTimeout(() => {
-    logDebug(
+    logWarn(
       "control-channel",
-      "no relay traffic in liveness window; reconnecting",
+      `no relay traffic in ${LIVENESS_TIMEOUT_MS}ms; forcing reconnect`,
     );
     ws?.reconnect();
   }, LIVENESS_TIMEOUT_MS);
@@ -207,6 +211,11 @@ export const startControlChannel = (): void => {
   });
   ws = socket;
   socket.onopen = (): void => {
+    logInfo(
+      "control-channel",
+      hasConnected ? "reconnected over websocket" : "connected over websocket",
+    );
+    hasConnected = true;
     armLiveness();
     void (async () => {
       const status = await computeStatus();
@@ -222,14 +231,18 @@ export const startControlChannel = (): void => {
     onMessage(ev.data);
   };
   socket.onerror = (ev): void => {
-    // Surface connect failures (a timed-out channel fetch, a handshake timeout,
-    // a refused dial) so a stuck reconnect is visible in the logs rather than
-    // silent. partysocket still backs off + retries — this is trace only.
-    const message =
-      ev && typeof ev === "object" && "message" in ev
-        ? String((ev as { message: unknown }).message)
-        : "unknown";
-    logDebug("control-channel", `socket error: ${message} (reconnecting)`);
+    // Surface connect failures (a timed-out channel fetch — message `TIMEOUT` —,
+    // a thrown channel URL provider, a refused dial) at WARN so "I don't know
+    // why it keeps dropping" is answerable from the log. partysocket still backs
+    // off + retries; the matching `reconnected` line lands on recovery. The real
+    // reason lives on `.message` (partysocket wraps the thrown error) but native
+    // ws error events carry only `.error`, so read both.
+    const e = ev as { message?: unknown; error?: unknown } | null;
+    const reason =
+      (typeof e?.message === "string" && e.message) ||
+      (e?.error instanceof Error && e.error.message) ||
+      "unknown";
+    logWarn("control-channel", `socket error: ${reason} (reconnecting)`);
   };
   socket.onclose = (ev): void => {
     stopWatcher();
@@ -237,10 +250,12 @@ export const startControlChannel = (): void => {
     // mismatch); 1006 = relay unreachable. 1000/1001 = relay cycling. partysocket
     // reconnects automatically in all cases.
     const clean = ev.code === 1000 || ev.code === 1001;
-    logDebug(
-      "control-channel",
-      `socket closed code=${ev.code}${ev.reason ? ` reason=${ev.reason}` : ""}${clean ? "" : " (reconnecting)"}`,
-    );
+    const line = `socket closed code=${ev.code}${ev.reason ? ` reason=${ev.reason}` : ""}${clean ? "" : " (reconnecting)"}`;
+    // A clean close (relay cycling its box, or our own graceful stop) is routine
+    // → debug. An abnormal close (1006 unreachable, 4003 rejected ticket) is a
+    // real drop the user needs to see → warn, paired with the `reconnected` line.
+    if (clean) logDebug("control-channel", line);
+    else logWarn("control-channel", line);
   };
 };
 
