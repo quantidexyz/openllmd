@@ -68,6 +68,30 @@ const authHeaders = (): Record<string, string> => {
   };
 };
 
+// Cloud control-plane calls must never hang forever. Bun's `fetch` has NO
+// default timeout, so a half-open TCP connection to the cloud — routine on a
+// long-lived remote daemon after a network blip — stalls the request
+// indefinitely. For `fetchChannel` this is fatal: partysocket awaits the URL
+// provider INSIDE its reconnect lock (`_connectLock`), released only when the
+// fetch settles. A hung channel fetch wedges the lock forever, so BOTH
+// partysocket's auto-reconnect AND the daemon's liveness-watchdog `reconnect()`
+// early-return — the daemon is stuck "connecting" until the process restarts.
+// Bounding every call with an AbortSignal lets a stalled connection reject
+// promptly so the channel loop's backoff (or the caller) retries cleanly.
+const CLOUD_FETCH_TIMEOUT_MS = 15_000;
+
+const cloudFetch = (url: string, init: RequestInit): Promise<Response> =>
+  fetch(url, {
+    ...init,
+    signal:
+      init.signal != null
+        ? AbortSignal.any([
+            init.signal,
+            AbortSignal.timeout(CLOUD_FETCH_TIMEOUT_MS),
+          ])
+        : AbortSignal.timeout(CLOUD_FETCH_TIMEOUT_MS),
+  });
+
 // Default to the pinned cloud origin, but let the same-machine-307 path
 // override per-request with the deployment that issued the redirect
 // (`?__origin=`), so one daemon serves any deployment.
@@ -86,7 +110,7 @@ const cloudUrl = (path: string, origin?: string | null): string => {
  * 401/403 so callers can distinguish "needs a key" from "key is bad".
  */
 export const fetchBootstrap = async (): Promise<TDaemonBootstrap> => {
-  const resp = await fetch(cloudUrl("/api/daemon/bootstrap"), {
+  const resp = await cloudFetch(cloudUrl("/api/daemon/bootstrap"), {
     method: "GET",
     headers: authHeaders(),
   });
@@ -105,7 +129,7 @@ export const fetchBootstrap = async (): Promise<TDaemonBootstrap> => {
  * channel loop can back off. See `docs/proposals/daemon-relay-websocket-push.md`.
  */
 export const fetchChannel = async (): Promise<TRelayChannelResponse> => {
-  const resp = await fetch(cloudUrl("/api/daemon/channel"), {
+  const resp = await cloudFetch(cloudUrl("/api/daemon/channel"), {
     method: "GET",
     headers: authHeaders(),
   });
@@ -135,7 +159,7 @@ export const recordRequest = async (
   origin?: string | null,
 ): Promise<void> => {
   try {
-    await fetch(cloudUrl("/api/daemon/requests", origin), {
+    await cloudFetch(cloudUrl("/api/daemon/requests", origin), {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify(row),
@@ -161,7 +185,7 @@ export const searchViaCloud = async (
   signal?: AbortSignal,
 ): Promise<TDaemonSearchResponse | null> => {
   try {
-    const resp = await fetch(cloudUrl("/api/daemon/search", origin), {
+    const resp = await cloudFetch(cloudUrl("/api/daemon/search", origin), {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({ query }),
@@ -186,7 +210,7 @@ export const relayCredential = async (
   targetKey: string,
   sealed: string,
 ): Promise<void> => {
-  const resp = await fetch(cloudUrl("/api/daemon/relay-credential"), {
+  const resp = await cloudFetch(cloudUrl("/api/daemon/relay-credential"), {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify({ target_key: targetKey, sealed }),

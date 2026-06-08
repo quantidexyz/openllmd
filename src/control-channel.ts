@@ -221,6 +221,16 @@ export const startControlChannel = (): void => {
     armLiveness(); // any inbound frame (incl. the relay's ping) = alive
     onMessage(ev.data);
   };
+  socket.onerror = (ev): void => {
+    // Surface connect failures (a timed-out channel fetch, a handshake timeout,
+    // a refused dial) so a stuck reconnect is visible in the logs rather than
+    // silent. partysocket still backs off + retries — this is trace only.
+    const message =
+      ev && typeof ev === "object" && "message" in ev
+        ? String((ev as { message: unknown }).message)
+        : "unknown";
+    logDebug("control-channel", `socket error: ${message} (reconnecting)`);
+  };
   socket.onclose = (ev): void => {
     stopWatcher();
     // 4003 = relay rejected our ticket (usually a NEON_AUTH_COOKIE_SECRET
