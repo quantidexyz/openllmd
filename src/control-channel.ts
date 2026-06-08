@@ -77,15 +77,18 @@ const stopWatcher = (): void => {
   }
 };
 
-// At-most-once command execution. Delivery is at-LEAST-once: the relay's
-// logical-replication stream replays unacked WAL on reconnect (and the
-// connect-time replay path can overlap a live push), so the SAME command id can
-// arrive more than once. Commands like `connect` aren't idempotent (a second
-// run spawns a second login), so we dedupe by id here. `null` = still running
-// (skip the re-ack — the in-flight run will ack); an ack value = completed
-// (re-ack with the REAL result so a lost first-ack still marks it terminal,
-// without clobbering an `error` with `done`). Bounded — a daemon restart starts
-// fresh and re-runs any still-pending command exactly once.
+// At-most-once command execution. Within a single session the SAME command id
+// can still arrive more than once — the connect-time replay path can overlap a
+// live push for a command that lands just as the daemon connects (read as
+// `pending` by the replay before the relay flips it to `delivered`). Commands
+// like `connect` aren't idempotent (a second run spawns a second login), so we
+// dedupe by id here. `null` = still running (skip the re-ack — the in-flight run
+// will ack); an ack value = completed (re-ack with the REAL result so a lost
+// first-ack still marks it terminal, without clobbering an `error` with `done`).
+// Across restarts the relay marks every pushed command `delivered` and only ever
+// replays never-delivered (`pending`) rows, so a restart does NOT re-run a
+// command it already received — this in-memory map only guards the in-session
+// double-delivery above.
 const commandResults = new Map<string, TDaemonCommandAck | null>();
 const PROCESSED_CAP = 500;
 
