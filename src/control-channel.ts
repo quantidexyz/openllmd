@@ -42,7 +42,6 @@ const sleep = (ms: number): Promise<void> =>
 
 let ws: ReconnectingWebSocket | null = null;
 let watchTimer: ReturnType<typeof setInterval> | null = null;
-let resyncTimer: ReturnType<typeof setInterval> | null = null;
 // The daemon's liveness heartbeat. `sendPing` and `onSilent` close over `ws`,
 // which is reassigned per connection, so they read the live binding at call
 // time. partysocket reuses one instance across reconnects, so this one heartbeat
@@ -62,6 +61,23 @@ const heartbeat = createHeartbeat({
 /** Fresh connect ticket, stashed by the url provider for the next `hello`. */
 let ticket = "";
 let lastFingerprint = "";
+/** Whether THIS connection's `hello` has been sent. The relay 4001-closes any
+ *  connection whose FIRST frame isn't a hello, and an out-of-band status push
+ *  (the bootstrap scheduler fires `pushStatusIfChanged` the moment
+ *  `cloud_state` changes — e.g. the cloud coming up seconds after the daemon)
+ *  can resolve its `computeStatus` between the socket opening and the hello's
+ *  own snapshot resolving — putting a `status` frame on the wire first and
+ *  killing the handshake. So `send` drops every non-hello frame until the
+ *  hello is out; the dropped status is lossless (the hello carries a fresh
+ *  snapshot, and the 2.5s watcher re-pushes on change). */
+let helloSent = false;
+/** Monotonic connection counter. The hello continuation awaits
+ *  `computeStatus()`, and the socket can close + reopen while that's pending —
+ *  the STALE continuation would then send an old-ticket hello on the NEW
+ *  connection (which the relay 4003-rejects) and prematurely open the
+ *  `helloSent` gate. Each `onopen` bumps this; a continuation whose captured
+ *  generation no longer matches simply bails. */
+let connectionGeneration = 0;
 /** Whether the socket has opened at least once — lets `onopen` log a first
  *  "connected" vs a recovery "reconnected", so the log shows the channel coming
  *  back, not just dropping. */
@@ -69,6 +85,8 @@ let hasConnected = false;
 
 const send = (frame: TRelayFrame): void => {
   if (ws === null || ws.readyState !== ws.OPEN) return;
+  // Nothing may precede the hello on a fresh connection (see `helloSent`).
+  if (!helloSent && frame.type !== "hello") return;
   try {
     ws.send(JSON.stringify(frame));
   } catch {
@@ -114,55 +132,25 @@ const stopWatcher = (): void => {
   }
 };
 
-// Delivery floor: ask the relay to re-push any command that's still `pending`
-// (a live push lost to a transient blip / half-open socket). Bounds delivery
-// latency to this interval instead of the reconnect cadence — without it a lost
-// push only recovers on the NEXT reconnect (minutes on a flapping link). The
-// relay re-pushes only never-received rows and the daemon dedups by id, so this
-// is cheap and safe. See R1/R7 in
-// docs/audit/2026-06-08-daemon-relay-websocket-stability.md.
-// Overridable via `OPENLLM_DAEMON_RESYNC_MS` (ops tuning + the local
-// daemon↔relay harness drives it down so it can assert the floor fast).
-const RESYNC_MS = ((): number => {
-  const raw = Number(process.env.OPENLLM_DAEMON_RESYNC_MS);
-  return Number.isFinite(raw) && raw > 0 ? raw : 60_000;
-})();
-
-const startResync = (): void => {
-  if (resyncTimer !== null) return;
-  resyncTimer = setInterval(() => send({ type: "resync" }), RESYNC_MS);
-  resyncTimer.unref?.();
-};
-
-const stopResync = (): void => {
-  if (resyncTimer !== null) {
-    clearInterval(resyncTimer);
-    resyncTimer = null;
-  }
-};
-
-// At-most-once command execution. Within a single session the SAME command id
-// can still arrive more than once — the connect-time replay path can overlap a
-// live push for a command that lands just as the daemon connects (read as
-// `pending` by the replay before the relay flips it to `delivered`). Commands
-// like `connect` aren't idempotent (a second run spawns a second login), so we
-// dedupe by id here. `null` = still running (skip the re-ack — the in-flight run
-// will ack); an ack value = completed (re-ack with the REAL result so a lost
-// first-ack still marks it terminal, without clobbering an `error` with `done`).
-// Across restarts the relay only replays never-`delivered` (`pending`) rows, and
-// a command is flipped `delivered` by our `received` receipt the moment we have
-// it — so a restart does NOT re-run a command we already received. This
-// in-memory map only guards the in-session double-delivery above.
+// Command dedup. The SAME command id can arrive more than once: the relay's
+// delivery is at-least-once — its connect-time replay can overlap a live push,
+// and its periodic sweep re-pushes any row that hasn't reached a terminal ack
+// within the redeliver window (a long-running command like a browser login is
+// legitimately un-acked for a while). Commands like `connect` aren't idempotent
+// (a second run spawns a second login), so we dedupe by id here. `null` = still
+// running (skip the re-ack — the in-flight run will ack); an ack value =
+// completed (re-ack with the REAL result so a lost first-ack still reaches a
+// terminal state, without clobbering an `error` with `done`). The map is
+// in-memory: a daemon RESTART forgets it, so a command that was delivered but
+// never terminally acked is re-delivered and re-run after the redeliver window
+// — by design (the command never completed; the cloud's stale reaper is the
+// give-up bound).
 const commandResults = new Map<string, TDaemonCommandAck | null>();
 const PROCESSED_CAP = 500;
 
 const onCommand = async (command: TRelayFrame): Promise<void> => {
   if (command.type !== "command") return;
   const id = command.command.id;
-  // Receipt FIRST, before dedup: tell the relay we have the bytes so it flips the
-  // row pending → delivered (and stops re-pushing it on resync). Sent even for a
-  // duplicate so a lost first receipt is recovered by the re-push. R1/R2.
-  send({ type: "received", id });
   const prior = commandResults.get(id);
   if (prior !== undefined) {
     logDebug("control-channel", "duplicate command ignored", {
@@ -269,13 +257,19 @@ export const startControlChannel = (): void => {
       hasConnected ? "reconnected over websocket" : "connected over websocket",
     );
     hasConnected = true;
+    helloSent = false; // a fresh connection — nothing may precede ITS hello
+    connectionGeneration += 1;
+    const generation = connectionGeneration;
     heartbeat.start(); // begin pinging + arm the liveness window off pong receipt
     void (async () => {
       const status = await computeStatus();
+      // A close+reopen superseded this connection while the snapshot was in
+      // flight — the NEW open's own continuation owns the hello now.
+      if (generation !== connectionGeneration) return;
       lastFingerprint = JSON.stringify(status);
+      helloSent = true; // open the gate exactly as the hello goes out
       send({ type: "hello", ticket, status });
       startWatcher();
-      startResync();
     })().catch(() => {
       // best-effort: partysocket reconnects if the hello never lands
     });
@@ -299,7 +293,7 @@ export const startControlChannel = (): void => {
   };
   socket.onclose = (ev): void => {
     stopWatcher();
-    stopResync();
+    helloSent = false; // the next connection must lead with its own hello
     heartbeat.stop(); // disarm until the next open re-starts it
     // 4003 = relay rejected our ticket (usually a NEON_AUTH_COOKIE_SECRET
     // mismatch); 1006 = relay unreachable. 1000/1001 = relay cycling. partysocket
@@ -318,7 +312,6 @@ export const startControlChannel = (): void => {
 export const stopControlChannel = async (): Promise<void> => {
   if (ws === null) return;
   stopWatcher();
-  stopResync();
   heartbeat.stop();
   if (ws.readyState === ws.OPEN) send({ type: "status", active: false });
   ws.close(); // partysocket: a manual close() disables further reconnection
