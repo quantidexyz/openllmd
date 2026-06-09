@@ -121,7 +121,12 @@ const stopWatcher = (): void => {
 // relay re-pushes only never-received rows and the daemon dedups by id, so this
 // is cheap and safe. See R1/R7 in
 // docs/audit/2026-06-08-daemon-relay-websocket-stability.md.
-const RESYNC_MS = 60_000;
+// Overridable via `OPENLLM_DAEMON_RESYNC_MS` (ops tuning + the local
+// daemon↔relay harness drives it down so it can assert the floor fast).
+const RESYNC_MS = ((): number => {
+  const raw = Number(process.env.OPENLLM_DAEMON_RESYNC_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 60_000;
+})();
 
 const startResync = (): void => {
   if (resyncTimer !== null) return;
