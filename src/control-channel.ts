@@ -12,15 +12,22 @@ import { Schema } from "effect";
 import { WebSocket as ReconnectingWebSocket } from "partysocket";
 import { fetchChannel } from "./cloud-client";
 import { runCommandInner } from "./control-relay";
+import { createHeartbeat } from "./heartbeat";
 import { logDebug, logInfo, logWarn } from "./logger";
 import { computeStatus } from "./status";
 
 const decodeFrame = Schema.decodeUnknownEither(RelayFrame);
 
 const WATCH_MS = 2_500;
-// Liveness watchdog: the relay pings every 20s; if NO traffic arrives within
-// this window the connection is a silent half-open (no `close` fired), so we
-// `reconnect()`. partysocket owns connect/backoff but has no app heartbeat.
+// Heartbeat: the daemon sends its OWN `ping` on this interval and arms the
+// liveness watchdog off the relay's `pong` (not off arbitrary inbound frames),
+// so it detects a dead daemon→relay direction itself and reconnects — rather
+// than waiting for the relay to terminate the socket (a `1006`). See `heartbeat.ts`
+// and R4 in docs/audit/2026-06-08-daemon-relay-websocket-stability.md.
+const HEARTBEAT_MS = 20_000;
+// Liveness window: if NO `pong` arrives within this, the link is a silent
+// half-open (no `close` fired) → `reconnect()`. 3.5× the heartbeat, so a single
+// slow round-trip never trips it. partysocket owns connect/backoff, not liveness.
 const LIVENESS_TIMEOUT_MS = 70_000;
 // Reconnect jitter: a relay redeploy closes EVERY daemon's socket at once, and
 // partysocket's backoff is deterministic (no jitter of its own), so without this
@@ -35,7 +42,22 @@ const sleep = (ms: number): Promise<void> =>
 
 let ws: ReconnectingWebSocket | null = null;
 let watchTimer: ReturnType<typeof setInterval> | null = null;
-let livenessTimer: ReturnType<typeof setTimeout> | null = null;
+// The daemon's liveness heartbeat. `sendPing` and `onSilent` close over `ws`,
+// which is reassigned per connection, so they read the live binding at call
+// time. partysocket reuses one instance across reconnects, so this one heartbeat
+// is started on each open and stopped on each close.
+const heartbeat = createHeartbeat({
+  sendPing: () => send({ type: "ping" }),
+  onSilent: () => {
+    logWarn(
+      "control-channel",
+      `no relay pong in ${LIVENESS_TIMEOUT_MS}ms; forcing reconnect`,
+    );
+    ws?.reconnect();
+  },
+  heartbeatMs: HEARTBEAT_MS,
+  livenessMs: LIVENESS_TIMEOUT_MS,
+});
 /** Fresh connect ticket, stashed by the url provider for the next `hello`. */
 let ticket = "";
 let lastFingerprint = "";
@@ -160,7 +182,14 @@ const onFrame = (frame: TRelayFrame): void => {
       });
       return;
     case "ping":
+      // The relay's keepalive ping → answer so its missed-pong reap stays happy.
       send({ type: "pong" });
+      return;
+    case "pong":
+      // The relay's answer to OUR heartbeat ping → the daemon→relay round-trip
+      // is alive, so re-arm the liveness window (R4: arm off pong, not off any
+      // inbound frame — that's how we notice a dead outbound direction).
+      heartbeat.notePong();
       return;
     default:
       // welcome / others: nothing to do (partysocket owns reconnection)
@@ -178,27 +207,6 @@ const onMessage = (data: unknown): void => {
   }
   const r = decodeFrame(json);
   if (r._tag === "Right") onFrame(r.right);
-};
-
-// (Re)arm on open + every inbound frame; if the relay goes quiet past the window
-// the connection is a silent half-open → force a reconnect.
-const armLiveness = (): void => {
-  if (livenessTimer !== null) clearTimeout(livenessTimer);
-  livenessTimer = setTimeout(() => {
-    logWarn(
-      "control-channel",
-      `no relay traffic in ${LIVENESS_TIMEOUT_MS}ms; forcing reconnect`,
-    );
-    ws?.reconnect();
-  }, LIVENESS_TIMEOUT_MS);
-  livenessTimer.unref?.();
-};
-
-const clearLiveness = (): void => {
-  if (livenessTimer !== null) {
-    clearTimeout(livenessTimer);
-    livenessTimer = null;
-  }
 };
 
 /** partysocket calls this before every (re)connect — fetch a fresh channel so
@@ -229,7 +237,7 @@ export const startControlChannel = (): void => {
       hasConnected ? "reconnected over websocket" : "connected over websocket",
     );
     hasConnected = true;
-    armLiveness();
+    heartbeat.start(); // begin pinging + arm the liveness window off pong receipt
     void (async () => {
       const status = await computeStatus();
       lastFingerprint = JSON.stringify(status);
@@ -240,7 +248,6 @@ export const startControlChannel = (): void => {
     });
   };
   socket.onmessage = (ev: MessageEvent): void => {
-    armLiveness(); // any inbound frame (incl. the relay's ping) = alive
     onMessage(ev.data);
   };
   socket.onerror = (ev): void => {
@@ -259,6 +266,7 @@ export const startControlChannel = (): void => {
   };
   socket.onclose = (ev): void => {
     stopWatcher();
+    heartbeat.stop(); // disarm until the next open re-starts it
     // 4003 = relay rejected our ticket (usually a NEON_AUTH_COOKIE_SECRET
     // mismatch); 1006 = relay unreachable. 1000/1001 = relay cycling. partysocket
     // reconnects automatically in all cases.
@@ -276,7 +284,7 @@ export const startControlChannel = (): void => {
 export const stopControlChannel = async (): Promise<void> => {
   if (ws === null) return;
   stopWatcher();
-  clearLiveness();
+  heartbeat.stop();
   if (ws.readyState === ws.OPEN) send({ type: "status", active: false });
   ws.close(); // partysocket: a manual close() disables further reconnection
   ws = null;
