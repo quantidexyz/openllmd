@@ -1,10 +1,11 @@
 /**
  * Shape of the committed daemon-release manifest (`./release.ts`). The data
- * module is rewritten by `scripts/release.ts` after each GitHub release; this
+ * module is rewritten by the release CLI (`bun run release:daemon`) after each
+ * GitHub release; this
  * type stays hand-written so the manifest is type-checked.
  *
  * `DAEMON_TARGETS` is the SINGLE source of truth for the buildable targets —
- * `scripts/release.ts` imports it (rather than re-declaring the list), and the
+ * `packages/release` imports it (rather than re-declaring the list), and the
  * union + the sha256 map key derive from it, so a missing or unknown-target
  * checksum is a compile error instead of silent drift.
  */
