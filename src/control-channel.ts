@@ -12,15 +12,22 @@ import { Schema } from "effect";
 import { WebSocket as ReconnectingWebSocket } from "partysocket";
 import { fetchChannel } from "./cloud-client";
 import { runCommandInner } from "./control-relay";
+import { createHeartbeat } from "./heartbeat";
 import { logDebug, logInfo, logWarn } from "./logger";
 import { computeStatus } from "./status";
 
 const decodeFrame = Schema.decodeUnknownEither(RelayFrame);
 
 const WATCH_MS = 2_500;
-// Liveness watchdog: the relay pings every 20s; if NO traffic arrives within
-// this window the connection is a silent half-open (no `close` fired), so we
-// `reconnect()`. partysocket owns connect/backoff but has no app heartbeat.
+// Heartbeat: the daemon sends its OWN `ping` on this interval and arms the
+// liveness watchdog off the relay's `pong` (not off arbitrary inbound frames),
+// so it detects a dead daemon→relay direction itself and reconnects — rather
+// than waiting for the relay to terminate the socket (a `1006`). See `heartbeat.ts`
+// and R4 in docs/audit/2026-06-08-daemon-relay-websocket-stability.md.
+const HEARTBEAT_MS = 20_000;
+// Liveness window: if NO `pong` arrives within this, the link is a silent
+// half-open (no `close` fired) → `reconnect()`. 3.5× the heartbeat, so a single
+// slow round-trip never trips it. partysocket owns connect/backoff, not liveness.
 const LIVENESS_TIMEOUT_MS = 70_000;
 // Reconnect jitter: a relay redeploy closes EVERY daemon's socket at once, and
 // partysocket's backoff is deterministic (no jitter of its own), so without this
@@ -35,7 +42,23 @@ const sleep = (ms: number): Promise<void> =>
 
 let ws: ReconnectingWebSocket | null = null;
 let watchTimer: ReturnType<typeof setInterval> | null = null;
-let livenessTimer: ReturnType<typeof setTimeout> | null = null;
+let resyncTimer: ReturnType<typeof setInterval> | null = null;
+// The daemon's liveness heartbeat. `sendPing` and `onSilent` close over `ws`,
+// which is reassigned per connection, so they read the live binding at call
+// time. partysocket reuses one instance across reconnects, so this one heartbeat
+// is started on each open and stopped on each close.
+const heartbeat = createHeartbeat({
+  sendPing: () => send({ type: "ping" }),
+  onSilent: () => {
+    logWarn(
+      "control-channel",
+      `no relay pong in ${LIVENESS_TIMEOUT_MS}ms; forcing reconnect`,
+    );
+    ws?.reconnect();
+  },
+  heartbeatMs: HEARTBEAT_MS,
+  livenessMs: LIVENESS_TIMEOUT_MS,
+});
 /** Fresh connect ticket, stashed by the url provider for the next `hello`. */
 let ticket = "";
 let lastFingerprint = "";
@@ -91,6 +114,33 @@ const stopWatcher = (): void => {
   }
 };
 
+// Delivery floor: ask the relay to re-push any command that's still `pending`
+// (a live push lost to a transient blip / half-open socket). Bounds delivery
+// latency to this interval instead of the reconnect cadence — without it a lost
+// push only recovers on the NEXT reconnect (minutes on a flapping link). The
+// relay re-pushes only never-received rows and the daemon dedups by id, so this
+// is cheap and safe. See R1/R7 in
+// docs/audit/2026-06-08-daemon-relay-websocket-stability.md.
+// Overridable via `OPENLLM_DAEMON_RESYNC_MS` (ops tuning + the local
+// daemon↔relay harness drives it down so it can assert the floor fast).
+const RESYNC_MS = ((): number => {
+  const raw = Number(process.env.OPENLLM_DAEMON_RESYNC_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 60_000;
+})();
+
+const startResync = (): void => {
+  if (resyncTimer !== null) return;
+  resyncTimer = setInterval(() => send({ type: "resync" }), RESYNC_MS);
+  resyncTimer.unref?.();
+};
+
+const stopResync = (): void => {
+  if (resyncTimer !== null) {
+    clearInterval(resyncTimer);
+    resyncTimer = null;
+  }
+};
+
 // At-most-once command execution. Within a single session the SAME command id
 // can still arrive more than once — the connect-time replay path can overlap a
 // live push for a command that lands just as the daemon connects (read as
@@ -99,16 +149,20 @@ const stopWatcher = (): void => {
 // dedupe by id here. `null` = still running (skip the re-ack — the in-flight run
 // will ack); an ack value = completed (re-ack with the REAL result so a lost
 // first-ack still marks it terminal, without clobbering an `error` with `done`).
-// Across restarts the relay marks every pushed command `delivered` and only ever
-// replays never-delivered (`pending`) rows, so a restart does NOT re-run a
-// command it already received — this in-memory map only guards the in-session
-// double-delivery above.
+// Across restarts the relay only replays never-`delivered` (`pending`) rows, and
+// a command is flipped `delivered` by our `received` receipt the moment we have
+// it — so a restart does NOT re-run a command we already received. This
+// in-memory map only guards the in-session double-delivery above.
 const commandResults = new Map<string, TDaemonCommandAck | null>();
 const PROCESSED_CAP = 500;
 
 const onCommand = async (command: TRelayFrame): Promise<void> => {
   if (command.type !== "command") return;
   const id = command.command.id;
+  // Receipt FIRST, before dedup: tell the relay we have the bytes so it flips the
+  // row pending → delivered (and stops re-pushing it on resync). Sent even for a
+  // duplicate so a lost first receipt is recovered by the re-push. R1/R2.
+  send({ type: "received", id });
   const prior = commandResults.get(id);
   if (prior !== undefined) {
     logDebug("control-channel", "duplicate command ignored", {
@@ -160,7 +214,14 @@ const onFrame = (frame: TRelayFrame): void => {
       });
       return;
     case "ping":
+      // The relay's keepalive ping → answer so its missed-pong reap stays happy.
       send({ type: "pong" });
+      return;
+    case "pong":
+      // The relay's answer to OUR heartbeat ping → the daemon→relay round-trip
+      // is alive, so re-arm the liveness window (R4: arm off pong, not off any
+      // inbound frame — that's how we notice a dead outbound direction).
+      heartbeat.notePong();
       return;
     default:
       // welcome / others: nothing to do (partysocket owns reconnection)
@@ -178,27 +239,6 @@ const onMessage = (data: unknown): void => {
   }
   const r = decodeFrame(json);
   if (r._tag === "Right") onFrame(r.right);
-};
-
-// (Re)arm on open + every inbound frame; if the relay goes quiet past the window
-// the connection is a silent half-open → force a reconnect.
-const armLiveness = (): void => {
-  if (livenessTimer !== null) clearTimeout(livenessTimer);
-  livenessTimer = setTimeout(() => {
-    logWarn(
-      "control-channel",
-      `no relay traffic in ${LIVENESS_TIMEOUT_MS}ms; forcing reconnect`,
-    );
-    ws?.reconnect();
-  }, LIVENESS_TIMEOUT_MS);
-  livenessTimer.unref?.();
-};
-
-const clearLiveness = (): void => {
-  if (livenessTimer !== null) {
-    clearTimeout(livenessTimer);
-    livenessTimer = null;
-  }
 };
 
 /** partysocket calls this before every (re)connect — fetch a fresh channel so
@@ -229,18 +269,18 @@ export const startControlChannel = (): void => {
       hasConnected ? "reconnected over websocket" : "connected over websocket",
     );
     hasConnected = true;
-    armLiveness();
+    heartbeat.start(); // begin pinging + arm the liveness window off pong receipt
     void (async () => {
       const status = await computeStatus();
       lastFingerprint = JSON.stringify(status);
       send({ type: "hello", ticket, status });
       startWatcher();
+      startResync();
     })().catch(() => {
       // best-effort: partysocket reconnects if the hello never lands
     });
   };
   socket.onmessage = (ev: MessageEvent): void => {
-    armLiveness(); // any inbound frame (incl. the relay's ping) = alive
     onMessage(ev.data);
   };
   socket.onerror = (ev): void => {
@@ -259,6 +299,8 @@ export const startControlChannel = (): void => {
   };
   socket.onclose = (ev): void => {
     stopWatcher();
+    stopResync();
+    heartbeat.stop(); // disarm until the next open re-starts it
     // 4003 = relay rejected our ticket (usually a NEON_AUTH_COOKIE_SECRET
     // mismatch); 1006 = relay unreachable. 1000/1001 = relay cycling. partysocket
     // reconnects automatically in all cases.
@@ -276,7 +318,8 @@ export const startControlChannel = (): void => {
 export const stopControlChannel = async (): Promise<void> => {
   if (ws === null) return;
   stopWatcher();
-  clearLiveness();
+  stopResync();
+  heartbeat.stop();
   if (ws.readyState === ws.OPEN) send({ type: "status", active: false });
   ws.close(); // partysocket: a manual close() disables further reconnection
   ws = null;
