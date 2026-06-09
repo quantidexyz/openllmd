@@ -18,10 +18,20 @@ import { computeStatus } from "./status";
 const decodeFrame = Schema.decodeUnknownEither(RelayFrame);
 
 const WATCH_MS = 2_500;
-// Liveness watchdog: the relay pings every 30s; if NO traffic arrives within
+// Liveness watchdog: the relay pings every 20s; if NO traffic arrives within
 // this window the connection is a silent half-open (no `close` fired), so we
 // `reconnect()`. partysocket owns connect/backoff but has no app heartbeat.
 const LIVENESS_TIMEOUT_MS = 70_000;
+// Reconnect jitter: a relay redeploy closes EVERY daemon's socket at once, and
+// partysocket's backoff is deterministic (no jitter of its own), so without this
+// the whole fleet re-dials in lockstep and stampedes the successor box. Add up to
+// this much random delay before a RE-dial (gated on `hasConnected`, so the first
+// connect stays immediate). Small vs the 35s presence grace, so it never surfaces
+// as a flap. See `packages/audit/presence-reconnect-prior-art.md` §3.
+const RECONNECT_JITTER_MS = 3_000;
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
 let ws: ReconnectingWebSocket | null = null;
 let watchTimer: ReturnType<typeof setInterval> | null = null;
@@ -195,6 +205,9 @@ const clearLiveness = (): void => {
  *  each connection presents a fresh short-lived ticket. Throws when keyless /
  *  unreachable; partysocket backs off and retries. */
 const channelUrl = async (): Promise<string> => {
+  // De-sync fleet reconnect storms (relay redeploy). First connect is immediate;
+  // only re-dials are jittered. partysocket calls this before every (re)connect.
+  if (hasConnected) await sleep(Math.random() * RECONNECT_JITTER_MS);
   const channel = await fetchChannel();
   ticket = channel.ticket;
   return channel.wss_url;
