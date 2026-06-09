@@ -42,6 +42,7 @@ const sleep = (ms: number): Promise<void> =>
 
 let ws: ReconnectingWebSocket | null = null;
 let watchTimer: ReturnType<typeof setInterval> | null = null;
+let resyncTimer: ReturnType<typeof setInterval> | null = null;
 // The daemon's liveness heartbeat. `sendPing` and `onSilent` close over `ws`,
 // which is reassigned per connection, so they read the live binding at call
 // time. partysocket reuses one instance across reconnects, so this one heartbeat
@@ -113,6 +114,28 @@ const stopWatcher = (): void => {
   }
 };
 
+// Delivery floor: ask the relay to re-push any command that's still `pending`
+// (a live push lost to a transient blip / half-open socket). Bounds delivery
+// latency to this interval instead of the reconnect cadence — without it a lost
+// push only recovers on the NEXT reconnect (minutes on a flapping link). The
+// relay re-pushes only never-received rows and the daemon dedups by id, so this
+// is cheap and safe. See R1/R7 in
+// docs/audit/2026-06-08-daemon-relay-websocket-stability.md.
+const RESYNC_MS = 60_000;
+
+const startResync = (): void => {
+  if (resyncTimer !== null) return;
+  resyncTimer = setInterval(() => send({ type: "resync" }), RESYNC_MS);
+  resyncTimer.unref?.();
+};
+
+const stopResync = (): void => {
+  if (resyncTimer !== null) {
+    clearInterval(resyncTimer);
+    resyncTimer = null;
+  }
+};
+
 // At-most-once command execution. Within a single session the SAME command id
 // can still arrive more than once — the connect-time replay path can overlap a
 // live push for a command that lands just as the daemon connects (read as
@@ -121,16 +144,20 @@ const stopWatcher = (): void => {
 // dedupe by id here. `null` = still running (skip the re-ack — the in-flight run
 // will ack); an ack value = completed (re-ack with the REAL result so a lost
 // first-ack still marks it terminal, without clobbering an `error` with `done`).
-// Across restarts the relay marks every pushed command `delivered` and only ever
-// replays never-delivered (`pending`) rows, so a restart does NOT re-run a
-// command it already received — this in-memory map only guards the in-session
-// double-delivery above.
+// Across restarts the relay only replays never-`delivered` (`pending`) rows, and
+// a command is flipped `delivered` by our `received` receipt the moment we have
+// it — so a restart does NOT re-run a command we already received. This
+// in-memory map only guards the in-session double-delivery above.
 const commandResults = new Map<string, TDaemonCommandAck | null>();
 const PROCESSED_CAP = 500;
 
 const onCommand = async (command: TRelayFrame): Promise<void> => {
   if (command.type !== "command") return;
   const id = command.command.id;
+  // Receipt FIRST, before dedup: tell the relay we have the bytes so it flips the
+  // row pending → delivered (and stops re-pushing it on resync). Sent even for a
+  // duplicate so a lost first receipt is recovered by the re-push. R1/R2.
+  send({ type: "received", id });
   const prior = commandResults.get(id);
   if (prior !== undefined) {
     logDebug("control-channel", "duplicate command ignored", {
@@ -243,6 +270,7 @@ export const startControlChannel = (): void => {
       lastFingerprint = JSON.stringify(status);
       send({ type: "hello", ticket, status });
       startWatcher();
+      startResync();
     })().catch(() => {
       // best-effort: partysocket reconnects if the hello never lands
     });
@@ -266,6 +294,7 @@ export const startControlChannel = (): void => {
   };
   socket.onclose = (ev): void => {
     stopWatcher();
+    stopResync();
     heartbeat.stop(); // disarm until the next open re-starts it
     // 4003 = relay rejected our ticket (usually a NEON_AUTH_COOKIE_SECRET
     // mismatch); 1006 = relay unreachable. 1000/1001 = relay cycling. partysocket
@@ -284,6 +313,7 @@ export const startControlChannel = (): void => {
 export const stopControlChannel = async (): Promise<void> => {
   if (ws === null) return;
   stopWatcher();
+  stopResync();
   heartbeat.stop();
   if (ws.readyState === ws.OPEN) send({ type: "status", active: false });
   ws.close(); // partysocket: a manual close() disables further reconnection
