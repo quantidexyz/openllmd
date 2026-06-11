@@ -33,7 +33,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export type TDaemonEnv = {
   /** The user's `sk-llm-...` key, or null until the dashboard sets it. */
@@ -126,11 +126,11 @@ const loadEnvFile = (): void => {
  * This is how runtime-resolved secrets/ids (`OPENLLM_API_KEY`,
  * `OPENLLM_DEVICE_ID`) and re-pointed config (`OPENLLM_CLOUD_ORIGIN`,
  * `OPENLLM_DAEMON_PORT`) get persisted back to the one file both dev and the
- * service boot from. Best-effort.
+ * service boot from. Returns true on successful write, false on failure.
  */
 export const writeEnvFileVars = (
   updates: Readonly<Record<string, string>>,
-): void => {
+): boolean => {
   let existing: string[] = [];
   try {
     existing = readFileSync(envFilePath(), "utf-8").split("\n");
@@ -154,10 +154,12 @@ export const writeEnvFileVars = (
   while (out.length > 0 && out[out.length - 1].trim().length === 0) out.pop();
   for (const [key, value] of pending) out.push(`${key}=${value}`);
   try {
-    mkdirSync(stateDir(), { recursive: true });
+    const parentDir = dirname(envFilePath());
+    mkdirSync(parentDir, { recursive: true });
     writeFileSync(envFilePath(), `${out.join("\n")}\n`, { mode: 0o600 });
+    return true;
   } catch {
-    // best-effort persistence
+    return false;
   }
 };
 
@@ -232,12 +234,14 @@ export const deviceId = (): string => {
     // no legacy file — mint below
   }
   if (id === null) id = randomUUID();
-  writeEnvFileVars({ OPENLLM_DEVICE_ID: id });
+  const written = writeEnvFileVars({ OPENLLM_DEVICE_ID: id });
   process.env.OPENLLM_DEVICE_ID = id;
-  try {
-    rmSync(deviceIdFile(), { force: true });
-  } catch {
-    // best-effort cleanup of the now-migrated legacy file
+  if (written) {
+    try {
+      rmSync(deviceIdFile(), { force: true });
+    } catch {
+      // best-effort cleanup of the now-migrated legacy file
+    }
   }
   cachedDeviceId = id;
   return id;
@@ -257,12 +261,14 @@ const loadApiKey = (): string | null => {
   try {
     const legacy = readFileSync(apiKeyFile(), "utf-8").trim();
     if (legacy.length > 0) {
-      writeEnvFileVars({ OPENLLM_API_KEY: legacy });
+      const written = writeEnvFileVars({ OPENLLM_API_KEY: legacy });
       process.env.OPENLLM_API_KEY = legacy;
-      try {
-        rmSync(apiKeyFile(), { force: true });
-      } catch {
-        // best-effort cleanup of the now-migrated legacy file
+      if (written) {
+        try {
+          rmSync(apiKeyFile(), { force: true });
+        } catch {
+          // best-effort cleanup of the now-migrated legacy file
+        }
       }
       return legacy;
     }

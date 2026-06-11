@@ -19,10 +19,10 @@
  * binary's checksum gate in `packages/setup/daemon/install.sh`.
  */
 import { createHash } from "node:crypto";
-import { homedir } from "node:os";
 import type { TDaemonIntegrationKind } from "@openllm/schema";
 import { daemonEnv } from "./env";
 import { logError, logInfo } from "./logger";
+import { DEFAULT_BIN_DIRS } from "./path-utils";
 
 /** Aliased to the closed `DaemonIntegrationKind` control-schema enum so the
  *  executor's vocabulary can't drift from the wire's. */
@@ -140,15 +140,10 @@ export const runIntegration = async (
   // them. All three are within the OS-sandbox working set (`/opt`, `/usr`,
   // ~/.local/bin — see sandbox/working-set.ts), so no spawn hits a Landlock
   // denial; absent dirs are simply ignored by the shell.
-  const PATH = [
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    `${homedir()}/.local/bin`,
-    baseEnv.PATH ?? "",
-  ]
+  const pathValue = [...DEFAULT_BIN_DIRS, baseEnv.PATH ?? ""]
     .filter((p) => p.length > 0)
     .join(":");
-  const env = { ...baseEnv, PATH, OPENLLM_API_KEY: apiKey ?? "" };
+  const env = { ...baseEnv, PATH: pathValue, OPENLLM_API_KEY: apiKey ?? "" };
   const proc = Bun.spawn(["bash", "-s"], {
     stdin: new TextEncoder().encode(script),
     env,
