@@ -24,7 +24,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { daemonEnv, envFilePath, stateDir, writeEnvFileVars } from "./env";
 import { hardenMacBinary } from "./harden-binary";
 import { DAEMON_VERSION } from "./version";
@@ -95,8 +95,56 @@ const writeEnvFileIfNeeded = (): void => {
   });
 };
 
+/**
+ * The daemon's service-captured log files — the stdout/stderr the OS
+ * supervisor (launchd/systemd) redirects, distinct from the app's own
+ * structured `openllmd.log`. Single source of truth, consumed by `renderPlist`,
+ * `renderUnit`, and `serviceStatus` so the capture policy is ONE value, not
+ * per-renderer copies that drift (the bug: macOS captured an err.log, Linux
+ * didn't).
+ */
+const serviceLogPaths = (): { out: string; err: string } => ({
+  out: join(stateDir(), "openllmd.out.log"),
+  err: join(stateDir(), "openllmd.err.log"),
+});
+
+/**
+ * Major version from `systemctl --version` (first line: `systemd 249 (…)`).
+ * Returns 0 when systemctl is absent/unparseable so callers fall back to
+ * journald rather than emitting a directive an older systemd rejects at unit
+ * load.
+ */
+const systemdMajor = (): number => {
+  const m = capture("systemctl", ["--version"]).match(/\bsystemd\s+(\d+)/);
+  return m === null ? 0 : Number.parseInt(m[1], 10);
+};
+
+/**
+ * Service-log directives for the systemd unit. Always tags journald with a
+ * greppable identity; ADDITIONALLY mirrors stdout/stderr to files — parity with
+ * the macOS launch agent's `StandardOut/ErrorPath`, so Linux finally writes an
+ * `openllmd.err.log` capturing crash/OOM/native output the app logger can't
+ * reach — when systemd supports `append:` (≥240) and the paths are absolute (an
+ * `OPENLLM_DAEMON_STATE_DIR` override could be relative). Otherwise stays
+ * journald-only — never `file:`, which truncates the log on every (re)start.
+ * `append:` needs the parent dir to exist at exec time (see `startLinux`).
+ *
+ * Takes the systemd major (from `systemdMajor()`) so the version gate is
+ * injectable — exported for the same reason `renderUnitHardening` is: so a test
+ * can assert both branches without a real systemd.
+ */
+export const renderUnitLogging = (systemdMajorVersion: number): string => {
+  const { out, err } = serviceLogPaths();
+  let s = "SyslogIdentifier=openllmd\n";
+  if (systemdMajorVersion >= 240 && isAbsolute(out) && isAbsolute(err)) {
+    s += `StandardOutput=append:${out}\n`;
+    s += `StandardError=append:${err}\n`;
+  }
+  return s;
+};
+
 const renderPlist = (binPath: string): string => {
-  const dir = stateDir();
+  const { out, err } = serviceLogPaths();
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -110,8 +158,8 @@ const renderPlist = (binPath: string): string => {
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>2</integer>
   <key>ProcessType</key><string>Background</string>
-  <key>StandardOutPath</key><string>${join(dir, "openllmd.out.log")}</string>
-  <key>StandardErrorPath</key><string>${join(dir, "openllmd.err.log")}</string>
+  <key>StandardOutPath</key><string>${out}</string>
+  <key>StandardErrorPath</key><string>${err}</string>
 </dict>
 </plist>
 `;
@@ -179,7 +227,7 @@ ExecStart=${binPath}
 # a hard crash loop can't peg the CPU.
 Restart=always
 RestartSec=2
-${renderUnitHardening()}
+${renderUnitLogging(systemdMajor())}${renderUnitHardening()}
 [Install]
 WantedBy=default.target
 `;
@@ -208,6 +256,9 @@ const startMac = (binPath: string): void => {
 
 const startLinux = (binPath: string): void => {
   mkdirSync(unitDir(), { recursive: true });
+  // systemd opens the `append:` log targets (renderUnitLogging) at exec time —
+  // the state dir must exist first or the unit fails to start.
+  mkdirSync(stateDir(), { recursive: true });
   writeFileSync(unitPath(), renderUnit(binPath));
   if (!tryRun("systemctl", ["--version"])) {
     throw new Error("systemctl not found — cannot register a systemd unit");
@@ -324,6 +375,7 @@ export const serviceStatus = (): void => {
   const registered = isMac ? existsSync(plistPath()) : existsSync(unitPath());
   const running = isMac ? macRunning() : linuxRunning();
   const port = daemonPort();
+  const logs = serviceLogPaths();
   process.stdout.write(
     [
       `openllmd v${DAEMON_VERSION}`,
@@ -333,6 +385,8 @@ export const serviceStatus = (): void => {
       `  binary:    ${process.execPath}`,
       `  state dir: ${stateDir()}`,
       `  logs:      ${join(stateDir(), "openllmd.log")}`,
+      `  stdout:    ${logs.out}`,
+      `  stderr:    ${logs.err}`,
       "",
     ].join("\n"),
   );
