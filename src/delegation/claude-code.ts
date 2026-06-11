@@ -346,24 +346,6 @@ const captureSetupToken = async (): Promise<
     };
   }
   const token = match[0];
-  // Non-secret diagnostic: a setup-token is a single contiguous run, so a bare
-  // CR (`\r`) sitting immediately AFTER the match means the TTY soft-WRAPPED the
-  // value mid-line and we truncated it — the historic `tokenLen: 77` corruption
-  // that Anthropic 401s as "Invalid bearer token". `spawnLoginPty` now forces a
-  // wide PTY (`stty cols`) so the token renders on one line and this never
-  // trips; if it ever does, the binary is running on a too-narrow PTY. We log
-  // the flag (never the secret) and reject so a corrupt token is never stored.
-  const cutByWrap = cleaned[(match.index ?? 0) + token.length] === "\r";
-  if (cutByWrap) {
-    logError(
-      "setup-token",
-      "token truncated by a PTY soft-wrap — capture aborted (PTY too narrow)",
-      { tokenLen: token.length },
-    );
-    return {
-      error: "setup-token capture was truncated by a terminal wrap — retry",
-    };
-  }
   logInfo("setup-token", "captured setup token", { tokenLen: token.length });
   return { token };
 };

@@ -78,7 +78,7 @@ const runSetToken = (args: readonly string[]): never => {
   }
   if (!setSetupToken(provider, token)) {
     process.stderr.write(
-      "refused: that doesn't look like a setup token (expected sk-ant-oat01-…)\n",
+      "refused: that doesn't look like a setup token (expected sk-ant-oat01-…/sk-ant-at01-…)\n",
     );
     process.exit(1);
   }

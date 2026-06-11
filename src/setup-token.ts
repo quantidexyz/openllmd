@@ -21,18 +21,22 @@
  * (`sk-ant-api03-`) or junk dropped here is IGNORED, never used as a
  * subscription bearer. Never sent off-box.
  */
+
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+  ANTHROPIC_OAUTH_TOKEN_RE,
+  isAnthropicOAuthToken,
+} from "@openllm/wire/providers/anthropic";
 import { stateDir } from "./env";
 
-const OAT_PREFIX = "sk-ant-oat01-";
-// The full token shape: prefix + base64url body. Used to EXTRACT a clean token
-// from a stored value, so trailing terminal junk that slipped past capture
-// (newlines, a fused log line, etc.) can never reach the upstream as a corrupt
-// Bearer — we send only the matched token, never the raw file/env contents.
-// Exported as the single source of truth for "what a setup-token looks like"
-// so capture (claude-code delegate) + storage + reload can't drift.
-export const SETUP_TOKEN_RE = /sk-ant-oat01-[A-Za-z0-9_-]+/;
+// The token shape (prefix + base64url body) — owned by `@openllm/wire` so the
+// cloud auth split, the terms gate, and this on-box capture/validation all agree
+// on which credentials are subscription bearers (`sk-ant-oat01-`/`sk-ant-at01-`,
+// never the Console `sk-ant-api03-`). Used to EXTRACT a clean token from a
+// stored value so trailing terminal junk (newlines, a fused log line) can't
+// reach upstream as a corrupt Bearer — we send only the matched token.
+export const SETUP_TOKEN_RE = ANTHROPIC_OAUTH_TOKEN_RE;
 
 const extractOat = (raw: string | null | undefined): string | null => {
   if (raw === null || raw === undefined) return null;
@@ -83,7 +87,7 @@ export const setSetupToken = (
 ): boolean => {
   if (!isValidProvider(provider)) return false;
   const trimmed = token?.trim() ?? "";
-  if (trimmed.length > 0 && !trimmed.startsWith(OAT_PREFIX)) return false;
+  if (trimmed.length > 0 && !isAnthropicOAuthToken(trimmed)) return false;
   try {
     mkdirSync(setupTokenDir(), { recursive: true });
   } catch {
