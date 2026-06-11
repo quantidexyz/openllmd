@@ -19,6 +19,7 @@
  * binary's checksum gate in `packages/setup/daemon/install.sh`.
  */
 import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 import type { TDaemonIntegrationKind } from "@openllm/schema";
 import { daemonEnv } from "./env";
 import { logError, logInfo } from "./logger";
@@ -131,7 +132,23 @@ export const runIntegration = async (
   // 3. Only now build the env with the key and execute. Strip any inherited
   // OPENLLM_API_KEY first so an unverified value can never leak in.
   const { OPENLLM_API_KEY: _omit, ...baseEnv } = process.env;
-  const env = { ...baseEnv, OPENLLM_API_KEY: apiKey ?? "" };
+  // The daemon runs as a background service with a minimal inherited PATH, so
+  // user-installed CLIs the scripts need (`claude` lands in ~/.local/bin; many
+  // tools live under Homebrew) aren't found and a script that relies on one
+  // half-applies or acks `status:error`. Prepend the standard user bin dirs
+  // ONCE, here, so EVERY integration (install + uninstall, all areas) resolves
+  // them. All three are within the OS-sandbox working set (`/opt`, `/usr`,
+  // ~/.local/bin — see sandbox/working-set.ts), so no spawn hits a Landlock
+  // denial; absent dirs are simply ignored by the shell.
+  const PATH = [
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    `${homedir()}/.local/bin`,
+    baseEnv.PATH ?? "",
+  ]
+    .filter((p) => p.length > 0)
+    .join(":");
+  const env = { ...baseEnv, PATH, OPENLLM_API_KEY: apiKey ?? "" };
   const proc = Bun.spawn(["bash", "-s"], {
     stdin: new TextEncoder().encode(script),
     env,
