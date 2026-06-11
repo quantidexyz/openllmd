@@ -26,8 +26,6 @@ const EMPTY: TDaemonBootstrap = {
   provider_prefixes: [],
   user_fallback_groups: [],
   user_model_fallback_bindings: [],
-  default_fallback_groups: [],
-  default_model_fallback_bindings: [],
 };
 
 /**
