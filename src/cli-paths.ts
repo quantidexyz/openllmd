@@ -13,9 +13,13 @@
  *     home/            the CLI's home/config + credentials (isolated)
  */
 import { join } from "node:path";
+import type { TSubscriptionProviderSlug } from "@openllm/schema";
 import { stateDir } from "./env";
 
-export type TCliProvider = "claude_code" | "chatgpt" | "kimi_code";
+/** The providers with an isolated CLI — exactly the closed
+ *  `SubscriptionProviderSlug` vocabulary of the control schema, so a slug
+ *  that reaches a CLI path provably came through the typed command union. */
+export type TCliProvider = TSubscriptionProviderSlug;
 
 // Where the vendor installer drops the binary, RELATIVE to the provider
 // root. (Run/install env knobs live in `cliEnv` below, not here.)

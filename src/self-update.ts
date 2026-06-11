@@ -30,6 +30,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { gunzipSync } from "node:zlib";
 import type { TDaemonTarget } from "../release-types";
 import { DAEMON_TARGETS } from "../release-types";
 import { autoUpdateEnabled } from "./auto-update-pref";
@@ -145,7 +146,15 @@ const fetchBinary = async (url: string): Promise<Buffer> => {
     signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`binary download failed: ${res.status}`);
-  return Buffer.from(await res.arrayBuffer());
+  const buf = Buffer.from(await res.arrayBuffer());
+  // The published asset is gzipped (`openllmd-<target>.gz`); decompress when the
+  // gzip magic bytes (0x1f 0x8b) are present, tolerating a raw binary too. The
+  // sha256 is checked against the DECOMPRESSED bytes (what runs), so the gate is
+  // gzip-determinism-independent.
+  if (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
+    return Buffer.from(gunzipSync(buf));
+  }
+  return buf;
 };
 
 // The `.sha256` endpoint returns `"<hex>  openllmd-<target>\n"` — take the hex.

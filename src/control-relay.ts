@@ -11,12 +11,10 @@
 import type { TDaemonCommand, TDaemonCommandAck } from "@openllm/schema";
 import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { installCli } from "./cli-install";
-import type { TCliProvider } from "./cli-paths";
 import { relayCredential } from "./cloud-client";
 import { latestVersion, refreshBootstrap } from "./config";
 import { getDelegate } from "./delegation";
 import { clearInstalling, setInstalling } from "./installing-state";
-import type { TIntegrationKind } from "./integrations";
 import { runIntegration } from "./integrations";
 import { openSealed, sealTo } from "./keypair";
 import { clearPendingAuth } from "./pending-auth";
@@ -26,26 +24,18 @@ import { invalidateUsage } from "./usage-cache";
 
 /**
  * Execute one delivered command via the control handlers. Returns the terminal
- * ack. Unknown kinds are acked as errors rather than thrown so one bad command
- * can't stall the batch.
+ * ack. `cmd` is the CLOSED `DaemonCommand` union — the relay socket's schema
+ * decode already rejected unknown kinds and out-of-vocabulary payloads, so
+ * each `case` narrows to its exact typed payload (no hand-cast). The delegate
+ * null-checks stay as belt-and-braces for any non-wire caller.
  */
 export const runCommandInner = async (
   cmd: TDaemonCommand,
 ): Promise<TDaemonCommandAck> => {
   try {
-    const payload = (cmd.payload ?? {}) as {
-      slug?: string;
-      target_key?: string;
-      target_pubkey?: string;
-      sealed?: string;
-      kind?: string;
-      target?: string;
-      enabled?: boolean;
-    };
     switch (cmd.kind) {
       case "connect": {
-        const delegate =
-          payload.slug !== undefined ? getDelegate(payload.slug) : null;
+        const delegate = getDelegate(cmd.payload.slug);
         if (delegate === null) {
           return {
             id: cmd.id,
@@ -57,14 +47,14 @@ export const runCommandInner = async (
         return { id: cmd.id, status: "done", result: r };
       }
       case "cli_install": {
-        if (payload.slug === undefined || getDelegate(payload.slug) === null) {
+        const slug = cmd.payload.slug;
+        if (getDelegate(slug) === null) {
           return {
             id: cmd.id,
             status: "error",
             result: { error: "unknown provider" },
           };
         }
-        const slug = payload.slug;
         // Mark installing so the next status snapshot the control channel pushes
         // (its change-detected watcher, or the post-command push) carries
         // `installing: true` and the card shows "Installing…". `clearInstalling`
@@ -72,7 +62,7 @@ export const runCommandInner = async (
         // provider in `installing: true`.
         setInstalling(slug);
         try {
-          const r = await installCli(slug as TCliProvider);
+          const r = await installCli(slug);
           return { id: cmd.id, status: "done", result: r };
         } finally {
           clearInstalling(slug);
@@ -84,34 +74,22 @@ export const runCommandInner = async (
         // same shared executor the CLI uses. The dashboard enqueues this against
         // the selected daemon key; the executor fetches the gateway script,
         // verifies it (fail-closed), and shells out. See
-        // `docs/proposals/daemon-integration-triggers.md` §5.
-        const integrationKinds = ["skill", "plugin", "setup"];
-        if (
-          payload.kind === undefined ||
-          !integrationKinds.includes(payload.kind) ||
-          payload.slug === undefined
-        ) {
-          return {
-            id: cmd.id,
-            status: "error",
-            result: { error: `${cmd.kind}: bad payload` },
-          };
-        }
+        // `docs/proposals/daemon-integration-triggers.md` §5. The kind enum +
+        // charset-pinned slug/target are guaranteed by the command schema.
         const action =
           cmd.kind === "install_integration" ? "install" : "uninstall";
         const r = await runIntegration(
-          payload.kind as TIntegrationKind,
+          cmd.payload.kind,
           action,
-          payload.slug,
-          payload.target,
+          cmd.payload.slug,
+          cmd.payload.target,
         );
         return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
       }
       case "connect_device_code": {
         // Start a device-code login (codex remote; kimi falls back to its
         // normal device-code `connect`). Surfaces the URL+code via status.
-        const delegate =
-          payload.slug !== undefined ? getDelegate(payload.slug) : null;
+        const delegate = getDelegate(cmd.payload.slug);
         if (delegate === null) {
           return {
             id: cmd.id,
@@ -133,8 +111,7 @@ export const runCommandInner = async (
         // Obtain a setup-token via the provider's own flow (Claude only) —
         // the daemon runs `claude setup-token`, captures the printed token,
         // and stores it on the box. Same control-surface path as `connect`.
-        const delegate =
-          payload.slug !== undefined ? getDelegate(payload.slug) : null;
+        const delegate = getDelegate(cmd.payload.slug);
         if (delegate?.connectSetupToken === undefined) {
           return {
             id: cmd.id,
@@ -157,9 +134,8 @@ export const runCommandInner = async (
         // (no `cancelConnect`) — there's no live flow, so dropping a stale code
         // is the whole job. The post-command status push (with the cleared
         // `pending_auth`) flips the card back to Not signed in.
-        const delegate =
-          payload.slug !== undefined ? getDelegate(payload.slug) : null;
-        if (delegate === null || payload.slug === undefined) {
+        const delegate = getDelegate(cmd.payload.slug);
+        if (delegate === null) {
           return {
             id: cmd.id,
             status: "error",
@@ -170,14 +146,13 @@ export const runCommandInner = async (
           const r = await delegate.cancelConnect();
           return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
         }
-        clearPendingAuth(payload.slug);
+        clearPendingAuth(cmd.payload.slug);
         return { id: cmd.id, status: "done", result: { ok: true } };
       }
       case "logout": {
         // Sign out of a subscription provider's CLI-LOGIN credential on this
         // daemon (per-key: the cloud delivered this only to the target key).
-        const delegate =
-          payload.slug !== undefined ? getDelegate(payload.slug) : null;
+        const delegate = getDelegate(cmd.payload.slug);
         if (delegate === null) {
           return {
             id: cmd.id,
@@ -193,17 +168,12 @@ export const runCommandInner = async (
         // setup-token here, SEAL it to the TARGET daemon's pubkey, and relay
         // the ciphertext via the cloud. The token never touches this box's
         // store nor the cloud in the clear.
-        const delegate =
-          payload.slug !== undefined ? getDelegate(payload.slug) : null;
-        if (
-          delegate?.mintSetupToken === undefined ||
-          payload.target_key === undefined ||
-          payload.target_pubkey === undefined
-        ) {
+        const delegate = getDelegate(cmd.payload.slug);
+        if (delegate?.mintSetupToken === undefined) {
           return {
             id: cmd.id,
             status: "error",
-            result: { error: "mint_setup_token: bad payload / unsupported" },
+            result: { error: "mint_setup_token: unsupported provider" },
           };
         }
         const minted = await delegate.mintSetupToken();
@@ -215,8 +185,8 @@ export const runCommandInner = async (
           };
         }
         try {
-          const sealed = sealTo(payload.target_pubkey, minted.token);
-          await relayCredential(payload.target_key, sealed);
+          const sealed = sealTo(cmd.payload.target_pubkey, minted.token);
+          await relayCredential(cmd.payload.target_key, sealed);
         } catch (err) {
           return {
             id: cmd.id,
@@ -235,14 +205,7 @@ export const runCommandInner = async (
       case "receive_setup_token": {
         // TARGET daemon: open the sealed setup-token with our own key and
         // store it. We're now authenticated via the caller's browser identity.
-        if (payload.sealed === undefined) {
-          return {
-            id: cmd.id,
-            status: "error",
-            result: { error: "receive_setup_token: missing sealed blob" },
-          };
-        }
-        const token = openSealed(payload.sealed);
+        const token = openSealed(cmd.payload.sealed);
         if (token === null) {
           return {
             id: cmd.id,
@@ -256,14 +219,14 @@ export const runCommandInner = async (
       case "remove_setup_token": {
         // Clear an on-box setup-token (Claude). Independent of `logout` —
         // they're separate credential sources for claude_code.
-        if (payload.slug === undefined || getDelegate(payload.slug) === null) {
+        if (getDelegate(cmd.payload.slug) === null) {
           return {
             id: cmd.id,
             status: "error",
             result: { error: "unknown provider" },
           };
         }
-        setSetupToken(payload.slug, null);
+        setSetupToken(cmd.payload.slug, null);
         return { id: cmd.id, status: "done", result: { ok: true } };
       }
       // A bare refresh: nothing to do — the status push below carries the
@@ -274,7 +237,7 @@ export const runCommandInner = async (
         // cached (possibly backing-off) snapshot. `slug` scopes it to one
         // provider; the dashboard's whole-daemon refresh sends none → clears
         // all. `status` is the passive read and keeps the cache.
-        invalidateUsage(payload.slug);
+        invalidateUsage(cmd.payload?.slug);
         return { id: cmd.id, status: "done" };
       case "status":
         return { id: cmd.id, status: "done" };
@@ -297,7 +260,7 @@ export const runCommandInner = async (
       // convergence check (now that it's allowed) so the daemon catches up
       // without waiting for the next bootstrap tick.
       case "set_auto_update": {
-        const enabled = payload.enabled === true;
+        const enabled = cmd.payload.enabled;
         setAutoUpdate(enabled);
         // Confirm the write actually took before acking success — the persist
         // can fail silently (read-only state dir / full disk; setAutoUpdate logs
@@ -327,12 +290,17 @@ export const runCommandInner = async (
           result: { auto_update: persisted },
         };
       }
-      default:
+      default: {
+        // Unreachable for a wire-delivered command — the closed union rejects
+        // unknown kinds at the schema boundary before this runs. Kept as
+        // defence-in-depth for any future non-wire caller.
+        const unknown = cmd as { id: string; kind: string };
         return {
-          id: cmd.id,
+          id: unknown.id,
           status: "error",
-          result: { error: `unknown command kind "${cmd.kind}"` },
+          result: { error: `unknown command kind "${unknown.kind}"` },
         };
+      }
     }
   } catch (err) {
     return {

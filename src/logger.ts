@@ -1,16 +1,23 @@
 /**
- * Daemon error log → a file under the state dir (`~/.openllm/openllmd.log`).
+ * Daemon logs. Two destinations, by design:
  *
- * The daemon is headless (launchd / systemd swallow stdout+stderr) and the
- * control loop deliberately BACKS OFF on errors instead of crashing — so a
- * relay 404, a sealed-open miss, or an unreachable cloud used to vanish with
- * no trace. This appends one timestamped JSON line per event so a user can
- * `tail -f ~/.openllm/openllmd.log` (or paste it) to see exactly what broke.
+ *   1. `~/.openllm/openllmd.log` — the COMBINED stream (every level), one
+ *      timestamped JSON line per event, rotated past a size cap. The canonical
+ *      `tail -f ~/.openllm/openllmd.log` target.
+ *   2. stdout / stderr, split BY LEVEL — `error`/`warn` go to **stderr**,
+ *      `info`/`debug` to **stdout**. The launch agent routes those to separate
+ *      files (`openllmd.err.log` ← stderr, `openllmd.out.log` ← stdout — see
+ *      `service.ts`), so the ERROR log holds only faults + their culprits and
+ *      isn't drowned by routine info. systemd's journald captures both streams
+ *      together; the split still tags each line's level.
  *
- * Best-effort + self-contained: it never throws (a logging failure must not
- * take down the daemon), depends only on `stateDir`, and rotates once past a
- * size cap so a long-lived daemon can't fill the disk. It also echoes to
- * stderr so `journalctl --user -u openllmd` / `log show` capture it live.
+ * The daemon is headless and the control loop deliberately BACKS OFF on errors
+ * instead of crashing — so a relay 404, a sealed-open miss, an unreachable
+ * cloud, or a SANDBOX-KILLED child used to vanish with no trace. These helpers
+ * make every fault land in the error stream with enough context to diagnose it.
+ *
+ * Best-effort + self-contained: never throws (a logging failure must not take
+ * down the daemon), depends only on `stateDir`, rotates past a size cap.
  */
 import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -70,9 +77,21 @@ const write = (
     // Logging is best-effort — never let it throw into the caller.
   }
   try {
-    process.stderr.write(line);
+    // The boot readiness sentinel ("openllmd v<VERSION> listening on :<port>")
+    // in main.ts must be a single plain-text line on stdout, but all other
+    // structured JSON logs go to stderr during bootstrap. The "boot" scope
+    // carries the readiness message; send all JSON to stderr so the sentinel
+    // stands alone on stdout.
+    if (scope === "boot" && level === "info") {
+      // Plain sentinel line to stdout (the install-time launcher reads it).
+      process.stdout.write(`${message}\n`);
+    } else {
+      // All other logs (JSON-structured) go to stderr so they don't break
+      // the bootstrap readiness contract.
+      process.stderr.write(line);
+    }
   } catch {
-    // stderr may be closed under a service manager — ignore.
+    // streams may be closed under a service manager — ignore.
   }
 };
 

@@ -31,6 +31,7 @@ import { corsHeaders, isPreflight, preflightResponse } from "./cors";
 import { daemonPort, deviceId, isDevMode, stateDir } from "./env";
 import { handleInference } from "./listener";
 import { logError, logInfo } from "./logger";
+import { applyDaemonSandbox } from "./sandbox/landlock";
 import {
   beginRequest,
   endRequest,
@@ -49,7 +50,22 @@ const BOOTSTRAP_TTL_MS = 5 * 60 * 1000;
 const BOOTSTRAP_RETRY_MS = 5 * 1000;
 
 const main = async (): Promise<void> => {
+  // `daemonPort()` loads the env file, so the kill-switch / opt-in vars are
+  // resolved before the sandbox decision.
   const port = daemonPort();
+
+  // OS sandbox (Linux Landlock / macOS Seatbelt — see `sandbox/landlock.ts`'s
+  // `applyDaemonSandbox` dispatcher): confine this process + every child it
+  // spawns to the declared working set BEFORE any listener binds or network
+  // dial happens. Fail-open with a loud log; the resulting posture rides every
+  // status push (`DaemonStatus.sandbox`). CLI verbs (`runCli` below)
+  // deliberately run unconfined — service registration and uninstall touch
+  // paths outside the working set.
+  const sandbox = await applyDaemonSandbox();
+  // Always record the decision at boot so an unconfined daemon is visible in
+  // the log, not just on the (cloud-pushed) `DaemonStatus.sandbox` field —
+  // the localhost-only boot never pushes status.
+  logInfo("sandbox", `os sandbox: ${sandbox}`);
 
   // Last-resort crash handling. The daemon is headless under launchd/systemd,
   // so an uncaught throw or rejected promise would otherwise die silently —

@@ -19,10 +19,13 @@
  * binary's checksum gate in `packages/setup/daemon/install.sh`.
  */
 import { createHash } from "node:crypto";
+import type { TDaemonIntegrationKind } from "@openllm/schema";
 import { daemonEnv } from "./env";
 import { logError, logInfo } from "./logger";
 
-export type TIntegrationKind = "skill" | "plugin" | "setup";
+/** Aliased to the closed `DaemonIntegrationKind` control-schema enum so the
+ *  executor's vocabulary can't drift from the wire's. */
+export type TIntegrationKind = TDaemonIntegrationKind;
 export type TIntegrationAction = "install" | "uninstall";
 
 const AREA: Record<TIntegrationKind, string> = {
@@ -141,9 +144,23 @@ export const runIntegration = async (
     proc.exited,
   ]);
   const output = `${out}${err}`.trim();
-  logInfo("integrations", `${action} ${kind} ${slug}`, {
-    ok: code === 0,
+  // A script SIGKILLed by the sandbox produces no useful output + a confusing
+  // exit code — name the actual culprit at error level so it lands in
+  // openllmd.err.log instead of vanishing.
+  if (proc.signalCode !== null) {
+    logError("integrations", `${action} ${kind} ${slug}: script killed`, {
+      signal: proc.signalCode,
+      hint: "likely an OS sandbox denial — a path the script writes isn't in the daemon working set",
+    });
+  } else {
+    logInfo("integrations", `${action} ${kind} ${slug}`, {
+      ok: code === 0,
+      code,
+    });
+  }
+  return {
+    ok: code === 0 && proc.signalCode === null,
     code,
-  });
-  return { ok: code === 0, code, output: output.slice(-4000) };
+    output: output.slice(-4000),
+  };
 };

@@ -14,6 +14,7 @@ import { daemonPort, hasApiKey } from "./env";
 import { isInstalling } from "./installing-state";
 import { detectInstalledIntegrations } from "./integrations-detect";
 import { daemonPublicKey } from "./keypair";
+import { sandboxState } from "./sandbox/landlock";
 import { cachedUsage } from "./usage-cache";
 import { DAEMON_VERSION } from "./version";
 
@@ -50,6 +51,7 @@ export const computeStatus = async (): Promise<TDaemonStatus> => {
     cloud_state: getCloudState(),
     pubkey: daemonPublicKey(),
     port: daemonPort(),
+    sandbox: sandboxState(),
     connections,
     integrations: detectInstalledIntegrations(),
   };

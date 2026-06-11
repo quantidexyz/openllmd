@@ -54,6 +54,7 @@ import {
   readJsonFile,
   runCapture,
   spawnLogin,
+  spawnLoginPty,
   stripAnsi,
   toEpochMs,
   writeIsolatedKeychain,
@@ -306,25 +307,41 @@ const captureSetupToken = async (): Promise<
   // macOS: setup-token is still an OAuth login, so the isolated keychain must
   // exist (it may write session state alongside printing the token).
   await ensureIsolatedKeychain(cliHome(PROVIDER));
-  const result = await spawnLogin([bin(), "setup-token"], {
-    ...env(),
-    // Plain, unwrapped output so the token prints clean on its own line.
-    NO_COLOR: "1",
-    FORCE_COLOR: "0",
-    TERM: "dumb",
-    COLUMNS: "4096",
-  });
+  // `claude setup-token` is a TTY-only interactive TUI: it writes the auth URL +
+  // token to its CONTROLLING TERMINAL, so spawned with a plain pipe (no TTY) it
+  // emits nothing and the daemon captured `outputLen: 0`. Run it under a PTY so
+  // it actually renders, and capture its terminal output. `until` returns the
+  // instant the token appears (the TUI can wedge/linger after printing it).
+  const result = await spawnLoginPty(
+    [bin(), "setup-token"],
+    {
+      ...env(),
+      // A real terminal type so the TUI renders (TERM=dumb makes it emit
+      // nothing under a PTY); FORCE_COLOR off + a generous width so the token
+      // isn't coloured or line-wrapped mid-value (we strip ANSI regardless).
+      NO_COLOR: "1",
+      FORCE_COLOR: "0",
+      TERM: "xterm-256color",
+      COLUMNS: "200",
+      LINES: "50",
+    },
+    { until: SETUP_TOKEN_RE },
+  );
   const cleaned = stripAnsi(result.output);
   const match = cleaned.match(SETUP_TOKEN_RE);
   if (match === null) {
     logError("setup-token", "no token in `claude setup-token` output", {
       code: result.code,
       outputLen: cleaned.length,
+      // Safe (no token in THIS branch): a whitespace-collapsed sample so a TUI
+      // that fragments the token, or an onboarding/login screen blocking the
+      // flow, is diagnosable from openllmd.err.log.
+      sample: cleaned.replace(/\s+/g, " ").trim().slice(0, 400),
     });
     return {
       error:
         cleaned.length > 0
-          ? cleaned.slice(0, 300)
+          ? cleaned.replace(/\s+/g, " ").trim().slice(0, 300)
           : `claude setup-token exited ${result.code} without a token`,
     };
   }

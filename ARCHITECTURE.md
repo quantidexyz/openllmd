@@ -60,6 +60,10 @@ daemon/
     uninstall.ts            `openllmd uninstall` — confirm → stop+unregister → strip completion + owned PATH symlink → delete all state (credentials)
     completion.ts           bash/zsh/fish shell completion (emit + `completion install` / `uninstallCompletion`)
     harden-binary.ts        macOS dequarantine + ad-hoc sign (shared by service + self-update)
+    sandbox/
+      working-set.ts        the daemon's filesystem allow-list — ONE source consumed by every sandbox backend
+      landlock.ts           cross-platform applyDaemonSandbox() dispatcher + the Linux Landlock backend (bun:ffi, inherited by children)
+      seatbelt.ts           macOS Seatbelt backend — in-process sandbox_init() deny-by-default profile (bun:ffi, inherited by children)
     listener.ts             /v1/* inference: parse → validate → runWalker (the only path)
     walker.ts               coreless §3.3 plan-walker — the daemon's sole data path; @openllm/core-free
     control.ts              localhost control surface (/status,/events,/connect,/cli-install,/usage,/config)
@@ -278,6 +282,66 @@ runs its OWN copy of each CLI under `<stateDir>/cli/<provider>/`
   merged. Idempotent (skips when the binary is already present).
   `cliInstallState(provider)` → `{ installed, version }` from the
   isolated binary's `--version`.
+
+## OS sandbox + typed control vocabulary (hardening)
+
+Two orthogonal hardenings from
+[`docs/proposals/daemon-os-sandbox-and-typed-control.md`](../../docs/proposals/daemon-os-sandbox-and-typed-control.md):
+
+- **Closed command vocabulary (the parse boundary).** `DaemonCommand` /
+  `DaemonCmdRequest` (`packages/schema/daemon.ts`) are a **discriminated
+  union** — one struct per kind, literal-discriminated, every payload field a
+  constrained scalar (provider-slug enum, charset-pinned artifact slug,
+  boolean, opaque base64 blob). No field can carry a command string, script
+  body, args array, URL, or free filesystem path. An unmodelled command fails
+  decode at EVERY boundary: the cloud enqueue (`enqueueCommand` in
+  `packages/api/lib/daemon-commands.ts`), the relay's watcher `enqueue` frame
+  + delivery push (`packages/daemon-relay`), and the daemon's own relay
+  socket (`RelayCommandFrame` embeds the union) — before `runCommandInner`
+  ever runs. `control-relay.ts` narrows each `case` from the union (no
+  hand-cast). The union ⇔ executor lockstep is machine-checked by
+  `tests/deployment/daemon-command-vocabulary.test.ts`.
+- **Filesystem confinement (the blast-radius bound).** The path isolation
+  below is **kernel-enforced on Linux AND macOS**, not just env-redirected.
+  `sandbox/working-set.ts` derives ONE allow-list from `env.ts`/`cli-paths.ts`
+  (the state dir — which contains the binary, CLI homes, and logs — plus the
+  claude-code integration footprint `~/.claude`/`~/.claude.json` read-write;
+  system trees read-only; everything else, notably `~/.ssh`/`~/.aws`/the
+  user's real CLI homes, implicitly denied). `applyDaemonSandbox()`
+  (`sandbox/landlock.ts`) dispatches by platform to one of two in-process,
+  unprivileged, self-applied backends — both applied in `main()` before the
+  listener binds, both inherited across `execve` (so `bash` running a SHA-gated
+  integration script, `curl`, and the vendor CLIs are confined too):
+  - **Linux → Landlock** (`sandbox/landlock.ts`) — a deny-by-default Landlock
+    ruleset over the working set (kernel ≥ 5.13, `bun:ffi` → `syscall(2)`).
+    Landlock is file-only, so non-file ops are untouched; `/dev` is in the
+    working set because every `Bun.spawn` with `stdout:"ignore"` opens
+    `/dev/null` (without it `posix_spawn` of `bash`/the vendor CLIs fails
+    `EACCES` and connect/integrations silently break).
+  - **macOS → Seatbelt** (`sandbox/seatbelt.ts`) — an SBPL profile applied via
+    `sandbox_init()` (`bun:ffi` → `libsandbox`), deprecated-but-functional, no
+    Developer ID signing (App Sandbox is Phase C). It is **asymmetric**, because
+    macOS forces it: WRITES are a deny-by-default whitelist (working set +
+    workflow targets only — strong tamper guard), but READS are allow-default
+    with a credential deny-list (`~/.ssh`, `~/.aws`, `~/Library/Keychains`,
+    browser data). A read-whitelist isn't viable — a spawned child's dyld needs
+    broad read at `exec` (which `sandbox-exec` grants implicitly but a raw
+    `sandbox_init` profile can't), so it SIGABRTs every child. Non-file ops stay
+    allowed so the OAuth-browser + keychain login flows run.
+
+  The **systemd user unit** (`renderUnitHardening()` in `service.ts`) adds a
+  defense-in-depth SECCOMP layer ONLY — `NoNewPrivileges`,
+  `RestrictAddressFamilies`, `SystemCallFilter=@system-service @sandbox`, etc.
+  It deliberately carries no capability/mount directives: a `systemctl --user`
+  unit runs unprivileged and can't drop capabilities (`218/CAPABILITIES`) or
+  set up mount namespaces, so FS confinement is Landlock's job, not systemd's.
+  W^X stays off (`MemoryDenyWriteExecute` is absent — Bun's JIT needs it).
+
+  Posture rides every status push as `DaemonStatus.sandbox`
+  (`enforced`/`off`/`unsupported`/`error` — fail-open with a loud log, never
+  silent). Kill switch `OPENLLM_DAEMON_NO_SANDBOX=1`; dev source runs opt in
+  via `OPENLLM_DAEMON_SANDBOX=1`. CLI verbs run unconfined (service
+  registration/uninstall touch paths outside the working set).
 
 ## Delegation (the compliance core)
 
