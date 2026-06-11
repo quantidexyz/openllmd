@@ -270,10 +270,19 @@ export const spawnLoginPty = async (
   // child exits (which the TUI may not do). `-F` flushes after every write.
   const escapeShellArg = (arg: string): string =>
     `'${arg.replace(/'/g, "'\\''")}'`;
+  // `script` allocates the PTY at the DEFAULT 80×24 — a PTY's window size is an
+  // ioctl (TIOCSWINSZ), NOT the `COLUMNS`/`LINES` env vars, so a TUI rendering
+  // a fixed-width box wraps a long value (e.g. an `sk-ant-oat01-` setup-token)
+  // mid-line with a bare `\r`, which screen-scraping then truncates. We resize
+  // the slave with `stty` INSIDE the PTY (it runs on the controlling tty before
+  // the real command via `exec`), so the token renders on one line. `2>/dev/null`
+  // keeps a `stty`-less environment from breaking the flow.
+  const cmd = argv.map(escapeShellArg).join(" ");
+  const widen = `stty cols 1000 rows 50 2>/dev/null; exec ${cmd}`;
   const scriptArgv =
     os === "darwin"
-      ? ["script", "-F", "-q", tsFile, ...argv]
-      : ["script", "-qfc", argv.map(escapeShellArg).join(" "), tsFile];
+      ? ["script", "-F", "-q", tsFile, "sh", "-c", widen]
+      : ["script", "-qfc", widen, tsFile];
 
   const proc = Bun.spawn(scriptArgv, {
     stdin: "ignore",
