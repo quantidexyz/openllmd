@@ -25,7 +25,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { daemonEnv, stateDir } from "./env";
+import { daemonEnv, envFilePath, stateDir, writeEnvFileVars } from "./env";
 import { hardenMacBinary } from "./harden-binary";
 import { DAEMON_VERSION } from "./version";
 
@@ -33,7 +33,6 @@ const LABEL = "sh.openllm.daemon";
 const DEFAULT_PORT = 8787;
 const isMac = process.platform === "darwin";
 
-const envFilePath = (): string => join(stateDir(), "daemon.env");
 const plistPath = (): string =>
   join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
 const unitDir = (): string => join(homedir(), ".config", "systemd", "user");
@@ -73,29 +72,27 @@ const capture = (cmd: string, args: readonly string[]): string => {
 };
 
 /**
- * Write the env file (cloud origin + port) the service reads at boot. Created
- * when absent so a standalone `openllmd start` works without the installer;
- * also (re)written when `OPENLLM_CLOUD_ORIGIN` or `OPENLLM_DAEMON_PORT` is set
- * explicitly, so `OPENLLM_CLOUD_ORIGIN=… openllmd start` (or `…PORT=…`)
- * re-points an existing install. The installer writes its own env file first
- * (with the gateway origin it paired to), so this leaves that untouched.
+ * Ensure daemon.env carries the cloud origin + port the service reads at boot.
+ * Written when absent so a standalone `openllmd start` works without the
+ * installer; also (re)written when `OPENLLM_CLOUD_ORIGIN` or
+ * `OPENLLM_DAEMON_PORT` is set explicitly, so `OPENLLM_CLOUD_ORIGIN=… openllmd
+ * start` (or `…PORT=…`) re-points an existing install. Upserts only these two
+ * keys — the paired `OPENLLM_API_KEY` and minted `OPENLLM_DEVICE_ID` lines in
+ * the same file are preserved.
  */
 const writeEnvFileIfNeeded = (): void => {
-  const path = envFilePath();
   // Either var set explicitly re-points an existing install — otherwise
   // `OPENLLM_DAEMON_PORT=9000 openllmd start` would report :9000 while the
   // persisted env file (what the service actually boots with) kept the old one.
   const explicitOverride =
     process.env.OPENLLM_CLOUD_ORIGIN !== undefined ||
     process.env.OPENLLM_DAEMON_PORT !== undefined;
-  if (existsSync(path) && !explicitOverride) return;
-  mkdirSync(stateDir(), { recursive: true });
+  if (existsSync(envFilePath()) && !explicitOverride) return;
   const env = daemonEnv();
-  writeFileSync(
-    path,
-    `OPENLLM_CLOUD_ORIGIN=${env.cloudOrigin}\nOPENLLM_DAEMON_PORT=${daemonPort()}\n`,
-    { mode: 0o600 },
-  );
+  writeEnvFileVars({
+    OPENLLM_CLOUD_ORIGIN: env.cloudOrigin,
+    OPENLLM_DAEMON_PORT: String(daemonPort()),
+  });
 };
 
 const renderPlist = (binPath: string): string => {

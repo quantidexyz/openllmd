@@ -9,8 +9,8 @@
  * Everything the daemon legitimately touches is deliberately centralised:
  *
  *   read-write
- *     - the state dir (`~/.openllm`): api-key/device-id/update-state (0600),
- *       daemon.env, logs, the isolated vendor CLIs under `cli/<provider>/`
+ *     - the state dir (`~/.openllm`): daemon.env (0600, holds the key + device
+ *       id + config) and update-state, logs, the isolated vendor CLIs under `cli/<provider>/`
  *       (homes + binaries + config), AND the daemon binary itself + its
  *       atomic-swap temp (`bin/openllmd`, `.openllmd.update.<pid>.tmp` —
  *       the installer places the binary inside the state dir);
@@ -105,7 +105,7 @@ export const daemonWorkingSet = (): TWorkingSet => {
   // files. Instead we create and use our own isolated temp under stateDir.
   const daemonTmp = daemonTempDir();
   const readWrite = new Set<string>([
-    // The whole state dir: api-key + env + logs + isolated CLI roots
+    // The whole state dir: daemon.env (config + key + device id) + logs + isolated CLI roots
     // (`cli/<provider>/{home,bin}` all nest under it — see `cli-paths.ts`)
     // + the installed binary and its self-update temp (`<state>/bin`).
     state,

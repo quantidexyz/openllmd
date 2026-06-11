@@ -241,8 +241,9 @@ mints a fresh `sk-llm` under the unlocked vault, named "OpenLLM Daemon",
 and sends the one-time plaintext to localhost — never to the cloud; revoke
 it on the Keys page). The daemon still needs this DEK-bearing key for its
 cloud control-plane calls AND for forwarding API-key hops — the `?__plan=`
-HMAC secures the plan, not the daemon's identity. `env.ts` persists it to
-`~/.openllm/api-key` (`0600`) so it
+HMAC secures the plan, not the daemon's identity. `env.ts` persists it as
+`OPENLLM_API_KEY` in `~/.openllm/daemon.env` (`0600`) — the single config
+file — so it
 survives restarts / HMR, and re-bootstraps in-request so a valid key
 flips `cloud_state` to `ok` immediately. Until a key is set the daemon
 runs and serves its control surface so the dashboard can set one. The
@@ -456,11 +457,14 @@ the `packages/setup/daemon` install target (`includeBundle:false`,
 no key piped in): `install.sh` downloads the binary from
 `/api/daemon/binary/<target>` and verifies it against the published
 `.sha256` (a checksum sidecar, not a detached signature), symlinks it onto
-`PATH` as `openllmd`, writes `~/.openllm/daemon.env` with just
-`OPENLLM_CLOUD_ORIGIN` + `OPENLLM_DAEMON_PORT` (the API key is persisted
-separately to `~/.openllm/api-key`, mode `0600`, by the same script — set
-from the dashboard's Providers tab afterward), then hands off to `openllmd
-start`.
+`PATH` as `openllmd`, writes the single config file `~/.openllm/daemon.env`
+(`0600`) with `OPENLLM_CLOUD_ORIGIN` + `OPENLLM_DAEMON_PORT` +
+`OPENLLM_API_KEY` (the daemon mints `OPENLLM_DEVICE_ID` into the same file
+on first boot; legacy standalone `api-key` / `device-id` files from older
+installs are migrated into daemon.env and removed), then hands off to
+`openllmd start`. That one file is what both the installed service
+(systemd `EnvironmentFile=` / the macOS launch agent's
+`OPENLLM_DAEMON_ENV_FILE`) and `bun dev:daemon` boot from.
 
 **The binary supervises itself.** Service registration is NOT open-coded in
 `install.sh` — it lives in `src/service.ts`, exposed as the `openllmd
