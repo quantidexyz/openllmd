@@ -316,14 +316,16 @@ const captureSetupToken = async (): Promise<
     [bin(), "setup-token"],
     {
       ...env(),
-      // A real terminal type so the TUI renders (TERM=dumb makes it emit
-      // nothing under a PTY); FORCE_COLOR off + a generous width so the token
-      // isn't coloured or line-wrapped mid-value (we strip ANSI regardless).
-      NO_COLOR: "1",
-      FORCE_COLOR: "0",
-      TERM: "xterm-256color",
-      COLUMNS: "200",
-      LINES: "50",
+      // ONLY pin TERM (so the TUI renders under the PTY when the daemon's own
+      // env lacks one, e.g. under systemd). We deliberately do NOT force
+      // NO_COLOR / FORCE_COLOR=0 / COLUMNS / LINES: turning COLOR OFF flips
+      // `claude setup-token` into its NON-INTERACTIVE browser-OAuth path
+      // (`scope=user:inference`), which mints an `sk-ant-at01-` credential that
+      // is NOT a usable Bearer (401 even via the official CLI). With color left
+      // alone it takes the interactive session-mint path and emits a working
+      // `sk-ant-oat01-` access token. We strip ANSI from the captured output
+      // regardless, so inherited color is harmless; the PTY ioctl owns size.
+      TERM: process.env.TERM ?? "xterm-256color",
     },
     { until: SETUP_TOKEN_RE },
   );
