@@ -232,6 +232,43 @@ const ANSI_RE = new RegExp(
 export const stripAnsi = (s: string): string => s.replace(ANSI_RE, "");
 
 /**
+ * Build the `script(1)` argv that runs `argv` under a PSEUDO-TERMINAL, writing
+ * the terminal capture to `typescript` — or null on an OS without `script`
+ * (caller falls back to a plain pipe spawn). Some vendor CLIs only run attached
+ * to a real terminal (`claude setup-token`'s TTY-only TUI; `kimi -p`'s
+ * raw-mode-gated print mode), emitting NOTHING under a plain pipe. Shared by
+ * {@link spawnLoginPty} (which POLLS the typescript for an `until` regex) and
+ * the exec-fixture capture (which ignores the typescript — pass `/dev/null` —
+ * and drives off its HTTP recorder instead).
+ *
+ * Subtleties baked in:
+ *   - `-F` (BSD) / `-f` (util-linux, inside `-qfc`) is LOAD-BEARING: without it
+ *     `script` BUFFERS the typescript and only flushes on close, so a poller
+ *     reads empty until the child exits. `-F` flushes after every write.
+ *   - `script` allocates the PTY at the DEFAULT 80×24 — window size is an ioctl
+ *     (TIOCSWINSZ), NOT `COLUMNS`/`LINES` — so a TUI rendering a fixed-width box
+ *     wraps a long value mid-line. We resize the slave with `stty` INSIDE the
+ *     PTY (runs on the controlling tty before the real command via `exec`).
+ *     `2>/dev/null` keeps an `stty`-less environment from breaking the flow.
+ *   - BSD (`script -q <file> cmd…`) vs util-linux (`script -qfc "cmd" <file>`)
+ *     differ in argument order.
+ */
+export const ptyScriptArgv = (
+  argv: ReadonlyArray<string>,
+  typescript: string,
+): string[] | null => {
+  const os = platform();
+  if (os !== "darwin" && os !== "linux") return null;
+  const escapeShellArg = (arg: string): string =>
+    `'${arg.replace(/'/g, "'\\''")}'`;
+  const cmd = argv.map(escapeShellArg).join(" ");
+  const widen = `stty cols 1000 rows 50 2>/dev/null; exec ${cmd}`;
+  return os === "darwin"
+    ? ["script", "-F", "-q", typescript, "sh", "-c", widen]
+    : ["script", "-qfc", widen, typescript];
+};
+
+/**
  * Like {@link spawnLogin}, but runs `argv` under a PSEUDO-TERMINAL (via
  * `script(1)`). Some vendor CLIs only work attached to a real terminal —
  * `claude setup-token` is a TTY-only interactive TUI that writes the auth URL +
@@ -264,25 +301,9 @@ export const spawnLoginPty = async (
     `openllmd-pty-${process.pid}-${Date.now().toString(36)}.log`,
   );
   await Bun.write(tsFile, "");
-  // `-F` (BSD) / `-f` (util-linux, inside `-qfc`) is LOAD-BEARING: without it
-  // `script` BUFFERS the typescript and only flushes on close, so polling it
-  // while the child still runs reads empty — we'd never see the token until the
-  // child exits (which the TUI may not do). `-F` flushes after every write.
-  const escapeShellArg = (arg: string): string =>
-    `'${arg.replace(/'/g, "'\\''")}'`;
-  // `script` allocates the PTY at the DEFAULT 80×24 — a PTY's window size is an
-  // ioctl (TIOCSWINSZ), NOT the `COLUMNS`/`LINES` env vars, so a TUI rendering
-  // a fixed-width box wraps a long value (e.g. an `sk-ant-oat01-` setup-token)
-  // mid-line with a bare `\r`, which screen-scraping then truncates. We resize
-  // the slave with `stty` INSIDE the PTY (it runs on the controlling tty before
-  // the real command via `exec`), so the token renders on one line. `2>/dev/null`
-  // keeps a `stty`-less environment from breaking the flow.
-  const cmd = argv.map(escapeShellArg).join(" ");
-  const widen = `stty cols 1000 rows 50 2>/dev/null; exec ${cmd}`;
-  const scriptArgv =
-    os === "darwin"
-      ? ["script", "-F", "-q", tsFile, "sh", "-c", widen]
-      : ["script", "-qfc", widen, tsFile];
+  // PTY argv (shared with the exec-fixture capture). Non-null here: the OS was
+  // already gated to darwin/linux above. We POLL `tsFile` for `opts.until`.
+  const scriptArgv = ptyScriptArgv(argv, tsFile) ?? [...argv];
 
   const proc = Bun.spawn(scriptArgv, {
     stdin: "ignore",

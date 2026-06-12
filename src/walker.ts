@@ -109,12 +109,12 @@ type TUpstreamWire = "anthropic" | "chatgpt" | "openai";
 const UPSTREAM_WIRE: Readonly<Record<string, TUpstreamWire>> = {
   claude_code: "anthropic",
   chatgpt: "chatgpt",
-  // Kimi gated its OpenAI-wire `/chat/completions` to approved coding agents
-  // (403 `access_terminated_error`); its Anthropic-compatible
-  // `/coding/v1/messages` endpoint serves the same subscription to Claude Code.
-  // So we delegate over the anthropic wire (URL from the delegate's
-  // `credentialForUpstream`). See `kimi-code.ts`.
-  kimi_code: "anthropic",
+  // Kimi's managed "Kimi For Coding" subscription speaks the OpenAI wire
+  // (`/coding/v1/chat/completions`) — exactly what the official `kimi-code-cli`
+  // sends. So we delegate over the openai wire with the CLI's genuine identity
+  // (URL + headers from the delegate's `credentialForUpstream`, captured from
+  // the real `kimi -p ping` request). See `kimi-code.ts`.
+  kimi_code: "openai",
 };
 
 // The chatgpt Responses API emits freeform JSON events (no strict schema);

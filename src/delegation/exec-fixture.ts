@@ -26,7 +26,7 @@ import { join } from "node:path";
 import type { TCliProvider } from "../cli-paths";
 import { cliBin, cliEnv, cliRoot } from "../cli-paths";
 import { logDebug, logInfo } from "../logger";
-import { cliVersion, readJsonFile } from "./util";
+import { cliVersion, ptyScriptArgv, readJsonFile } from "./util";
 
 export type TExecFixture = {
   /** The isolated binary's `--version` at capture time; a mismatch re-captures. */
@@ -111,12 +111,13 @@ type TCaptureSpec = {
   readonly argv: (bin: string, base: string) => ReadonlyArray<string>;
   readonly env: (base: string) => Record<string, string>;
   /**
-   * When true, the live exec-capture is skipped and the delegate's fallback
-   * identity is used verbatim. The `origin`/`path` are still consumed by
-   * `defaultUpstreamUrl`; only the CLI spawn is suppressed. Set for a provider
-   * whose isolated CLI can't be driven headlessly (see kimi_code below).
+   * Run the headless CLI under a pseudo-terminal (`script(1)`). Set for a CLI
+   * whose print/exec mode is gated on a real TTY and emits NO request under a
+   * plain pipe (kimi's `-p` raw-mode gate) — see `ptyScriptArgv`. On an OS
+   * without `script` it falls back to a plain spawn (capture then yields no
+   * request → the delegate's hand-mirrored identity fallback).
    */
-  readonly skipCapture?: boolean;
+  readonly usePty?: boolean;
 };
 
 const CAPTURE: Readonly<Record<TCliProvider, TCaptureSpec>> = {
@@ -162,27 +163,32 @@ const CAPTURE: Readonly<Record<TCliProvider, TCaptureSpec>> = {
   },
   kimi_code: {
     origin: "https://api.kimi.com",
-    // ANTHROPIC-wire endpoint, NOT the OpenAI `/chat/completions` one. Kimi
-    // gated its OpenAI-wire path to approved coding agents (a 403
-    // `access_terminated_error` for the `kimi-code-cli` identity), but its
-    // Anthropic-compatible `/coding/v1/messages` serves the SAME subscription
-    // to "Claude Code" (an approved agent). So the daemon delegates inference
-    // over the anthropic wire as Claude Code — see `kimi-code.ts` +
-    // `walker.ts` (`UPSTREAM_WIRE.kimi_code = "anthropic"`).
-    path: "/coding/v1/messages",
-    // Exact match (not `endsWith`): kimi is `skipCapture`, so this matcher only
-    // gates `fixtureUrlIsInference` — a loose suffix would let a stale fixture
-    // for some other `/…/messages` path survive validation and override the
-    // `/coding/v1/messages` routing.
-    match: (p) => p === "/coding/v1/messages",
-    // NOT captureable headlessly, and unnecessary: the daemon drives kimi's
-    // device-code OAuth itself (no CLI `/login` config), and the served
-    // identity is now Claude Code (a fixed UA + anthropic-version/-beta the
-    // wire layer adds), not a captured `kimi-code-cli` request. `argv`/`env`
-    // are retained for shape only (never spawned).
+    // The managed "Kimi For Coding" subscription speaks the OpenAI wire
+    // (`/coding/v1/chat/completions`) — the genuine endpoint the official
+    // `kimi-code-cli` POSTs to. Captured live (with its real `kimi-code-cli`
+    // identity) by driving `kimi -p ping` headless against the recorder; the
+    // delegate's hand-mirrored identity is the fallback when capture can't run.
+    path: "/coding/v1/chat/completions",
+    match: (p) => p.endsWith("/coding/v1/chat/completions"),
+    // `-p/--prompt` = headless single-shot (a non-empty prompt is required). The
+    // isolated home has only the credential — no provisioned config/model — so
+    // `kimi -p` would error "No model configured" before issuing a request. The
+    // `KIMI_MODEL_*` trio synthesizes an EPHEMERAL in-memory model (ref/kimi-code
+    // `packages/agent-core/src/config/env-model.ts`) that auto-becomes the
+    // default: provider type `kimi` (so the genuine `kimi-code-cli` UA + X-Msh-*
+    // identity headers are attached via the same provider-manager path) pointed
+    // at the recorder. The OpenAI SDK appends `/chat/completions` to the base, so
+    // the base must NOT include it. The dummy api key only rides `authorization`,
+    // which the fixture denylists + the delegate re-injects fresh.
     argv: (bin) => [bin, "-p", "ping"],
-    env: (base) => ({ KIMI_CODE_BASE_URL: `${base}/coding/v1` }),
-    skipCapture: true,
+    env: (base) => ({
+      KIMI_MODEL_NAME: "kimi-for-coding",
+      KIMI_MODEL_API_KEY: "sk-openllm-capture",
+      KIMI_MODEL_BASE_URL: `${base}/coding/v1`,
+    }),
+    // `kimi -p` is gated on a real TTY (raw-mode detection) — under a plain pipe
+    // it emits no request. Run it under a PTY like `claude setup-token`.
+    usePty: true,
   },
 };
 
@@ -336,14 +342,20 @@ const captureExecFixture = async (
   provider: TCliProvider,
 ): Promise<TExecFixture | null> => {
   const spec = CAPTURE[provider];
-  // Some providers can't be driven headlessly (e.g. kimi_code) — don't spawn,
-  // just signal "no fixture" so the caller uses the delegate's fallback.
-  if (spec.skipCapture === true) return null;
   const bin = cliBin(provider);
   const recorder = startRecorder(spec);
+  const cmdArgv = [...spec.argv(bin, recorder.base)];
+  // PTY-gated CLIs (kimi `-p`) run under `script(1)`; the terminal capture goes
+  // to /dev/null since we drive off the HTTP recorder, not the typescript. On an
+  // OS without `script` it falls back to a plain pipe (→ likely no request → the
+  // delegate's hand-mirrored identity fallback).
+  const spawnArgv =
+    spec.usePty === true
+      ? (ptyScriptArgv(cmdArgv, "/dev/null") ?? cmdArgv)
+      : cmdArgv;
   let proc: ReturnType<typeof Bun.spawn> | null = null;
   try {
-    proc = Bun.spawn([...spec.argv(bin, recorder.base)], {
+    proc = Bun.spawn(spawnArgv, {
       stdin: "ignore",
       stdout: "ignore",
       stderr: "ignore",

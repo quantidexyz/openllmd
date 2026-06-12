@@ -54,18 +54,6 @@ import { cliVersion, openUrl, readJsonFile } from "./util";
 const PROVIDER = "kimi_code" as const;
 const USAGE_URL = "https://api.kimi.com/coding/v1/usages";
 
-// Kimi gated its OpenAI-wire `/coding/v1/chat/completions` to approved coding
-// agents — the `kimi-code-cli` identity now gets a 403 `access_terminated_error`
-// ("Kimi For Coding is currently only available for Coding Agents such as Kimi
-// CLI, Claude Code, Roo Code, Kilo Code"). Its Anthropic-compatible
-// `/coding/v1/messages` endpoint serves the SAME subscription to "Claude Code"
-// (an approved agent), so inference is delegated over the anthropic wire AS
-// Claude Code: the walker maps kimi_code → the `anthropic` upstream wire (it
-// adds anthropic-version/-beta + the bearer), and we present Claude Code's
-// user-agent here. The `X-Msh-*` device identity stays on the still-open usage
-// endpoint only (`usage()` below). Verified end-to-end with the Claude harness.
-const CLAUDE_CODE_USER_AGENT = "claude-cli/2.0.0 (external, cli)";
-
 // Device-code OAuth — verbatim from `ref/kimi-code/packages/oauth`
 // (constants.ts + oauth.ts). Same host + public client id the CLI uses,
 // so the daemon runs the CLI's own login, not a forged one.
@@ -692,14 +680,16 @@ export const kimiCodeDelegate: TProviderDelegate = {
     if (token === null) {
       throw new Error("kimi_code: not signed in (no stored credential)");
     }
-    // Serve over the Anthropic-wire endpoint AS Claude Code (the OpenAI-wire
-    // `kimi-code-cli` path is gated — see the CLAUDE_CODE_USER_AGENT note). The
-    // URL is the `/coding/v1/messages` endpoint (`defaultUpstreamUrl`); the
-    // walker's anthropic wire adds anthropic-version/-beta + the bearer. We do
-    // NOT send the `X-Msh-*` kimi-cli identity here — that's the gated one.
+    // Serve over the genuine OpenAI-wire `/coding/v1/chat/completions` endpoint
+    // (`defaultUpstreamUrl`) with the real `kimi-code-cli` identity the official
+    // CLI sends — its `user-agent` + `X-Msh-*` device headers. Preferred from the
+    // live exec fixture (captured from `kimi -p ping`); the hand-mirrored
+    // `identityHeaders()` here is the compliant fallback. The walker maps
+    // kimi_code → the `openai` upstream wire (no anthropic-version/-beta, no
+    // forged Claude Code identity).
     const { url, headers } = await resolveUpstream(PROVIDER, {
       url: defaultUpstreamUrl(PROVIDER),
-      headers: { "user-agent": CLAUDE_CODE_USER_AGENT },
+      headers: await identityHeaders(),
     });
     return { access_token: token.accessToken, headers, url };
   },
