@@ -1,7 +1,7 @@
 # `packages/daemon` Architecture
 
 > The headless **local daemon** — a source-free compiled binary (coreless:
-> built from `@openllm/wire` + `@quantidexyz/openllmp`, NOT `@openllm/core`) that
+> built from `@quantidexyz/openllmw` + `@quantidexyz/openllmp`, NOT `@openllm/core`) that
 > runs the **subscription** data plane on the user's
 > machine. It delegates to the official vendor CLIs' own credentials +
 > identity (never minting, storing, or forging a subscription token),
@@ -25,10 +25,10 @@ providers keep running on the cloud unchanged.
 
 ## Dependency boundary (load-bearing)
 
-The daemon links **only** `@openllm/wire`, `@quantidexyz/openllmp`, and
+The daemon links **only** `@quantidexyz/openllmw`, `@quantidexyz/openllmp`, and
 `effect` — it is **`@openllm/core`-free** (the §7.5 cut-over is done: the
 core-backed `dispatch.ts`/`encode.ts` are deleted and the walker is the
-sole data path). `@openllm/wire` is the dependency-light package of pure
+sole data path). `@quantidexyz/openllmw` is the dependency-light package of pure
 wire-format transforms extracted from `core` (request/response/streaming
 adapters, the per-provider transforms, SSE decode/encode + accumulate);
 see
@@ -129,7 +129,7 @@ vendor called directly) and forwarding each API-key hop to the cloud
 `retryable()` and committing on first byte.
 
 **Serves all three subscription providers + cross-wire** (§9(a)) — a tiny
-per-hop mini-runner built from the `@openllm/wire` transforms:
+per-hop mini-runner built from the `@quantidexyz/openllmw` transforms:
 
 | Provider | Upstream wire | Anthropic-wire client | OpenAI-wire client |
 | --- | --- | --- | --- |
@@ -142,7 +142,7 @@ upstream wire)` cell, including the passthrough-vs-transform decision and
 the Anthropic adaptive-thinking / `anthropic-beta` handling — is NOT
 open-coded here. The walker calls
 [`buildUpstreamRequest`](../wire/providers/upstream-request.ts) from
-`@openllm/wire`, the **single** recipe the cloud runner also calls. This is
+`@quantidexyz/openllmw`, the **single** recipe the cloud runner also calls. This is
 load-bearing: the recipe used to be forked between the cloud's runner and
 this walker (which can't share `@openllm/core`), and the two drifted —
 dropping the client's `anthropic-beta` and skipping
@@ -157,14 +157,14 @@ the genuine CLI identity (versions/beta/UA/account headers) off the
 delegate's `credentialForUpstream().headers`, plus the refreshed bearer.
 Wire-derived headers are layered on top by the builder. On the RESPONSE
 side the walker decodes the upstream SSE/JSON to canonical chunks
-(`@openllm/wire/lib/streaming/provider-decode` — the `@openllm/core`-free
+(`@quantidexyz/openllmw/lib/streaming/provider-decode` — the `@openllm/core`-free
 analogue of `providerEventStream`) and re-encodes to the client wire
 (`chunksToMessagesSseBytes` for Anthropic clients, `chunksToSseBytes` for
 OpenAI clients). `canWalkPlan` decides up front for the whole plan
 (declining only an unknown subscription provider with no upstream), so a
 chain is never half-attempted then bailed.
 
-> **Standing rule.** `@openllm/wire` owns wire transforms **and their
+> **Standing rule.** `@quantidexyz/openllmw` owns wire transforms **and their
 > composition** (the request recipe + the response decode/encode). The
 > cloud runner and this walker are thin callers — neither re-derives the
 > recipe. A new provider/wire pairing is added in `upstream-request.ts`
