@@ -14,7 +14,10 @@
  * fields ride along in the wire shape but are unused on the box.
  */
 
-import type { TDaemonBootstrap, TDaemonCatalogEntry } from "@openllm/schema";
+import type {
+  TDaemonBootstrap,
+  TDaemonCatalogEntry,
+} from "@quantidexyz/openllmp";
 import {
   fetchBootstrap,
   InvalidApiKeyError,

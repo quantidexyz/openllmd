@@ -29,7 +29,7 @@
 import { rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { join } from "node:path";
-import type { TProviderUsageSnapshot } from "@openllm/schema";
+import type { TProviderUsageSnapshot } from "@quantidexyz/openllmp";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
 import { logError, logInfo } from "../logger";

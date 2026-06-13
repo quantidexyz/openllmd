@@ -6,7 +6,7 @@
  * auth/store read), so callers should not hammer it — the SSE watcher
  * recomputes on a gentle interval and only while a client is listening.
  */
-import type { TDaemonStatus } from "@openllm/schema";
+import type { TDaemonStatus } from "@quantidexyz/openllmp";
 import { autoUpdateEnabled } from "./auto-update-pref";
 import { getCloudState } from "./config";
 import { DELEGATES } from "./delegation";

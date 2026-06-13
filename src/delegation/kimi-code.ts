@@ -34,7 +34,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { arch, hostname, release, type } from "node:os";
 import { join } from "node:path";
-import type { TProviderUsageSnapshot } from "@openllm/schema";
+import type { TProviderUsageSnapshot } from "@quantidexyz/openllmp";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv } from "../cli-paths";
 import {

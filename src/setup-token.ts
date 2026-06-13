@@ -27,10 +27,10 @@ import { join } from "node:path";
 import {
   ANTHROPIC_OAUTH_TOKEN_RE,
   isAnthropicOAuthToken,
-} from "@openllm/wire/providers/anthropic";
+} from "@quantidexyz/openllmw/providers/anthropic";
 import { stateDir } from "./env";
 
-// The token shape (prefix + base64url body) — owned by `@openllm/wire` so the
+// The token shape (prefix + base64url body) — owned by `@quantidexyz/openllmw` so the
 // cloud auth split, the terms gate, and this on-box capture/validation all agree
 // on which credentials are subscription bearers (`sk-ant-oat01-`/`sk-ant-at01-`,
 // never the Console `sk-ant-api03-`). Used to EXTRACT a clean token from a

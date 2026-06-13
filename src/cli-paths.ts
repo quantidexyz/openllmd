@@ -13,7 +13,7 @@
  *     home/            the CLI's home/config + credentials (isolated)
  */
 import { join } from "node:path";
-import type { TSubscriptionProviderSlug } from "@openllm/schema";
+import type { TSubscriptionProviderSlug } from "@quantidexyz/openllmp";
 import { stateDir } from "./env";
 
 /** The providers with an isolated CLI — exactly the closed

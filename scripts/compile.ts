@@ -4,7 +4,7 @@
  * Compile the daemon into source-free standalone binaries.
  *
  * `bun build --compile` inlines the transitive workspace imports
- * (@openllm/wire, @openllm/schema, effect — NOT @openllm/core; the daemon
+ * (@quantidexyz/openllmw, @quantidexyz/openllmp, effect — NOT @openllm/core; the daemon
  * is coreless) following the symlinks Bun creates for `workspace:*` deps,
  * into a single executable that embeds the Bun runtime. `--minify
  * --bytecode` strips readable identifiers + original source text. No `.ts`

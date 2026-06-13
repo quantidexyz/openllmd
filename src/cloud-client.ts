@@ -16,12 +16,12 @@ import type {
   TDaemonRecordRequest,
   TDaemonSearchResponse,
   TRelayChannelResponse,
-} from "@openllm/schema";
+} from "@quantidexyz/openllmp";
 import {
   DAEMON_DEVICE_ID_HEADER,
   DAEMON_DEVICE_LABEL_HEADER,
   RelayChannelResponse,
-} from "@openllm/schema";
+} from "@quantidexyz/openllmp";
 import { Schema } from "effect";
 import { daemonEnv, deviceId } from "./env";
 

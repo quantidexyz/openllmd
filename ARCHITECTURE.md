@@ -1,7 +1,7 @@
 # `packages/daemon` Architecture
 
 > The headless **local daemon** — a source-free compiled binary (coreless:
-> built from `@openllm/wire` + `@openllm/schema`, NOT `@openllm/core`) that
+> built from `@openllm/wire` + `@quantidexyz/openllmp`, NOT `@openllm/core`) that
 > runs the **subscription** data plane on the user's
 > machine. It delegates to the official vendor CLIs' own credentials +
 > identity (never minting, storing, or forging a subscription token),
@@ -25,7 +25,7 @@ providers keep running on the cloud unchanged.
 
 ## Dependency boundary (load-bearing)
 
-The daemon links **only** `@openllm/wire`, `@openllm/schema`, and
+The daemon links **only** `@openllm/wire`, `@quantidexyz/openllmp`, and
 `effect` — it is **`@openllm/core`-free** (the §7.5 cut-over is done: the
 core-backed `dispatch.ts`/`encode.ts` are deleted and the walker is the
 sole data path). `@openllm/wire` is the dependency-light package of pure

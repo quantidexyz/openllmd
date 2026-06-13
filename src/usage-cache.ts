@@ -42,7 +42,7 @@
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { TProviderUsageSnapshot } from "@openllm/schema";
+import type { TProviderUsageSnapshot } from "@quantidexyz/openllmp";
 
 // Hit the vendor at most once per this window — applies to BOTH a successful
 // read (the figures are reused) and a failed one (we back off instead of

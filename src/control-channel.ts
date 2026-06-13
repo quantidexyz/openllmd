@@ -6,8 +6,8 @@
  * status over the socket. See `docs/proposals/daemon-relay-websocket-push.md`.
  */
 
-import type { TDaemonCommandAck, TRelayFrame } from "@openllm/schema";
-import { RelayFrame } from "@openllm/schema";
+import type { TDaemonCommandAck, TRelayFrame } from "@quantidexyz/openllmp";
+import { RelayFrame } from "@quantidexyz/openllmp";
 import { Schema } from "effect";
 import { WebSocket as ReconnectingWebSocket } from "partysocket";
 import { fetchChannel } from "./cloud-client";

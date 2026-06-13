@@ -13,11 +13,11 @@
  *     - PRE-STREAM error + retryable → next hop
  *     - committed (response received, ok) → stream straight to the client
  *
- * Coreless: imports `@openllm/wire` + `@openllm/schema` + local modules
+ * Coreless: imports `@quantidexyz/openllmw` + `@quantidexyz/openllmp` + local modules
  * only — NEVER `@openllm/core`. The pure provider wire transforms
  * (request/response/streaming for anthropic + chatgpt, the canonical
  * message adapters, and the SSE decode/encode primitives) all live in
- * `@openllm/wire`; the walker wires them into a tiny per-hop mini-runner.
+ * `@quantidexyz/openllmw`; the walker wires them into a tiny per-hop mini-runner.
  *
  * Serves all three subscription providers + cross-wire:
  *   - claude_code (Anthropic upstream): passthrough for an Anthropic-wire
@@ -50,31 +50,31 @@ import {
   type TErrorEnvelope,
   type TRequestStatus,
   type TToolCall,
-} from "@openllm/schema";
-import { toAnthropicMessagesResponse } from "@openllm/wire/adapters/messages/response";
-import { chunksToMessagesSseBytes } from "@openllm/wire/adapters/messages/streaming";
+} from "@quantidexyz/openllmp";
+import { toAnthropicMessagesResponse } from "@quantidexyz/openllmw/adapters/messages/response";
+import { chunksToMessagesSseBytes } from "@quantidexyz/openllmw/adapters/messages/streaming";
 import {
   chunksToResponsesSseBytes,
   toResponsesResponse,
-} from "@openllm/wire/adapters/responses";
-import { classifyHopError } from "@openllm/wire/lib/error-class";
-import { accumulateChunksToResponse } from "@openllm/wire/lib/streaming/accumulate";
+} from "@quantidexyz/openllmw/adapters/responses";
+import { classifyHopError } from "@quantidexyz/openllmw/lib/error-class";
+import { accumulateChunksToResponse } from "@quantidexyz/openllmw/lib/streaming/accumulate";
 import {
   chunksToSseBytes,
   decodeProviderEventStream,
-} from "@openllm/wire/lib/streaming/provider-decode";
-import { responseToChunkStream } from "@openllm/wire/lib/streaming/response-stream";
-import { withFrameAlignedHeartbeat } from "@openllm/wire/lib/streaming/sse";
-import { fromAnthropicResponse } from "@openllm/wire/providers/anthropic/response";
+} from "@quantidexyz/openllmw/lib/streaming/provider-decode";
+import { responseToChunkStream } from "@quantidexyz/openllmw/lib/streaming/response-stream";
+import { withFrameAlignedHeartbeat } from "@quantidexyz/openllmw/lib/streaming/sse";
+import { fromAnthropicResponse } from "@quantidexyz/openllmw/providers/anthropic/response";
 import {
   fromAnthropicStreamEvent,
   newAnthropicStreamState,
-} from "@openllm/wire/providers/anthropic/streaming";
+} from "@quantidexyz/openllmw/providers/anthropic/streaming";
 import {
   chatGptEventToChunk,
   newChatGptStreamState,
   type TChatGptStreamEvent,
-} from "@openllm/wire/providers/chatgpt/streaming";
+} from "@quantidexyz/openllmw/providers/chatgpt/streaming";
 // The SINGLE (clientWire × upstreamWire) request recipe — shared with the
 // cloud runner so the two can't drift (this fork caused two regressions). See
 // `docs/proposals/unified-upstream-request-builder.md`.
@@ -84,7 +84,7 @@ import {
   canonicalFromInbound,
   canonicalToUpstreamBody,
   clientWireOf,
-} from "@openllm/wire/providers/upstream-request";
+} from "@quantidexyz/openllmw/providers/upstream-request";
 import {
   buildAssistantToolCallMessage,
   buildToolResultMessages,
@@ -92,7 +92,7 @@ import {
   functionNameUsesWebSearch,
   MAX_WEB_SEARCH_ROUNDS,
   toolCallUsesWebSearch,
-} from "@openllm/wire/tools/web-search/helpers";
+} from "@quantidexyz/openllmw/tools/web-search/helpers";
 import { Schema } from "effect";
 import { recordRequest, searchViaCloud } from "./cloud-client";
 import { lookupCatalogEntry, planSigningKey } from "./config";
@@ -302,7 +302,7 @@ const report = (row: TDaemonRecordRequest, origin: string | null): void => {
 const decodeAnthropicResponse = Schema.decodeUnknownSync(AnthropicResponse);
 
 // The (clientWire × upstreamWire) request recipe — body + headers — lives in
-// `@openllm/wire/providers/upstream-request` (buildUpstreamRequest /
+// `@quantidexyz/openllmw/providers/upstream-request` (buildUpstreamRequest /
 // buildUpstreamHeaders / buildUpstreamBody / canonicalToUpstreamBody /
 // canonicalFromInbound / clientWireOf). The walker is a thin caller; it never
 // re-derives the recipe (that fork caused two regressions).
@@ -372,7 +372,7 @@ const tokensFromCanonical = (
 
 // ─── web_search (§5) ──────────────────────────────────────────────────
 // The agentic round cap (`MAX_WEB_SEARCH_ROUNDS`) is shared with the cloud
-// orchestrator via `@openllm/wire/tools/web-search/helpers` so both paths
+// orchestrator via `@quantidexyz/openllmw/tools/web-search/helpers` so both paths
 // agent the same depth.
 
 /** Does the request ask the gateway to run web_search (an openllm function

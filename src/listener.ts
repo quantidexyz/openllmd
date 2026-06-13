@@ -18,7 +18,7 @@ import {
   AnthropicRequest,
   ChatCompletionRequest,
   ResponsesRequest,
-} from "@openllm/schema";
+} from "@quantidexyz/openllmp";
 import { Schema } from "effect";
 import { corsHeaders, errorJson, isPreflight, preflightResponse } from "./cors";
 import { runWalker } from "./walker";

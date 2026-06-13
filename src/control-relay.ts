@@ -8,7 +8,7 @@
  * long-poll anymore — the relay socket is the daemon's only control transport.
  */
 
-import type { TDaemonCommand, TDaemonCommandAck } from "@openllm/schema";
+import type { TDaemonCommand, TDaemonCommandAck } from "@quantidexyz/openllmp";
 import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { installCli } from "./cli-install";
 import { relayCredential } from "./cloud-client";

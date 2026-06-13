@@ -11,7 +11,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { TDaemonInstalledIntegration } from "@openllm/schema";
+import type { TDaemonInstalledIntegration } from "@quantidexyz/openllmp";
 
 /** Subdirectory names under `parent`, or `[]` if it doesn't exist. */
 const listDirs = (parent: string): string[] => {

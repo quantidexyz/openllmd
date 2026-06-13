@@ -1,7 +1,7 @@
 import type {
   TDaemonProviderConnection,
   TProviderUsageSnapshot,
-} from "@openllm/schema";
+} from "@quantidexyz/openllmp";
 import type { TExecFixture } from "./exec-fixture";
 
 /**

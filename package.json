@@ -1,7 +1,7 @@
 {
-  "name": "@openllm/daemon",
+  "name": "@quantidexyz/openllmd",
   "version": "1.3.10",
-  "private": true,
+  "private": false,
   "type": "module",
   "exports": {
     ".": "./index.ts",
@@ -17,8 +17,8 @@
     "uninstall:local": "bun scripts/install-local.ts --uninstall"
   },
   "dependencies": {
-    "@openllm/schema": "workspace:*",
-    "@openllm/wire": "workspace:*",
+    "@quantidexyz/openllmp": "workspace:*",
+    "@quantidexyz/openllmw": "workspace:*",
     "effect": ">=3.20.0",
     "partysocket": "^1.1.19"
   },
