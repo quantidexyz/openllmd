@@ -45,7 +45,7 @@ openllmd status
 Or consume the source as a package:
 
 ```sh
-bun install github:quantidexyz/openllmd#latest
+bun install github:quantidexyz/openllmd # latest
 ```
 
 ## License
