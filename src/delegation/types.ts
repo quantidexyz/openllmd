@@ -2,7 +2,6 @@ import type {
   TDaemonProviderConnection,
   TProviderUsageSnapshot,
 } from "@quantidexyz/openllmp";
-import type { TExecFixture } from "./exec-fixture";
 
 /**
  * A provider delegate wraps ONE official vendor CLI (Claude Code, Codex,
@@ -89,28 +88,20 @@ export type TProviderDelegate = {
   usage: () => Promise<TProviderUsageSnapshot>;
 
   /**
-   * Produce the bearer + identity headers + upstream URL for an inference call.
-   * The bearer comes from the official CLI's store; the identity headers + URL
-   * come from the captured exec fixture (`ensureFixture`), falling back to the
-   * delegate's defaults when no fixture exists. Used ONLY by the local runner;
-   * never leaves the machine.
+   * Produce, for ONE inference call: the bearer (from the official CLI's store),
+   * the request TARGET `url` (captured from a real CLI request, or the default),
+   * and only the CREDENTIAL-INTRINSIC `headers` — the small set the request can't
+   * work without and that is genuinely the user's own (e.g. chatgpt's
+   * `chatgpt-account-id`), NOT a synthesized CLI identity. The walker layers the
+   * ORIGINATOR's own headers underneath and the wire-derived headers on top, so
+   * a genuine vendor-CLI request reaches the vendor verbatim. Used ONLY by the
+   * local runner; never leaves the machine.
    */
   credentialForUpstream: () => Promise<{
     readonly access_token: string;
     readonly headers: Readonly<Record<string, string>>;
     readonly url: string;
   }>;
-
-  /**
-   * Capture (or return the cached) exec fixture — the genuine upstream URL +
-   * identity headers read from a real headless `exec` request the official CLI
-   * makes. Re-captured on a 24h TTL, a CLI version bump, or `{ force }` after a
-   * re-login. Returns null when no fixture is available (capture failed and
-   * none cached); the runner then uses the delegate's defaults.
-   */
-  ensureFixture: (opts?: {
-    readonly force?: boolean;
-  }) => Promise<TExecFixture | null>;
 
   /**
    * Sign out of the official CLI's LOGIN credential on this box: run the

@@ -58,6 +58,7 @@ import {
   toResponsesResponse,
 } from "@quantidexyz/openllmw/adapters/responses";
 import { classifyHopError } from "@quantidexyz/openllmw/lib/error-class";
+import { originatorHeadersFrom } from "@quantidexyz/openllmw/lib/forwarded-headers";
 import { accumulateChunksToResponse } from "@quantidexyz/openllmw/lib/streaming/accumulate";
 import {
   chunksToSseBytes,
@@ -102,9 +103,9 @@ import { forwardToCloud } from "./forward";
 
 // Upstream WIRE per subscription provider — structural (which adapter to run),
 // the one constant that stays in the walker. The upstream URL is no longer
-// hardcoded here: it's resolved per hop from the delegate's exec fixture
+// hardcoded here: it's resolved per hop from the delegate's auth config
 // (`credentialForUpstream().url`), captured from the real CLI request. See
-// `docs/proposals/delegation-exec-fixtures.md`.
+// `packages/daemon/src/delegation/auth-config.ts`.
 type TUpstreamWire = "anthropic" | "chatgpt" | "openai";
 const UPSTREAM_WIRE: Readonly<Record<string, TUpstreamWire>> = {
   claude_code: "anthropic",
@@ -409,16 +410,19 @@ const spliceAnthropicWebSearchBlocks = (
 };
 
 /**
- * Resolve the provider's delegate + read the official CLI's credential into the
- * BASE headers (its genuine identity + bearer) AND the upstream URL — both come
- * from the delegate's exec fixture (`credentialForUpstream`), captured from the
- * real CLI request. The wire-derived headers (anthropic-version / anthropic-beta
- * / content-type) are layered on by `buildUpstreamRequest`/`buildUpstreamHeaders`.
- * Returns "retry" when no usable local credential is available, so the walker
- * falls through.
+ * Build the BASE upstream headers for a hop: the ORIGINATOR's own headers
+ * (denylist passthrough — `originatorHeadersFrom`), then the credential-intrinsic
+ * headers + the subscription bearer layered on top. The wire-derived headers
+ * (anthropic-version / anthropic-beta / content-type) are layered last by
+ * `buildUpstreamRequest`/`buildUpstreamHeaders`. So a genuine vendor-CLI request
+ * reaches the vendor with ITS real identity; the daemon forges nothing and only
+ * swaps in the bearer (+ the user's own account id where required). Returns
+ * "retry" when no usable local credential is available, so the walker falls
+ * through.
  */
 const acquireUpstream = async (
   provider: string,
+  args: TWalkArgs,
 ): Promise<{ headers: Record<string, string>; url: string } | "retry"> => {
   const delegate = getDelegate(provider);
   if (delegate === null) return "retry";
@@ -426,6 +430,7 @@ const acquireUpstream = async (
     const cred = await delegate.credentialForUpstream();
     return {
       headers: {
+        ...originatorHeadersFrom(args.req.headers),
         ...cred.headers,
         authorization: `Bearer ${cred.access_token}`,
       },
@@ -456,7 +461,7 @@ const serveWithWebSearch = async (
   args: TWalkArgs,
   initialCanonical: TChatCompletionRequest,
 ): Promise<Response | "retry"> => {
-  const acquired = await acquireUpstream(hop.provider);
+  const acquired = await acquireUpstream(hop.provider, args);
   if (acquired === "retry") return "retry";
   const { headers: baseHeaders, url } = acquired;
   // Headers are computed once; the body is rebuilt per round from the
@@ -649,7 +654,7 @@ const serveSubscription = async (
   wire: TUpstreamWire,
   args: TWalkArgs,
 ): Promise<Response | "retry"> => {
-  const acquired = await acquireUpstream(hop.provider);
+  const acquired = await acquireUpstream(hop.provider, args);
   if (acquired === "retry") return "retry";
   const { headers: baseHeaders, url } = acquired;
 

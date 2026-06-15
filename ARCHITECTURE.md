@@ -79,10 +79,11 @@ daemon/
     record.ts/version/env   request recording, version, env (+ env-file loader)
     delegation/             isolated-CLI delegates per provider
       types.ts              TProviderDelegate contract
-      exec-fixture.ts       capture the real CLI exec request (url + identity
-                            headers) → fixture; the upstream URL + headers source
-      oauth-config.ts       extract Claude's + Codex/ChatGPT's OAuth client_id +
-                            token URL from the CLI binary (drift-safe), cached + fallback
+      auth-config.ts        per-provider `config.json` sidecar: capture the real CLI
+                            exec request's upstream URL (drift-safe) + CLI meta, and
+                            extract Claude's + Codex's OAuth client_id + token URL
+                            from the binary. Feeds the request TARGET + token refresh
+                            — NOT inference identity (the originator's headers do that)
       claude-code.ts chatgpt.ts kimi-code.ts util.ts index.ts
 ```
 
@@ -153,9 +154,14 @@ pinned together by `tests/transport/upstream-request-parity.test.ts`. See
 The walker supplies only what's transport-local: the resolved
 `providerModelId`, the client's `stream` intent (the daemon PINS both off
 the 307; the cloud passthrough preserves the body's), and `baseHeaders` —
-the genuine CLI identity (versions/beta/UA/account headers) off the
-delegate's `credentialForUpstream().headers`, plus the refreshed bearer.
-Wire-derived headers are layered on top by the builder. On the RESPONSE
+the **ORIGINATOR's own headers** (denylist passthrough via
+`@quantidexyz/openllmw/lib/forwarded-headers` `originatorHeadersFrom`), with the
+delegate's CREDENTIAL-INTRINSIC headers (codex `chatgpt-account-id` — the
+user's own account; none for claude/kimi) + the refreshed bearer layered on
+top. Wire-derived headers (anthropic-version/-beta/content-type) are layered
+last by the builder. The daemon forges NO CLI identity — a genuine vendor-CLI
+request reaches the vendor with its own headers, and an unsupported one is
+rejected upstream (terms compliance, see "Originator passthrough" below). On the RESPONSE
 side the walker decodes the upstream SSE/JSON to canonical chunks
 (`@quantidexyz/openllmw/lib/streaming/provider-decode` — the `@openllm/core`-free
 analogue of `providerEventStream`) and re-encodes to the client wire
@@ -349,9 +355,10 @@ Two orthogonal hardenings from
 Each `TProviderDelegate` wraps the daemon's isolated CLI: `detect`
 (`cliInstallState`), `connect` (trigger the CLI's native login under the
 isolated env), `usage` (read locally with the CLI's own credential), and
-`credentialForUpstream` (bearer + the CLI's real identity headers + the upstream
-URL for the local runner). Nothing the delegate reads from a CLI's store is ever
-sent off-box.
+`credentialForUpstream` (bearer + only the credential-intrinsic headers, e.g.
+codex's account id + the captured upstream URL — the local runner adds the
+ORIGINATOR's headers and the wire-derived ones). Nothing the delegate reads from
+a CLI's store is ever sent off-box.
 
 **Usage reads go through a TTL cache, not live (`usage-cache.ts`).**
 `computeStatus()` runs on every status push — every control-relay poll (~30s)
@@ -365,35 +372,71 @@ the last good snapshot when a refresh fails (rather than flapping the card to an
 error) until it ages out. So the usage panel no longer couples to the push
 cadence.
 
-**Identity is captured, not hardcoded (`exec-fixture.ts`).** Rather than
-hand-copy each vendor's inference URL + identity headers (they drift on CLI
-updates, and the daemon must impersonate the CLI byte-for-byte — T2), the daemon
-runs the CLI once in headless `exec` mode (`claude -p`, `codex exec`, `kimi -p`)
-pointed at a loopback recorder, captures the exact request it builds (path +
-headers), kills it before anything reaches the vendor (zero token cost), and
-serves from that fixture. `ensureExecFixture` re-captures on a 6h TTL, a CLI
-version bump, or after a re-login; `resolveUpstream` prefers the captured fixture
-and falls back to the delegate's built-in identity when none exists. The only
-retained constants are the upstream ORIGIN + default path per provider
-(`UPSTREAM_WIRE` in the walker keeps the structural wire). See
-[`delegation-exec-fixtures.md`](../../docs/proposals/delegation-exec-fixtures.md).
+**Originator passthrough (the compliance core, `auth-config.ts`).** The daemon
+is a transparent, credential-injecting reverse proxy: each inference request
+carries the **originator's own headers** to the vendor (denylist passthrough —
+pass everything except a small stable deny set: auth, host, content-*,
+accept-encoding, hop-by-hop, `sec-websocket-*`, cookie, the separately-composed
+`anthropic-beta`), and the daemon injects ONLY the subscription bearer + the
+credential-intrinsic bits the request can't work without — those vary by
+provider's binding model:
+- **claude_code** — bearer only (the OAuth `anthropic-beta` is wire-derived).
+- **chatgpt** — bearer + `chatgpt-account-id` (the user's own account).
+- **kimi_code** — bearer + kimi's `x-msh-*` device identity (`x-msh-device-id`
+  the daemon registered during kimi's OWN device-code OAuth, + `x-msh-platform`
+  / `x-msh-version` / device-name / model / os-version). Kimi's managed endpoint
+  BINDS the token to its kimi-code client identity and 403s without the full set
+  (confirmed live), so it's credential-intrinsic here — not a forged identity:
+  the daemon genuinely holds a kimi-code device credential. (The DESCRIPTIVE
+  bits still come from the live `identityHeaders()`; the originator's UA is
+  overridden for this hop because kimi requires its own.)
 
-**OAuth config is extracted too, not hardcoded (`oauth-config.ts`).** Same
-rationale, different value: refreshing a Claude Pro/Max OR a Codex/ChatGPT token
-needs the OAuth `client_id` + token endpoint, all the vendor's and all DRIFT on
-CLI updates (by Claude CLI 2.1.159 the token host had moved
-`console.anthropic.com` → `platform.claude.com` while the daemon's literal went
-stale). Rather than hand-copy them, `ensureOAuthConfig(provider)` scans the
-installed CLI binary per provider: Claude's JS bundle exposes an embedded prod
-config block (`TOKEN_URL:"…/v1/oauth/token" … CLIENT_ID:"<uuid>"`, anchored on
-the prod host so a local/staging dev block can't be picked up); Codex's Rust
-binary packs `REFRESH_TOKEN_URL` + `CLIENT_ID` as separator-less literals
-(matched at exact length + most-frequent pick). A per-provider format guard
-rejects a mis-extracted/stale-cached value so it self-heals to the fallback. The
-result is cached version-keyed next to the exec-fixture, falling back to a
-CURRENT built-in default when extraction fails. No value is secret (a public app
-id + a published URL) and the binary read stays on-box. Re-extracted on the
-24h TTL, a CLI version bump, and after a re-login / device-code landing.
+It forges no CLI identity for claude/codex. So a genuine vendor-CLI request (the
+real path: Claude Code → `claude_code`) reaches the vendor byte-for-byte, and a
+request in a shape/identity the vendor doesn't support is rejected upstream —
+which is the correct, compliant outcome (the daemon doesn't launder it). The
+denylist is single-sourced with the cloud's allow-list policy in
+[`@quantidexyz/openllmw/lib/forwarded-headers`](../wire/lib/forwarded-headers.ts) (two
+policies, one home): the cloud is a multi-tenant BYOK proxy that must CURATE
+what reaches first-party providers; the local daemon, in front of the user's own
+subscription CLI, passes the originator through.
+
+**The upstream URL is captured, not hardcoded (`auth-config.ts`).** The only
+thing the daemon still captures is the inference URL — it drifts on CLI updates
+(by Claude CLI 2.1.159 the token host had moved `console.anthropic.com` →
+`platform.claude.com`; codex's `/responses` host likewise) and can't be
+hardcoded. The daemon runs the CLI once in headless `exec` mode (`claude -p`,
+`codex exec`, `kimi -p`) pointed at a loopback recorder, reads the exact PATH it
+POSTs to, kills it before anything reaches the vendor (zero token cost), and
+stores ONLY that URL + the CLI version — never an identity-header set to replay.
+`resolveUpstreamUrl` prefers the captured URL and falls back to the retained
+ORIGIN + default path per provider.
+
+**OAuth refresh config is extracted too (`auth-config.ts`).** Refreshing a
+Claude Pro/Max OR Codex/ChatGPT token needs the OAuth `client_id` + token
+endpoint — the vendor's, baked into the CLI binary, and also drift-prone. Rather
+than hand-copy them, `oauthConfig(provider)` scans the installed CLI binary:
+Claude's JS bundle exposes an embedded prod config block
+(`TOKEN_URL:"…/v1/oauth/token" … CLIENT_ID:"<uuid>"`, anchored on the prod host
+so a local/staging dev block can't be picked up); Codex's Rust binary packs
+`REFRESH_TOKEN_URL` + `CLIENT_ID` as separator-less literals (matched at exact
+length + most-frequent pick). A per-provider format guard rejects a
+mis-extracted value. **No hardcoded fallback** (for compliance — a stale literal
+is exactly the drift that bit us): `oauthConfig` serves the freshly-extracted
+value or the last successfully-extracted one cached in `config.ts`, else `null`
+→ the delegate skips refresh (the stale access token then surfaces the vendor's
+own 401 → re-login), never a hardcoded credential. No value is secret (a public
+app id + a published URL) and the binary read stays on-box. The CLI version is
+attached as the `user-agent` on the refresh POST (the one call the daemon
+legitimately makes AS the CLI — CLI meta, used ONLY for refresh).
+
+Both the captured URL + the extracted OAuth config (+ `cli_version` and per-part
+TTL timestamps) persist to ONE consolidated per-provider `config.json` sidecar
+(`<cliRoot>/config.json`, plain JSON). Each part is version-keyed with its own
+24h TTL, re-captured / re-extracted on a CLI version bump or after a re-login
+(`ensureAuthConfig({ force })`). See
+[`delegation-exec-fixtures.md`](../../docs/proposals/delegation-exec-fixtures.md)
+(amended).
 
 Login per provider (the CLI opens the user's browser, the user signs in,
 and the CLI completes via its own localhost callback then exits;

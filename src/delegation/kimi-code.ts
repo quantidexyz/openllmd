@@ -43,11 +43,7 @@ import {
   pendingAuthDetail,
   setPendingAuth,
 } from "../pending-auth";
-import {
-  defaultUpstreamUrl,
-  ensureExecFixture,
-  resolveUpstream,
-} from "./exec-fixture";
+import { ensureAuthConfig, resolveUpstreamUrl } from "./auth-config";
 import type { TProviderDelegate } from "./types";
 import { cliVersion, openUrl, readJsonFile } from "./util";
 
@@ -391,8 +387,9 @@ const startBackgroundLogin = (
         if (loginAborted) return;
         if (res.kind === "success") {
           writeCredential(res.wire);
-          // Re-capture the exec fixture now that the identity is established.
-          void ensureExecFixture(PROVIDER, { force: true }).catch(() => {});
+          // Refresh the auth config (upstream URL) now that the identity is
+          // established. Best-effort + non-blocking.
+          void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
           return;
         }
         if (res.kind === "stop") return;
@@ -673,25 +670,30 @@ export const kimiCodeDelegate: TProviderDelegate = {
     }
   },
 
-  ensureFixture: (opts) => ensureExecFixture(PROVIDER, opts),
-
   credentialForUpstream: async () => {
     const token = await readToken();
     if (token === null) {
       throw new Error("kimi_code: not signed in (no stored credential)");
     }
-    // Serve over the genuine OpenAI-wire `/coding/v1/chat/completions` endpoint
-    // (`defaultUpstreamUrl`) with the real `kimi-code-cli` identity the official
-    // CLI sends — its `user-agent` + `X-Msh-*` device headers. Preferred from the
-    // live exec fixture (captured from `kimi -p ping`); the hand-mirrored
-    // `identityHeaders()` here is the compliant fallback. The walker maps
-    // kimi_code → the `openai` upstream wire (no anthropic-version/-beta, no
-    // forged Claude Code identity).
-    const { url, headers } = await resolveUpstream(PROVIDER, {
-      url: defaultUpstreamUrl(PROVIDER),
+    // Resolve the request TARGET URL — the genuine OpenAI-wire
+    // `/coding/v1/chat/completions` endpoint, captured from `kimi -p ping` (or
+    // the default) — and inject kimi's CREDENTIAL-BINDING identity. Kimi's
+    // managed endpoint binds the token to its kimi-code client identity and
+    // VALIDATES the full `x-msh-*` set + UA on every request (it 403s on any
+    // subset — confirmed live with just device-id/platform/version). The daemon
+    // legitimately holds a kimi-code credential (it ran kimi's OWN device-code
+    // OAuth, registering `x-msh-device-id`), so presenting that identity is
+    // credential-intrinsic, not a forged CLI identity — unlike claude/codex,
+    // kimi's token is unusable without it. These are spread OVER the
+    // originator's headers in the walker, so the kimi-code UA/device identity
+    // wins for this hop. `identityHeaders()` is the same set used for the
+    // device-login + /usages calls.
+    const url = await resolveUpstreamUrl(PROVIDER);
+    return {
+      access_token: token.accessToken,
       headers: await identityHeaders(),
-    });
-    return { access_token: token.accessToken, headers, url };
+      url,
+    };
   },
 
   logout: async () => {
