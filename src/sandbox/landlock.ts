@@ -27,7 +27,7 @@
  * future §3.4 consent grant takes effect via the self-updater's existing
  * drain-and-exit + supervisor relaunch, never by widening a live ruleset.
  */
-import { statSync } from "node:fs";
+import { fstatSync } from "node:fs";
 import { logInfo, logWarn } from "../logger";
 import { DAEMON_VERSION } from "../version";
 import { daemonWorkingSet } from "./working-set";
@@ -303,15 +303,20 @@ const applyInner = async (): Promise<TSandboxState> => {
           // rights — directory-only bits make `add_rule` fail EINVAL, leaving
           // the file ungranted (the `~/.claude.json` failure). `ruleAccessFor`
           // narrows the mask for a file; directories keep the full set.
-          // statSync may throw on a path that raced away post-open — treat as a
-          // directory (the prior behaviour) since the fd is already open.
+          // Classify the OPENED object via `fstatSync(fd)` (not `statSync(path)`)
+          // so a path swapped between open() and the stat can't misclassify the
+          // rule — the fd already references the real object. Fall back to
+          // "directory" (the prior behaviour) if the fstat fails.
           let isFile = false;
           try {
-            isFile = statSync(path).isFile();
+            isFile = fstatSync(fd).isFile();
           } catch {
             isFile = false;
           }
-          const rule = pathBeneathAttr(ruleAccessFor(allowed & handled, isFile), fd);
+          const rule = pathBeneathAttr(
+            ruleAccessFor(allowed & handled, isFile),
+            fd,
+          );
           const rc = Number(
             libc.syscall4(
               SYS_LANDLOCK_ADD_RULE,
