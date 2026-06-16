@@ -156,6 +156,13 @@ export const runIntegration = async (
     proc.exited,
   ]);
   const output = `${out}${err}`.trim();
+  // The captured output is piped into `bash` with `OPENLLM_API_KEY` in its env,
+  // so a script that echoes its env (or a tool that prints the key on error)
+  // could leak it into a tail we PERSIST to openllmd.err.log. Redact the key
+  // before any tail is logged. (The returned `output` for the relay ack is the
+  // raw value — it goes to the dashboard over the authed socket, not to disk.)
+  const redactTail = (s: string): string =>
+    apiKey ? s.split(apiKey).join("[REDACTED_OPENLLM_API_KEY]") : s;
   // A script SIGKILLed by the sandbox produces no useful output + a confusing
   // exit code — name the actual culprit at error level so it lands in
   // openllmd.err.log instead of vanishing.
@@ -163,12 +170,23 @@ export const runIntegration = async (
     logError("integrations", `${action} ${kind} ${slug}: script killed`, {
       signal: proc.signalCode,
       hint: "likely an OS sandbox denial — a path the script writes isn't in the daemon working set",
+      // The captured tail — even on a kill there may be partial output that
+      // names the offending path.
+      output: redactTail(output.slice(-2000)),
+    });
+  } else if (code !== 0) {
+    // A non-zero exit is a script-level failure (a write that EACCES'd, a
+    // missing tool, the script's own error path). Log its captured stdout+stderr
+    // at ERROR level — otherwise the only data point is a bare exit code and the
+    // failure is undiagnosable from the box (the relay ack carries `output`, but
+    // it isn't persisted anywhere). This is how an install/uninstall that exits
+    // 1 surfaces its real reason in openllmd.err.log.
+    logError("integrations", `${action} ${kind} ${slug} failed`, {
+      code,
+      output: redactTail(output.slice(-2000)),
     });
   } else {
-    logInfo("integrations", `${action} ${kind} ${slug}`, {
-      ok: code === 0,
-      code,
-    });
+    logInfo("integrations", `${action} ${kind} ${slug}`, { ok: true, code });
   }
   return {
     ok: code === 0 && proc.signalCode === null,

@@ -30,11 +30,10 @@ import {
   setPendingAuth,
 } from "../pending-auth";
 import {
-  defaultUpstreamUrl,
-  ensureExecFixture,
-  resolveUpstream,
-} from "./exec-fixture";
-import { ensureOAuthConfig } from "./oauth-config";
+  ensureAuthConfig,
+  oauthConfig,
+  resolveUpstreamUrl,
+} from "./auth-config";
 import type { TProviderDelegate } from "./types";
 import {
   cliVersion,
@@ -51,7 +50,7 @@ const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 // — matches codex's own `CHATGPT_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES` (5 min),
 // hiding clock skew and avoiding a guaranteed 401 → refresh → retry. The
 // `client_id` + token endpoint are read from the codex binary, not hardcoded
-// (they drift on CLI updates); see `oauth-config.ts`.
+// (they drift on CLI updates); see `auth-config.ts`.
 const REFRESH_LEEWAY_MS = 5 * 60_000;
 // Hard cap on the token-refresh request so a hung endpoint can't stall the
 // readToken critical path (inference + usage await it).
@@ -161,13 +160,21 @@ const refreshOAuth = async (
 } | null> => {
   try {
     // Read the (drift-prone) endpoint + client id from the codex binary, not a
-    // hardcoded literal. Falls back to current built-in defaults on failure.
-    const { token_url, client_id } = await ensureOAuthConfig(PROVIDER);
+    // hardcoded literal. NULL when extraction failed AND nothing valid is
+    // cached — skip the refresh (no hardcoded fallback); the stale access token
+    // then surfaces the vendor's own 401 → re-login.
+    const cfg = await oauthConfig(PROVIDER);
+    if (cfg === null) return null;
+    const { token_url, client_id } = cfg;
     const resp = await fetch(token_url, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         accept: "application/json",
+        // CLI meta, used ONLY here (the token endpoint is the one call the
+        // daemon legitimately makes AS the CLI). Derived live from the binary.
+        "user-agent": await userAgent(),
+        originator: "codex_cli_rs",
       },
       body: JSON.stringify({
         client_id,
@@ -353,11 +360,10 @@ export const chatgptDelegate: TProviderDelegate = {
       loginInFlight = false;
       if ((await readToken()) !== null) {
         // Device-code lands the credential on THIS box (the user authorized on
-        // another machine, but auth.json is written here) — refresh the genuine
-        // request fixture + OAuth refresh config now, exactly like the browser
-        // `connect` path does. Best-effort + non-blocking.
-        void ensureExecFixture(PROVIDER, { force: true }).catch(() => {});
-        void ensureOAuthConfig(PROVIDER, { force: true }).catch(() => {});
+        // another machine, but auth.json is written here) — refresh the auth
+        // config (upstream URL + OAuth refresh config) now, exactly like the
+        // browser `connect` path does. Best-effort + non-blocking.
+        void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
       } else {
         // The process stays alive polling until the user authorizes; once it
         // exits WITHOUT a stored credential the flow expired / was cancelled /
@@ -467,11 +473,10 @@ export const chatgptDelegate: TProviderDelegate = {
       deviceProcs.delete(proc);
       loginInFlight = false;
       if ((await readToken()) !== null) {
-        // Re-capture the exec fixture + re-extract the OAuth config now that the
-        // identity is established (a CLI update can rotate the token endpoint or
-        // client id). Best-effort + non-blocking.
-        void ensureExecFixture(PROVIDER, { force: true }).catch(() => {});
-        void ensureOAuthConfig(PROVIDER, { force: true }).catch(() => {});
+        // Refresh the auth config now that the identity is established (a CLI
+        // update can rotate the upstream URL, token endpoint, or client id).
+        // Best-effort + non-blocking.
+        void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
       } else {
         // Exited without a credential (expired / cancelled / errored) — drop
         // the stale pending URL so the card stops showing a dead link.
@@ -620,29 +625,21 @@ export const chatgptDelegate: TProviderDelegate = {
     }
   },
 
-  ensureFixture: (opts) => ensureExecFixture(PROVIDER, opts),
-
   credentialForUpstream: async () => {
     const token = await readToken();
     if (token === null) {
       throw new Error("chatgpt: not signed in (no stored credential)");
     }
-    // Prefer the captured exec fixture (the genuine `codex` request); fall back
-    // to the delegate defaults when no fixture exists.
-    const { url, headers } = await resolveUpstream(PROVIDER, {
-      url: defaultUpstreamUrl(PROVIDER),
-      headers: {
-        originator: "codex_cli_rs",
-        "user-agent": await userAgent(),
-      },
-    });
-    // The account id is per-credential — inject the live store's value on top so
-    // a fixture captured under a different/absent account can't pin a stale one.
-    const withAccount =
-      token.accountId !== null
-        ? { ...headers, "chatgpt-account-id": token.accountId }
-        : headers;
-    return { access_token: token.accessToken, headers: withAccount, url };
+    // Resolve only the request TARGET URL (captured from the genuine `codex`
+    // request, or the default). The ONE credential-intrinsic header injected is
+    // `chatgpt-account-id` — the user's OWN account, read from the store, which
+    // routes the request to their subscription (not a synthesized CLI identity).
+    // Everything else (user-agent, originator, …) rides through from the
+    // originator's own request.
+    const url = await resolveUpstreamUrl(PROVIDER);
+    const headers: Record<string, string> =
+      token.accountId !== null ? { "chatgpt-account-id": token.accountId } : {};
+    return { access_token: token.accessToken, headers, url };
   },
 
   cancelConnect: async () => {

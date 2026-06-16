@@ -27,6 +27,7 @@
  * future §3.4 consent grant takes effect via the self-updater's existing
  * drain-and-exit + supervisor relaunch, never by widening a live ruleset.
  */
+import { fstatSync } from "node:fs";
 import { logInfo, logWarn } from "../logger";
 import { DAEMON_VERSION } from "../version";
 import { daemonWorkingSet } from "./working-set";
@@ -47,11 +48,38 @@ const LANDLOCK_RULE_PATH_BENEATH = 1;
 // granted on read-write paths or EVERY cross-directory rename/link is denied
 // (the v1 quirk REFER exists to fix); TRUNCATE (v3) likewise for truncation.
 const ACCESS_FS_EXECUTE = 1n << 0n;
+const ACCESS_FS_WRITE_FILE = 1n << 1n;
 const ACCESS_FS_READ_FILE = 1n << 2n;
 const ACCESS_FS_READ_DIR = 1n << 3n;
 const ACCESS_FS_V1_ALL = 0x1fffn;
 const ACCESS_FS_REFER = 1n << 13n; // ABI v2
 const ACCESS_FS_TRUNCATE = 1n << 14n; // ABI v3
+
+// The ONLY access rights Landlock permits on a rule whose `parent_fd` is a
+// REGULAR FILE (not a directory): execute, read-file, write-file, truncate.
+// Adding ANY directory-only right (read-dir, make/remove-*, refer, …) to a
+// file rule makes `landlock_add_rule` fail EINVAL — which is why the lone
+// regular-file working-set entry (`~/.claude.json`) failed to grant and a
+// confined write to it got EACCES (→ the integration script exits 1). We mask
+// the requested rights down to this set for a file. TRUNCATE is &-ed against
+// `handled` by the caller, so it's only present when the ABI supports it.
+const ACCESS_FS_FILE_MASK =
+  ACCESS_FS_EXECUTE |
+  ACCESS_FS_WRITE_FILE |
+  ACCESS_FS_READ_FILE |
+  ACCESS_FS_TRUNCATE;
+
+/**
+ * The access mask to put on a `path_beneath` rule for one working-set entry.
+ * A regular-FILE rule may carry only file-applicable rights — directory-only
+ * bits make `landlock_add_rule` fail EINVAL (the `~/.claude.json` grant
+ * failure). A directory keeps the full requested set. Pure (no syscalls) so the
+ * file-vs-dir mask decision is unit-testable without a live kernel.
+ */
+export const ruleAccessFor = (
+  requested: bigint,
+  isRegularFile: boolean,
+): bigint => (isRegularFile ? requested & ACCESS_FS_FILE_MASK : requested);
 
 // asm-generic open(2) flags (identical on x86_64 + aarch64).
 const O_PATH = 0o10000000;
@@ -271,7 +299,24 @@ const applyInner = async (): Promise<TSandboxState> => {
         const fd = libc.open(cstr(path), O_PATH | O_CLOEXEC);
         if (fd < 0) continue; // raced away since the existence filter — skip
         try {
-          const rule = pathBeneathAttr(allowed & handled, fd);
+          // A regular-file path_beneath rule may ONLY carry file-applicable
+          // rights — directory-only bits make `add_rule` fail EINVAL, leaving
+          // the file ungranted (the `~/.claude.json` failure). `ruleAccessFor`
+          // narrows the mask for a file; directories keep the full set.
+          // Classify the OPENED object via `fstatSync(fd)` (not `statSync(path)`)
+          // so a path swapped between open() and the stat can't misclassify the
+          // rule — the fd already references the real object. Fall back to
+          // "directory" (the prior behaviour) if the fstat fails.
+          let isFile = false;
+          try {
+            isFile = fstatSync(fd).isFile();
+          } catch {
+            isFile = false;
+          }
+          const rule = pathBeneathAttr(
+            ruleAccessFor(allowed & handled, isFile),
+            fd,
+          );
           const rc = Number(
             libc.syscall4(
               SYS_LANDLOCK_ADD_RULE,

@@ -40,11 +40,10 @@ import {
   setSetupToken,
 } from "../setup-token";
 import {
-  defaultUpstreamUrl,
-  ensureExecFixture,
-  resolveUpstream,
-} from "./exec-fixture";
-import { ensureOAuthConfig } from "./oauth-config";
+  ensureAuthConfig,
+  oauthConfig,
+  resolveUpstreamUrl,
+} from "./auth-config";
 import type { TProviderDelegate } from "./types";
 import {
   cliVersion,
@@ -74,8 +73,9 @@ const OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 //
 // Both values are Anthropic's and DRIFT on CLI updates (the token host moved
 // console.anthropic.com → platform.claude.com), so they are NOT hardcoded
-// here — `ensureOAuthConfig()` reads them from the installed CLI binary
-// (cached, with a current built-in fallback). See `oauth-config.ts`.
+// here — `oauthConfig()` reads them from the installed CLI binary or a valid
+// cache entry; when neither exists, refresh is SKIPPED (no hardcoded fallback).
+// See `auth-config.ts`.
 //
 // Refresh proactively when within this window of expiry (hides clock skew
 // + avoids a guaranteed 401 → refresh → retry on the next call).
@@ -140,13 +140,21 @@ const refreshOAuth = async (
 } | null> => {
   try {
     // Read the (drift-prone) endpoint + client id from the CLI binary, not a
-    // hardcoded literal. Falls back to current built-in defaults on failure.
-    const { token_url, client_id } = await ensureOAuthConfig(PROVIDER);
+    // hardcoded literal. NULL when extraction failed AND nothing valid is
+    // cached — skip the refresh (no hardcoded fallback to fall back to); the
+    // stale access token then surfaces the vendor's own 401 → re-login.
+    const cfg = await oauthConfig(PROVIDER);
+    if (cfg === null) return null;
+    const { token_url, client_id } = cfg;
     const resp = await fetch(token_url, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         accept: "application/json",
+        // CLI meta, used ONLY here (the token endpoint is the one call the
+        // daemon legitimately makes AS the CLI). Derived live from the
+        // installed binary's version.
+        "user-agent": await userAgent(),
       },
       body: JSON.stringify({
         grant_type: "refresh_token",
@@ -435,11 +443,10 @@ export const claudeCodeDelegate: TProviderDelegate = {
     const viaAuth = await authStatusLoggedIn();
     const connected = viaAuth !== null ? viaAuth : (await readToken()) !== null;
     if (connected) {
-      // Re-capture the exec fixture + re-extract the OAuth config now that the
-      // identity / CLI may have changed (account-scoped headers; a CLI update
-      // can rotate the token endpoint or client id). Best-effort + non-blocking.
-      void ensureExecFixture(PROVIDER, { force: true }).catch(() => {});
-      void ensureOAuthConfig(PROVIDER, { force: true }).catch(() => {});
+      // Refresh the auth config now that the identity / CLI may have changed
+      // (a CLI update can rotate the upstream URL, token endpoint, or client
+      // id). Best-effort + non-blocking.
+      void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
       return { connected: true, detail: "signed in via Claude Code" };
     }
     return {
@@ -554,35 +561,25 @@ export const claudeCodeDelegate: TProviderDelegate = {
     }
   },
 
-  ensureFixture: (opts) => ensureExecFixture(PROVIDER, opts),
-
   credentialForUpstream: async () => {
     const token = await readToken();
     if (token === null) {
       throw new Error("claude_code: not signed in (no stored credential)");
     }
-    // Prefer the captured exec fixture (the genuine `claude` request); fall back
-    // to the delegate defaults when no fixture exists. The wire builder still
-    // owns/overrides anthropic-version + the anthropic-beta merge on top.
+    // Resolve only the request TARGET URL (captured from the genuine `claude`
+    // request, or the default). NO identity headers are injected here — the
+    // walker carries the originator's own headers, and the wire builder layers
+    // the OAuth `anthropic-beta` + `anthropic-version` on top (isOAuth). Claude
+    // has no per-credential header to add, so `headers` is empty.
     //
     // Setup-token mode: the token was delivered out-of-band (env / `set-token` /
     // sealed relay), so the isolated CLI is NOT logged in and can't produce a
-    // genuine request — `captureIfMissing: false` serves any pre-existing
-    // fixture (identity-agnostic; the bearer is injected fresh) or the defaults,
-    // without spawning a doomed `claude -p ping` on every inference.
-    const { url, headers } = await resolveUpstream(
-      PROVIDER,
-      {
-        url: defaultUpstreamUrl(PROVIDER),
-        headers: {
-          "anthropic-beta": OAUTH_BETA,
-          "anthropic-version": "2023-06-01",
-          "user-agent": await userAgent(),
-        },
-      },
-      { captureIfMissing: !hasSetupToken(PROVIDER) },
-    );
-    return { access_token: token.accessToken, headers, url };
+    // genuine request — `captureIfMissing: false` serves any stored URL or the
+    // default, without spawning a doomed `claude -p ping` on every inference.
+    const url = await resolveUpstreamUrl(PROVIDER, {
+      captureIfMissing: !hasSetupToken(PROVIDER),
+    });
+    return { access_token: token.accessToken, headers: {}, url };
   },
 
   logout: async () => {
