@@ -104,6 +104,19 @@ export const daemonWorkingSet = (): TWorkingSet => {
   // so granting global /tmp would leak access to every other process's temp
   // files. Instead we create and use our own isolated temp under stateDir.
   const daemonTmp = daemonTempDir();
+  // The integration scripts' staging dir ($HOME/.cache/openllm — see the grant
+  // below). PRE-CREATE it (best-effort) so the grant lands on the real leaf:
+  // `existing()` deliberately refuses to climb to bare $HOME, so on a fresh box
+  // where ~/.cache itself is absent the leaf would otherwise stay ungranted and
+  // the confined script's first mktemp would still EACCES. Mirrors how
+  // `daemonTempDir()` pre-creates the daemon tmp above.
+  const integrationTmp = join(home, ".cache", "openllm");
+  try {
+    mkdirSync(integrationTmp, { recursive: true, mode: 0o700 });
+  } catch {
+    // Best-effort — if creation fails, `existing()` still climbs to whatever
+    // ancestor DOES exist (or returns the leaf, which fails to grant safely).
+  }
   const readWrite = new Set<string>([
     // The whole state dir: daemon.env (config + key + device id) + logs + isolated CLI roots
     // (`cli/<provider>/{home,bin}` all nest under it — see `cli-paths.ts`)
@@ -130,6 +143,15 @@ export const daemonWorkingSet = (): TWorkingSet => {
     //   the user-level bin dir: the `openllmd` PATH symlink AND where the
     //   non-isolated `claude install` drops its launcher.
     join(home, ".local", "bin"),
+    //   the integration scripts' OWN staging dir: the shared script preamble
+    //   (`packages/api/lib/scripts.ts` `pick_tmpdir`) points TMPDIR at
+    //   `$HOME/.cache/openllm` (the root fs, to dodge the small /tmp tmpfs on
+    //   cloud images), and EVERY install/uninstall does its `mktemp` +
+    //   download/extract there. Without this grant a confined integration's
+    //   first `mktemp` EACCESes → the `set -e` script exits 1 (the EC2
+    //   install/uninstall failure). Pre-created above so the grant lands on the
+    //   real leaf even when ~/.cache didn't previously exist.
+    integrationTmp,
     // Daemon-owned temp directory (NOT global /tmp). Vendor install scripts
     // stage downloads here. Created above with 0o700 so it's isolated.
     daemonTmp,
