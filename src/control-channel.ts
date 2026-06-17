@@ -34,7 +34,7 @@ const LIVENESS_TIMEOUT_MS = 70_000;
 // the whole fleet re-dials in lockstep and stampedes the successor box. Add up to
 // this much random delay before a RE-dial (gated on `hasConnected`, so the first
 // connect stays immediate). Small vs the 35s presence grace, so it never surfaces
-// as a flap. See `packages/audit/presence-reconnect-prior-art.md` §3.
+// as a flap. See `docs/audit/presence-reconnect-prior-art.md` §3.
 const RECONNECT_JITTER_MS = 3_000;
 
 const sleep = (ms: number): Promise<void> =>
