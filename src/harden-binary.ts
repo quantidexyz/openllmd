@@ -22,7 +22,12 @@ export const hardenMacBinary = (path: string): void => {
     // no quarantine xattr / xattr unavailable — fine
   }
   try {
-    execFileSync("codesign", ["--verify", "--quiet", path], {
+    // NOTE: `codesign --verify` takes NO `--quiet` flag — macOS 15 rejects it
+    // ("unrecognized option '--quiet'", rc=2). Passing it made `--verify`
+    // always throw → the binary was treated as unsigned and re-signed on every
+    // start/self-update, defeating the "preserve a valid signature" intent.
+    // `stdio: "ignore"` already suppresses output.
+    execFileSync("codesign", ["--verify", path], {
       stdio: "ignore",
     });
     return; // already validly signed — don't disturb it
