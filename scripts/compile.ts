@@ -22,10 +22,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { $ } from "bun";
-// The DAEMON's own version (release-stamped here), NOT the root/cloud version —
-// `bun daemon:build` must bake the daemon's actual version so a local build
-// reports it (e.g. 1.3.7-alpha.3), not the lagging root app version (1.3.6).
-import daemonPkg from "../package.json" with { type: "json" };
 
 const ENTRY = "packages/daemon/src/main.ts";
 const OUT_DIR = "packages/daemon/dist";
@@ -41,15 +37,15 @@ const TARGETS = [
 const argv = process.argv.slice(2);
 const hostOnly = argv.includes("--host");
 const versionIdx = argv.indexOf("--version");
-// Default to the DAEMON package's version so every binary carries a real,
-// release-tracking version (surfaced in `/status` + bumped per release) — this
-// is how a mixed fleet is told apart, and why `bun daemon:build` reports the
-// daemon's actual version, not the lagging root app version. `--version`
-// overrides for one-offs (the release CLI passes the resolved tag).
+// The daemon has ONE version identity: the app/manifest tag the release CLI
+// passes via `--version` (commands/daemon.ts always passes it). There is no
+// separate daemon version number — a source build with no `--version` (e.g.
+// `bun daemon:build`) bakes the `"0.0.0-dev"` sentinel, which the runtime's
+// dev guards (self-update / sandbox / service registration) key on to skip
+// production behaviour. The vestigial `package.json` version was overwritten at
+// build and only ever disagreed with the pin, so it is no longer read here.
 const version =
-  versionIdx >= 0
-    ? (argv[versionIdx + 1] ?? daemonPkg.version)
-    : daemonPkg.version;
+  versionIdx >= 0 ? (argv[versionIdx + 1] ?? "0.0.0-dev") : "0.0.0-dev";
 
 const outfileFor = (target: string): string => {
   const suffix = target.replace(/^bun-/, "");
