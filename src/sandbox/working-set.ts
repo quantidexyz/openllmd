@@ -29,9 +29,13 @@
  *     - `~/.ssh`, `~/.aws`, `~/.gnupg`, the user's real `~/.codex` /
  *       `~/.kimi-code`, browser profiles, documents.
  *
- * Note `/tmp` is granted read-write: vendor install scripts stage downloads
- * there, and the systemd layer gives the service a PRIVATE `/tmp` anyway
- * (`PrivateTmp=yes`).
+ * Note the system `/tmp` is deliberately NOT granted (granting it would leak
+ * every other process's temp files — and the user unit no longer sets
+ * `PrivateTmp=yes`, which broke `--user` units). Instead the daemon owns
+ * `<state>/tmp` (`daemonTempDir()`, granted as part of the state dir) and
+ * points every isolated CLI's `TMPDIR` at it (`cli-paths.ts` `cliEnv`), so the
+ * codex/kimi installers' `mktemp -d` stages inside the working set rather than
+ * EACCESing on the ungranted `/tmp`.
  */
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";

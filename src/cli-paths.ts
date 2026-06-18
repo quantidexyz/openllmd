@@ -15,6 +15,7 @@
 import { join } from "node:path";
 import type { TSubscriptionProviderSlug } from "@quantidexyz/openllmp";
 import { stateDir } from "./env";
+import { daemonTempDir } from "./sandbox/working-set";
 
 /** The providers with an isolated CLI — exactly the closed
  *  `SubscriptionProviderSlug` vocabulary of the control schema, so a slug
@@ -75,15 +76,28 @@ export const cliConfigDir = (provider: TCliProvider): string => {
  * binary + state, and is the floor for the others). Codex/Kimi also get
  * their explicit install-dir + home knobs and PATH-edit suppression so
  * the installer doesn't touch the user's shell profiles.
+ *
+ * ALL three additionally get `TMPDIR` pointed at the daemon-owned temp dir
+ * (`<state>/tmp`). The OS sandbox (`./sandbox/working-set.ts`) does NOT grant
+ * the system `/tmp` — only `<state>/tmp`. The codex + kimi vendor installers
+ * stage their download/extract in `mktemp -d`, which falls back to `/tmp`
+ * when `TMPDIR` is unset; under the sandbox that first `mktemp -d` EACCESes
+ * and the `set -e` script exits with no binary. (Claude was unaffected: its
+ * installer stages under `$HOME`, already granted.) Pinning `TMPDIR` at the
+ * granted daemon temp dir keeps every isolated spawn's temp inside the
+ * working set, so the install lands the binary on a remote/sandboxed box too.
  */
 export const cliEnv = (provider: TCliProvider): Record<string, string> => {
   const home = cliHome(provider);
   const root = cliRoot(provider);
   const config = cliConfigDir(provider);
+  // The daemon-owned, sandbox-granted staging dir for `mktemp -d` (see above).
+  const tmp = daemonTempDir();
   switch (provider) {
     case "claude_code":
       return {
         HOME: home,
+        TMPDIR: tmp,
         // Claude reads its config/credentials from CLAUDE_CONFIG_DIR
         // (defaults to $HOME/.claude); pin it to the isolated home so
         // login/status/usage all use it, never the user's.
@@ -92,6 +106,7 @@ export const cliEnv = (provider: TCliProvider): Record<string, string> => {
     case "chatgpt":
       return {
         HOME: home,
+        TMPDIR: tmp,
         CODEX_HOME: config,
         CODEX_INSTALL_DIR: join(root, "bin"),
         // Skip interactive prompts during the scripted install.
@@ -100,6 +115,7 @@ export const cliEnv = (provider: TCliProvider): Record<string, string> => {
     case "kimi_code":
       return {
         HOME: home,
+        TMPDIR: tmp,
         KIMI_CODE_HOME: config,
         KIMI_INSTALL_DIR: root,
         // Don't edit the user's shell rc files.
