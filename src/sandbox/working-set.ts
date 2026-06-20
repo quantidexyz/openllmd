@@ -39,8 +39,9 @@
  */
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { stateDir } from "../env";
+import { DAEMON_VERSION } from "../version";
 
 export type TWorkingSet = {
   /** Paths (recursive) the daemon and its children may read AND write. */
@@ -56,21 +57,25 @@ export type TWorkingSet = {
  *  bootstrap targets like ~/.claude that don't yet exist, this walks up to the
  *  existing parent (e.g. ~/.local/) and grants that, letting the install mkdir.
  *
- *  SECURITY: stops at the user's home directory and returns the original path
- *  unchanged when the target doesn't exist and would climb to or above home.
- *  This prevents widening grants to the entire home directory when a bootstrap
- *  target is missing — callers must pre-create bootstrap targets or handle the
- *  grant failure. */
+ *  SECURITY: stops at the user's home directory AND at the filesystem root,
+ *  returning the original path unchanged when the target doesn't exist and
+ *  would climb to or above either. This prevents widening grants to the entire
+ *  home directory — or the entire filesystem — when a bootstrap or system
+ *  target is missing (e.g. `/lib64`, absent on arm64 Linux, would otherwise
+ *  climb to `/` and grant the whole root tree). Callers must pre-create
+ *  bootstrap targets or handle the grant failure. */
 const existing = (paths: readonly string[]): string[] => {
   const home = homedir();
   return paths.map((p) => {
     let candidate = p;
     while (candidate !== "/" && !existsSync(candidate)) {
       const parent = dirname(candidate);
-      // Stop climbing at home: do NOT return home as the granted ancestor when
-      // the original target didn't exist. Return the original path instead so
-      // callers can pre-create it or handle the missing grant.
-      if (parent === home && candidate !== home) {
+      // Stop climbing at home OR root: do NOT return home (or `/`) as the
+      // granted ancestor when the original target didn't exist — that would
+      // widen the grant to the whole home tree or the entire filesystem.
+      // Return the original path instead so callers can pre-create it or handle
+      // the missing grant.
+      if ((parent === home || parent === "/") && candidate !== home) {
         return p; // original path (non-existent, will fail to grant)
       }
       candidate = parent;
@@ -167,6 +172,21 @@ export const daemonWorkingSet = (): TWorkingSet => {
     "/dev",
   ]);
   const readOnly = new Set<string>([
+    // ── Dev-source-only grant (NEVER the shipped binary) ───────────────
+    // A source/dev run executes `bun packages/daemon/src/main.ts`, so the
+    // runtime must READ the repo's `.ts` sources + hoisted `node_modules`
+    // (e.g. `effect`) at import time. Landlock is a strict read-WHITELIST
+    // (unlike macOS Seatbelt, whose reads are open), so the repo root must be
+    // granted or the from-source daemon can't load its own modules under
+    // confinement. The COMPILED binary (`DAEMON_VERSION !== "0.0.0-dev"`) is
+    // a self-contained executable in the state dir, needs no source tree, and
+    // gets NO such grant — production confinement is unchanged. The repo root
+    // is derived from this module's own location, so it's correct regardless
+    // of the daemon's cwd, and it's disjoint from `$HOME` secrets like
+    // `~/.ssh`, so the confinement guarantee still holds.
+    ...(DAEMON_VERSION === "0.0.0-dev"
+      ? [resolve(import.meta.dir, "..", "..", "..", "..")]
+      : []),
     // Toolchain + loaders for spawned children (bash, curl, vendor CLIs).
     "/usr",
     "/lib",
