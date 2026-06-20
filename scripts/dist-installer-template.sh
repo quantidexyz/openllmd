@@ -17,9 +17,11 @@
 # Both are optional when ~/.openllm/daemon.env already exists — its values are
 # reused. OPENLLM_CLOUD_ORIGIN otherwise defaults to __CLOUD_DEFAULT__.
 #
-# NOTE: with a reachable cloud the daemon's self-update may later replace this
-# binary with the published release. To exercise THIS binary in isolation, point
-# GATEWAY_ORIGIN at a staging or unreachable origin.
+# NOTE: a dist install DISABLES daemon self-update by default, so a reachable
+# cloud pinned to a different (or lower) release can't overwrite this locally-
+# built binary — it's stamped with the app version, not the cloud's published
+# daemon version. Re-enable by running with OPENLLM_DAEMON_AUTO_UPDATE=1, or
+# later via `openllmd auto-update on`.
 # ============================================================================
 set -euo pipefail
 
@@ -110,6 +112,26 @@ export USAGE_URL="${USAGE_URL:-}"
 if [ -z "$API_KEY" ]; then
   echo "Note: no OPENLLM_API_KEY set and none in daemon.env — the daemon will install and run locally but won't pair with a cloud." >&2
 fi
+
+# --- disable daemon self-update for this dist install (default) --------------
+# A dist binary is stamped with the app's package.json version, NOT the cloud's
+# published daemon release; if the reachable cloud is pinned to a different (or
+# lower) version, the daemon's automatic self-update would OVERWRITE this just-
+# installed local binary on its first tick. Persist the opt-out flag (the exact
+# file `openllmd auto-update off` writes — it WINS over the env default) BEFORE
+# the embedded installer runs `openllmd start`, so it's in effect before the
+# first self-update check. Opt back in with OPENLLM_DAEMON_AUTO_UPDATE=1.
+case "${OPENLLM_DAEMON_AUTO_UPDATE:-}" in
+  1 | true)
+    echo "OPENLLM_DAEMON_AUTO_UPDATE set — leaving daemon self-update ENABLED." >&2
+    ;;
+  *)
+    mkdir -p "$HOME/.openllm"
+    printf '0' > "$HOME/.openllm/auto-update"
+    chmod 0600 "$HOME/.openllm/auto-update" 2>/dev/null || true
+    echo "Disabled daemon self-update for this dist install (re-enable: openllmd auto-update on)." >&2
+    ;;
+esac
 
 _openllmd_dist_cleanup() { rm -rf "$OPENLLMD_DIST_WORK"; }
 trap _openllmd_dist_cleanup EXIT

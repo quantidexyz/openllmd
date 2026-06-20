@@ -28,7 +28,11 @@
  * Note: `compile.ts` bakes `0.0.0-dev` when given no `--version`, and
  * `openllmd start` REFUSES a dev build (service.ts) — so this always stamps a
  * real version (default: the root package.json version) or the embedded
- * installer's `openllmd start` step would abort.
+ * installer's `openllmd start` step would abort. Because that version is the
+ * APP's (not the cloud's published daemon version), the emitted installer also
+ * DISABLES daemon self-update by default, so a reachable cloud on a different
+ * release can't overwrite the locally-built binary (override with
+ * OPENLLM_DAEMON_AUTO_UPDATE=1 when running the installer).
  */
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
