@@ -117,19 +117,18 @@ fi
 # A dist binary is stamped with the app's package.json version, NOT the cloud's
 # published daemon release; if the reachable cloud is pinned to a different (or
 # lower) version, the daemon's automatic self-update would OVERWRITE this just-
-# installed local binary on its first tick. Persist the opt-out flag (the exact
-# file `openllmd auto-update off` writes — it WINS over the env default) BEFORE
-# the embedded installer runs `openllmd start`, so it's in effect before the
-# first self-update check. Opt back in with OPENLLM_DAEMON_AUTO_UPDATE=1.
-case "${OPENLLM_DAEMON_AUTO_UPDATE:-}" in
-  1 | true)
-    echo "OPENLLM_DAEMON_AUTO_UPDATE set — leaving daemon self-update ENABLED." >&2
+# installed local binary on its first tick. Default the opt-out and EXPORT it:
+# the embedded installer's `openllmd start` persists OPENLLM_DAEMON_AUTO_UPDATE
+# into daemon.env BEFORE the service first boots (see service.ts), so it's in
+# effect before the first self-update check — no separate flag file. Opt back in
+# by running with OPENLLM_DAEMON_AUTO_UPDATE=1.
+export OPENLLM_DAEMON_AUTO_UPDATE="${OPENLLM_DAEMON_AUTO_UPDATE:-0}"
+case "$OPENLLM_DAEMON_AUTO_UPDATE" in
+  0 | false)
+    echo "Daemon self-update DISABLED for this dist install (re-enable: openllmd auto-update on)." >&2
     ;;
   *)
-    mkdir -p "$HOME/.openllm"
-    printf '0' > "$HOME/.openllm/auto-update"
-    chmod 0600 "$HOME/.openllm/auto-update" 2>/dev/null || true
-    echo "Disabled daemon self-update for this dist install (re-enable: openllmd auto-update on)." >&2
+    echo "OPENLLM_DAEMON_AUTO_UPDATE=$OPENLLM_DAEMON_AUTO_UPDATE — leaving daemon self-update enabled." >&2
     ;;
 esac
 

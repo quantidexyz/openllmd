@@ -26,6 +26,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { setAutoUpdate } from "./auto-update-pref";
 import { daemonEnv, envFilePath, stateDir, writeEnvFileVars } from "./env";
 import { hardenMacBinary } from "./harden-binary";
 import { DAEMON_VERSION } from "./version";
@@ -328,6 +329,14 @@ export const serviceStart = (): void => {
   }
   const binPath = process.execPath;
   writeEnvFileIfNeeded();
+  // An explicit OPENLLM_DAEMON_AUTO_UPDATE at registration is persisted to
+  // daemon.env BEFORE the service first boots — so a `daemon:dist` install that
+  // sets it `0` can't be clobbered by a self-update on the daemon's first tick.
+  // Mirrors how writeEnvFileIfNeeded persists an explicit cloud-origin/port.
+  const autoUpdateEnv = process.env.OPENLLM_DAEMON_AUTO_UPDATE;
+  if (autoUpdateEnv !== undefined) {
+    setAutoUpdate(autoUpdateEnv !== "0" && autoUpdateEnv !== "false");
+  }
   hardenMacBinary(binPath); // arm64 SIGKILLs an unsigned binary launchd spawns
   if (isMac) startMac(binPath);
   else startLinux(binPath);

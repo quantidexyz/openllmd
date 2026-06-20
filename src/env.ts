@@ -26,9 +26,14 @@
  *                            no separate control token at this stage.
  * - `OPENLLM_DAEMON_STATE_DIR` — where daemon.env + state live
  *                            (default `~/.openllm`).
+ * - `OPENLLM_DAEMON_AUTO_UPDATE` — self-update opt-out flag (`1`/`0`,
+ *                            default ON). Read/written by
+ *                            `auto-update-pref.ts`; lives here so ALL daemon
+ *                            config is in the one file.
  *
- * Legacy standalone `api-key` / `device-id` files (pre-single-file
- * installs) are migrated INTO daemon.env on first read and then removed.
+ * Legacy standalone `api-key` / `device-id` / `auto-update` files
+ * (pre-single-file installs) are migrated INTO daemon.env and then removed —
+ * lazily on first read, and proactively at boot via `migrateLegacyConfig`.
  */
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -102,7 +107,7 @@ export const envFilePath = (): string =>
  * `bun dev:daemon` rely on this read to load it. No-op when the file is
  * missing. Synchronous (boot-time, before anything reads env).
  */
-const loadEnvFile = (): void => {
+export const loadEnvFile = (): void => {
   let text: string;
   try {
     text = readFileSync(envFilePath(), "utf-8");

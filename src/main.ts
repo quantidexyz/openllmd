@@ -20,6 +20,7 @@
  * This file is compiled into a source-free standalone binary with
  * `bun build --compile --minify --bytecode` (see scripts/compile.ts).
  */
+import { migrateLegacyAutoUpdate } from "./auto-update-pref";
 import { runCli } from "./cli";
 import { getCloudState, latestVersion, refreshBootstrap } from "./config";
 import {
@@ -53,6 +54,11 @@ const main = async (): Promise<void> => {
   // `daemonPort()` loads the env file, so the kill-switch / opt-in vars are
   // resolved before the sandbox decision.
   const port = daemonPort();
+
+  // Fold any pre-`daemon.env` legacy config into the single config file (and
+  // remove the stray files) before anything reads it — the `auto-update` flag
+  // here; `api-key` / `device-id` migrate lazily in env.ts on first read.
+  migrateLegacyAutoUpdate();
 
   // OS sandbox (Linux Landlock / macOS Seatbelt — see `sandbox/landlock.ts`'s
   // `applyDaemonSandbox` dispatcher): confine this process + every child it
