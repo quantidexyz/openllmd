@@ -19,8 +19,10 @@
  *   bun run daemon:dist -- --version 1.2.3    # stamp a specific version
  *   bun run daemon:dist -- --target linux-x64 # only wrap one target (still builds all)
  *
- * Run an emitted installer on a target box:
- *   GATEWAY_ORIGIN=https://your-cloud API_KEY=sk-llm-... \
+ * Run an emitted installer on a target box (OPENLLM_* names match the real
+ * install + daemon.env; both are reused from an existing ~/.openllm/daemon.env
+ * when present, so a re-run needs neither):
+ *   OPENLLM_CLOUD_ORIGIN=https://your-cloud OPENLLM_API_KEY=sk-llm-... \
  *     bash packages/daemon/dist/openllmd-<target>.install.sh
  *
  * Note: `compile.ts` bakes `0.0.0-dev` when given no `--version`, and
@@ -130,7 +132,7 @@ const main = async (): Promise<void> => {
     `\nEmitted ${wrapTargets.length} self-contained installer(s) → ${DIST_DIR}`,
   );
   console.log(
-    "Run on a target machine:\n  GATEWAY_ORIGIN=https://your-cloud API_KEY=sk-llm-... \\\n    bash openllmd-<target>.install.sh",
+    "Run on a target machine (reuses ~/.openllm/daemon.env when present):\n  OPENLLM_CLOUD_ORIGIN=https://your-cloud OPENLLM_API_KEY=sk-llm-... \\\n    bash openllmd-<target>.install.sh",
   );
 };
 

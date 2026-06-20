@@ -12,9 +12,10 @@
 # install to ~/.openllm/bin, PATH symlink, daemon.env, macOS codesign,
 # `openllmd start`, shell completion — runs EXACTLY as in production.
 #
-# Usage on a __TARGET__ machine:
-#   GATEWAY_ORIGIN=https://your-cloud API_KEY=sk-llm-... bash "$0"
-# GATEWAY_ORIGIN defaults to __CLOUD_DEFAULT__; set API_KEY to pair with a cloud.
+# Usage on a __TARGET__ machine (env names match the real install + daemon.env):
+#   OPENLLM_CLOUD_ORIGIN=https://your-cloud OPENLLM_API_KEY=sk-llm-... bash "$0"
+# Both are optional when ~/.openllm/daemon.env already exists — its values are
+# reused. OPENLLM_CLOUD_ORIGIN otherwise defaults to __CLOUD_DEFAULT__.
 #
 # NOTE: with a reachable cloud the daemon's self-update may later replace this
 # binary with the published release. To exercise THIS binary in isolation, point
@@ -81,12 +82,33 @@ export OPENLLMD_DIST_REALPATH="$PATH"
 export OPENLLMD_DIST_PAYLOAD="$OPENLLMD_DIST_WORK/payload"
 export PATH="$OPENLLMD_DIST_WORK/shim:$PATH"
 
-# --- env the real install.sh expects from the setup wrapper -----------------
-export GATEWAY_ORIGIN="${GATEWAY_ORIGIN:-__CLOUD_DEFAULT__}"
-export API_KEY="${API_KEY:-}"
+# --- credentials: same OPENLLM_* names as the real install + daemon.env ------
+# The production setup flow pipes the key as OPENLLM_API_KEY (the daemon's
+# config_var) and the daemon boots from OPENLLM_CLOUD_ORIGIN; accept the SAME
+# names here. Precedence:
+#   1. an explicit OPENLLM_* value in the environment;
+#   2. the value already in ~/.openllm/daemon.env (re-run / re-pair in place);
+#   3. the baked default origin (the key stays empty if nothing supplies it).
+# install.sh always reads/writes $HOME/.openllm/daemon.env, so reuse from there;
+# install.sh itself separately preserves the minted OPENLLM_DEVICE_ID.
+OPENLLMD_DIST_ENV_FILE="$HOME/.openllm/daemon.env"
+_openllmd_dist_reuse() {  # $1=key → its value in the existing daemon.env (or "")
+  [ -f "$OPENLLMD_DIST_ENV_FILE" ] || return 0
+  grep -E "^$1=" "$OPENLLMD_DIST_ENV_FILE" 2>/dev/null | head -n1 | cut -d= -f2- || true
+}
+if [ -f "$OPENLLMD_DIST_ENV_FILE" ]; then
+  echo "Found existing $OPENLLMD_DIST_ENV_FILE — reusing its OPENLLM_CLOUD_ORIGIN + OPENLLM_API_KEY where not overridden." >&2
+fi
+OPENLLM_CLOUD_ORIGIN="${OPENLLM_CLOUD_ORIGIN:-$(_openllmd_dist_reuse OPENLLM_CLOUD_ORIGIN)}"
+OPENLLM_API_KEY="${OPENLLM_API_KEY:-$(_openllmd_dist_reuse OPENLLM_API_KEY)}"
+OPENLLM_CLOUD_ORIGIN="${OPENLLM_CLOUD_ORIGIN:-__CLOUD_DEFAULT__}"
+
+# Map the OPENLLM_* inputs onto the names the embedded install.sh consumes.
+export GATEWAY_ORIGIN="$OPENLLM_CLOUD_ORIGIN"
+export API_KEY="$OPENLLM_API_KEY"
 export USAGE_URL="${USAGE_URL:-}"
 if [ -z "$API_KEY" ]; then
-  echo "Note: API_KEY is empty — the daemon will install and run locally but won't pair with a cloud." >&2
+  echo "Note: no OPENLLM_API_KEY set and none in daemon.env — the daemon will install and run locally but won't pair with a cloud." >&2
 fi
 
 _openllmd_dist_cleanup() { rm -rf "$OPENLLMD_DIST_WORK"; }
