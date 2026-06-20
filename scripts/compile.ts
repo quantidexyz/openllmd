@@ -40,7 +40,8 @@ const versionIdx = argv.indexOf("--version");
 // The daemon has ONE version identity: the app/manifest tag the release CLI
 // passes via `--version` (commands/daemon.ts always passes it). There is no
 // separate daemon version number — a source build with no `--version` (e.g.
-// `bun daemon:build`) bakes the `"0.0.0-dev"` sentinel, which the runtime's
+// `bun run --cwd packages/daemon compile:host`) bakes the `"0.0.0-dev"`
+// sentinel, which the runtime's
 // dev guards (self-update / sandbox / service registration) key on to skip
 // production behaviour. The vestigial `package.json` version was overwritten at
 // build and only ever disagreed with the pin, so it is no longer read here.

@@ -12,9 +12,7 @@
   },
   "scripts": {
     "compile": "bun scripts/compile.ts",
-    "compile:host": "bun scripts/compile.ts --host",
-    "install:local": "bun scripts/install-local.ts",
-    "uninstall:local": "bun scripts/install-local.ts --uninstall"
+    "compile:host": "bun scripts/compile.ts --host"
   },
   "dependencies": {
     "@quantidexyz/openllmp": "workspace:*",

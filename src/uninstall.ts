@@ -1,7 +1,7 @@
 /**
  * `openllmd uninstall` — completely remove the OpenLLM daemon from this
- * machine. The inverse of `packages/setup/daemon/install.sh` +
- * `scripts/install-local.ts`: it leaves NOTHING behind.
+ * machine. The inverse of `packages/setup/daemon/install.sh`: it leaves
+ * NOTHING behind.
  *
  * Order matters — we STOP the self-restoring service FIRST (so launchd /
  * systemd can't relaunch the daemon mid-teardown), then delete state:

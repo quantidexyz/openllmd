@@ -19,7 +19,8 @@
  * The service runs `process.execPath` — the compiled binary that invoked
  * `start`. Running `start` from a source checkout (`bun src/main.ts start`,
  * reported as `0.0.0-dev`) would register `bun` as the service, so it's
- * refused; use the compiled binary (`bun run daemon:install`).
+ * refused; install + run the compiled binary (`bun run daemon:dist` then
+ * `bun run daemon:dist:install`).
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -321,7 +322,7 @@ export const serviceStart = (): void => {
   if (DAEMON_VERSION === "0.0.0-dev") {
     process.stderr.write(
       "refusing to register a service from a source run.\n" +
-        "Build + install the compiled binary first: bun run daemon:install\n",
+        "Build + install the compiled binary first: bun run daemon:dist && bun run daemon:dist:install\n",
     );
     process.exit(2);
   }

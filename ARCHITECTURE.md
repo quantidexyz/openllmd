@@ -49,7 +49,8 @@ cloud at runtime** (not compiled in) to keep the closure clean.
 daemon/
   index.ts                  re-exports
   scripts/compile.ts        bun build --compile --minify --bytecode (4 targets)
-  scripts/install-local.ts  build host binary + install locally (no release)
+  scripts/dist.ts           compile + emit a self-contained installer per target (daemon:dist)
+  scripts/dist-install.ts   run an emitted installer by target on this host (daemon:dist:install)
   src/
     main.ts                 boot: runCli() dispatch, else refresh bootstrap → Bun.serve(127.0.0.1)
     cli.ts                  `openllmd <cmd>` dispatch (start/stop/status/restart/skill/plugin/setup/auto-update/uninstall/set-token/completion/help)
@@ -530,12 +531,16 @@ The CLI surface is defined once in `src/commands.ts` (consumed by both
 `cli.ts`'s help and `completion.ts`). See
 [`daemon-self-managing-cli.md`](../../docs/proposals/daemon-self-managing-cli.md).
 
-**Local install without a release.** `scripts/install-local.ts` (run via
-`bun run daemon:install` from the repo root, or `daemon:uninstall` to
-reverse) compiles the host binary, drops it under `~/.openllm/bin/openllmd`,
-symlinks it onto `PATH`, and hands off to `openllmd start` — the same flow
-`install.sh` runs, but from source. `OPENLLM_CLOUD_ORIGIN=… bun run
-daemon:install` bakes a dev cloud origin in.
+**Local install without a release.** `scripts/dist.ts` (`bun run daemon:dist`)
+compiles all four targets and emits a self-contained installer per target —
+the real `packages/setup/daemon/install.sh` embedded verbatim with the
+locally-built binary appended, so the produced `openllmd-<target>.install.sh`
+replicates the exact production install flow offline. `scripts/dist-install.ts`
+(`bun run daemon:dist:install -- <target>`, default: this host) runs the
+emitted installer without copying a dist path. Credentials use the same
+OpenLLM-prefixed env as the real install — `OPENLLM_CLOUD_ORIGIN` +
+`OPENLLM_API_KEY` — and an existing `~/.openllm/daemon.env` is reused when
+present (a re-run re-pairs in place; the minted `OPENLLM_DEVICE_ID` is kept).
 
 ## Layering rules
 

@@ -1,6 +1,6 @@
 /**
- * macOS binary hardening — shared by the service registrar (`service.ts`),
- * the local installer (`scripts/install-local.ts`), and self-update.
+ * macOS binary hardening — shared by the service registrar (`service.ts`) and
+ * self-update. (The setup installer does its own `codesign` in shell.)
  *
  * The released (and especially cross-compiled) binaries are unnotarized and
  * not even ad-hoc signed, so on Apple Silicon the kernel SIGKILLs the Mach-O
