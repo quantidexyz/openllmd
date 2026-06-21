@@ -34,6 +34,12 @@ import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
 import { logError, logInfo } from "../logger";
 import {
+  clearPendingAuth,
+  getPendingAuth,
+  pendingAuthDetail,
+  setPendingAuth,
+} from "../pending-auth";
+import {
   hasSetupToken,
   loadSetupToken,
   SETUP_TOKEN_RE,
@@ -45,6 +51,7 @@ import {
   resolveUpstreamUrl,
 } from "./auth-config";
 import type { TProviderDelegate } from "./types";
+import type { THeadlessLogin } from "./util";
 import {
   cliVersion,
   ensureIsolatedKeychain,
@@ -52,6 +59,7 @@ import {
   readIsolatedKeychain,
   readJsonFile,
   runCapture,
+  spawnHeadlessLogin,
   spawnLogin,
   spawnLoginPty,
   stripAnsi,
@@ -87,6 +95,11 @@ const REFRESH_FETCH_TIMEOUT_MS = 10_000;
 // Run the isolated `claude` binary with its isolated home/config env.
 const bin = (): string => cliBin(PROVIDER);
 const env = (): Record<string, string> => cliEnv(PROVIDER);
+
+// A live headless paste-back login (remote box): the spawned `claude auth login`
+// is held open on a writable stdin until the user pastes the code (or cancels /
+// it expires). Single-flight — one in-flight login per daemon at a time.
+let inFlightLogin: THeadlessLogin | null = null;
 
 type TClaudeOAuth = {
   readonly accessToken?: string;
@@ -395,6 +408,11 @@ export const claudeCodeDelegate: TProviderDelegate = {
     // when it's unavailable / unparseable.
     const viaAuth = await authStatusLoggedIn();
     const connected = viaAuth !== null ? viaAuth : (await readToken()) !== null;
+    // A live headless paste-back login (remote box) awaiting the user's code:
+    // surface the authorize URL + paste mode so the dashboard renders the
+    // paste panel; drop it the moment the credential lands.
+    if (connected) clearPendingAuth(PROVIDER);
+    const pending = connected ? null : getPendingAuth(PROVIDER);
     return {
       provider: PROVIDER,
       connected,
@@ -402,7 +420,16 @@ export const claudeCodeDelegate: TProviderDelegate = {
       ...(version !== null ? { cli_version: version } : {}),
       ...(connected
         ? { auth_mode: "login" as const, last_login_at_ms: null }
-        : { detail: "claude CLI installed but not signed in" }),
+        : pending !== null
+          ? {
+              pending_auth: {
+                url: pending.url,
+                code: pending.code,
+                ...(pending.mode !== undefined ? { mode: pending.mode } : {}),
+              },
+              detail: pendingAuthDetail(pending),
+            }
+          : { detail: "claude CLI installed but not signed in" }),
     };
   },
 
@@ -473,6 +500,94 @@ export const claudeCodeDelegate: TProviderDelegate = {
   // and relay the ciphertext. Deliberately does NOT store it here — this box
   // isn't the one being authenticated.
   mintSetupToken: async () => captureSetupToken(),
+
+  // Headless paste-back login for a REMOTE box (replaces the setup-token mint
+  // for remote Claude): spawn `claude auth login --claudeai` with DISPLAY
+  // stripped + the browser suppressed, surface the hosted authorize URL via
+  // pending-auth (status → dashboard paste panel), and hold the process open on
+  // stdin until the user pastes the code (`submitLoginCode`) or cancels. The
+  // credential that lands is the REAL refreshable claude.ai OAuth one (not a
+  // setup-token). Reuses the `connect_device_code` control command + hook.
+  connectDeviceCode: async () => {
+    if (hasSetupToken(PROVIDER)) {
+      return { connected: true, detail: "connected via setup token" };
+    }
+    if (!(await cliInstallState(PROVIDER)).installed) {
+      return {
+        connected: false,
+        detail: "Install the Claude Code CLI from the Providers tab first.",
+      };
+    }
+    if ((await readToken()) !== null) {
+      clearPendingAuth(PROVIDER);
+      return { connected: true, detail: "signed in via Claude Code" };
+    }
+    // Single-flight: re-surface the live URL instead of spawning a second login
+    // (a new PKCE session would orphan the first).
+    if (inFlightLogin !== null) {
+      const p = getPendingAuth(PROVIDER);
+      return {
+        connected: false,
+        pending: true,
+        detail:
+          p !== null
+            ? pendingAuthDetail(p)
+            : "Claude sign-in already in progress — finish in your browser, then paste the code.",
+      };
+    }
+    // macOS: the isolated login keychain must exist before the credential write.
+    await ensureIsolatedKeychain(cliHome(PROVIDER));
+    const login = await spawnHeadlessLogin(
+      [bin(), "auth", "login", "--claudeai"],
+      env(),
+    );
+    if ("error" in login) {
+      return { connected: false, detail: login.error };
+    }
+    inFlightLogin = login;
+    const auth = { url: login.url, code: "", mode: "paste_code" as const };
+    setPendingAuth(PROVIDER, auth);
+    // On exit (success, cancel, or expiry) drop the in-flight handle + the
+    // stale pending URL; on success also refresh the auth config (the CLI /
+    // identity just changed), best-effort + non-blocking.
+    void login.done.then(async () => {
+      inFlightLogin = null;
+      clearPendingAuth(PROVIDER);
+      if ((await readToken()) !== null) {
+        void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
+      }
+    });
+    return { connected: false, pending: true, detail: pendingAuthDetail(auth) };
+  },
+
+  // Feed the pasted authorization code into the in-flight headless login. A
+  // valid code completes the in-process PKCE exchange (the CLI exits, the
+  // refreshable credential lands); an invalid one leaves the flow alive to
+  // retry. On success grant prompt-free keychain access (mirrors `connect`).
+  submitLoginCode: async (code: string) => {
+    if (inFlightLogin === null) {
+      return { ok: false, detail: "no Claude sign-in is awaiting a code." };
+    }
+    const r = await inFlightLogin.submitCode(code);
+    if (!r.ok) return { ok: false, detail: r.detail };
+    await grantKeychainToolAccess(cliHome(PROVIDER));
+    const connected =
+      (await authStatusLoggedIn()) === true || (await readToken()) !== null;
+    return connected
+      ? { ok: true, detail: "signed in via Claude Code" }
+      : { ok: false, detail: "code accepted but no credential was stored." };
+  },
+
+  // Cancel an in-flight headless paste-back login: kill the process + drop the
+  // pending URL so the card returns to Not signed in.
+  cancelConnect: async () => {
+    if (inFlightLogin !== null) {
+      inFlightLogin.cancel();
+      inFlightLogin = null;
+    }
+    clearPendingAuth(PROVIDER);
+    return { ok: true, detail: "sign-in cancelled" };
+  },
 
   usage: async (): Promise<TProviderUsageSnapshot> => {
     const token = await readToken();

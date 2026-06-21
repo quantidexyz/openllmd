@@ -16,6 +16,12 @@
 export type TPendingAuth = {
   readonly url: string;
   readonly code: string;
+  /** `device_code` (codex/kimi: the user enters `code` in their browser at
+   *  `url`, the daemon polls) or `paste_code` (claude headless login: the user
+   *  signs in at `url`, the hosted page shows a code, the user pastes it back
+   *  — `code` is empty, the dashboard renders a paste input). Absent ⇒
+   *  `device_code`. See `docs/proposals/headless-claude-login-paste-back.md`. */
+  readonly mode?: "device_code" | "paste_code";
 };
 
 const pending = new Map<string, TPendingAuth>();
@@ -37,9 +43,13 @@ export const clearPendingAuth = (slug: string): void => {
 export const hasPendingAuth = (): boolean => pending.size > 0;
 
 /** A human-facing one-liner for the dashboard `detail` while a pending auth is
- *  live. Device-code flows carry a `code`; the browser-OAuth flow (codex) has
- *  none (the localhost callback completes it), so the code clause is omitted. */
+ *  live. `paste_code` (claude headless) asks the user to paste the code the
+ *  hosted page shows; device-code flows that carry a `code` ask the user to
+ *  enter it in the browser; the browser-OAuth flow (codex) has none (the
+ *  localhost callback completes it), so the code clause is omitted. */
 export const pendingAuthDetail = (auth: TPendingAuth): string =>
-  auth.code.length > 0
-    ? `Open ${auth.url} in your browser and enter the code ${auth.code} to authorize. This updates automatically once you're done.`
-    : `Open ${auth.url} in your browser to authorize. This updates automatically once you're done.`;
+  auth.mode === "paste_code"
+    ? `Open ${auth.url} in your browser, sign in, then paste the code it shows back here to authorize.`
+    : auth.code.length > 0
+      ? `Open ${auth.url} in your browser and enter the code ${auth.code} to authorize. This updates automatically once you're done.`
+      : `Open ${auth.url} in your browser to authorize. This updates automatically once you're done.`;

@@ -56,16 +56,32 @@ export type TProviderDelegate = {
   mintSetupToken?: () => Promise<{ token: string } | { error: string }>;
 
   /**
-   * Device-code login for a REMOTE/headless box (codex; kimi uses its only
-   * login which is already device-code): start the vendor's device flow,
-   * surface the verification URL + one-time code (via pending-auth → status)
-   * so the user authorizes in THEIR browser, and let it complete in the
-   * background. Absent on providers without a device-code flow.
+   * Login for a REMOTE/headless box, surfacing an authorize URL via
+   * pending-auth → status so the user authorizes in THEIR browser:
+   *   - codex: the vendor's device-code flow (URL + one-time code, background
+   *     poll completes it);
+   *   - kimi: its only login, already device-code;
+   *   - claude: a headless paste-back login — the URL is the hosted-callback
+   *     one and the user pastes the code it shows back via `submitLoginCode`.
+   * Absent on providers without a headless flow.
    */
   connectDeviceCode?: () => Promise<{
     connected: boolean;
     detail?: string;
     pending?: boolean;
+  }>;
+
+  /**
+   * Feed a pasted authorization code into an in-flight headless login (claude
+   * only): the daemon writes it to the waiting `claude auth login` stdin, which
+   * exchanges it with its in-process PKCE verifier. `ok:false` (e.g. an invalid
+   * code) leaves the flow ALIVE for a retry; `ok:true` means the credential
+   * landed. Absent on providers whose remote login self-completes (codex/kimi
+   * device-code poll in the background).
+   */
+  submitLoginCode?: (code: string) => Promise<{
+    readonly ok: boolean;
+    readonly detail?: string;
   }>;
 
   /**

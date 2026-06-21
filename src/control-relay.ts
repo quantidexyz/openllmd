@@ -216,6 +216,30 @@ export const runCommandInner = async (
         setSetupToken("claude_code", token);
         return { id: cmd.id, status: "done", result: { received: true } };
       }
+      case "submit_login_code": {
+        // TARGET (remote) daemon: open the sealed OAuth authorization code the
+        // user pasted from the hosted callback page and feed it into the
+        // in-flight headless `claude auth login` (paste-back). The code is
+        // single-use + PKCE-bound; the cloud relayed only ciphertext.
+        const delegate = getDelegate(cmd.payload.slug);
+        if (delegate?.submitLoginCode === undefined) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: "submit_login_code: unsupported provider" },
+          };
+        }
+        const code = openSealed(cmd.payload.sealed);
+        if (code === null) {
+          return {
+            id: cmd.id,
+            status: "error",
+            result: { error: "could not open sealed login code" },
+          };
+        }
+        const r = await delegate.submitLoginCode(code);
+        return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
+      }
       case "remove_setup_token": {
         // Clear an on-box setup-token (Claude). Independent of `logout` —
         // they're separate credential sources for claude_code.
