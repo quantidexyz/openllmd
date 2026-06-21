@@ -205,8 +205,19 @@ RestrictNamespaces=yes
 LockPersonality=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
-# @sandbox keeps the daemon's own Landlock self-restriction syscalls callable.
-SystemCallFilter=@system-service @sandbox
+# The daemon self-restricts via Landlock at boot, so the seccomp allow-list MUST
+# keep those syscalls callable. The \`@sandbox\` GROUP only exists on systemd
+# >= 257 — on Debian 12 / Ubuntu 22.04|24.04 (systemd <= 256, most production
+# Linux) it is silently ignored ("Unknown system call group, ignoring: @sandbox"),
+# so the daemon's landlock_create_ruleset() hit the default action and was
+# SIGSYS-KILLED at boot → an endless Restart=always crash loop, killed before any
+# log flushed. Whitelist the three Landlock syscalls BY NAME (resolves on every
+# systemd) AND keep @sandbox for forward-compat. SystemCallErrorNumber=EPERM is
+# the belt-and-braces: a blocked syscall returns EPERM (the daemon's sandbox
+# apply fails OPEN) instead of crash-looping — so a future syscall gap degrades,
+# never kills.
+SystemCallFilter=@system-service @sandbox landlock_create_ruleset landlock_add_rule landlock_restrict_self
+SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 `;
 };
