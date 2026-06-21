@@ -21,6 +21,11 @@ export const COMMANDS: readonly TCommand[] = [
   { name: "status", description: "Show service registration and run status" },
   { name: "restart", description: "Stop then start the daemon" },
   {
+    name: "logs",
+    args: "[-f] [-n N]",
+    description: "Show or follow the daemon log",
+  },
+  {
     name: "skill",
     args: "<install|uninstall|list> [slug]",
     description: "Install or remove a Claude Code skill on this machine",
@@ -60,6 +65,7 @@ export type TFlag = { readonly name: string; readonly description: string };
 export const FLAGS: readonly TFlag[] = [
   { name: "-h", description: "Show help" },
   { name: "--help", description: "Show help" },
+  { name: "-v", description: "Print the version" },
   { name: "--version", description: "Print the version" },
 ] as const;
 

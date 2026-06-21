@@ -29,6 +29,7 @@ import { isAbsolute, join } from "node:path";
 import { setAutoUpdate } from "./auto-update-pref";
 import { daemonEnv, envFilePath, stateDir, writeEnvFileVars } from "./env";
 import { hardenMacBinary } from "./harden-binary";
+import type { TDaemonHealth } from "./health";
 import { DAEMON_VERSION } from "./version";
 
 const LABEL = "sh.openllm.daemon";
@@ -145,7 +146,7 @@ export const renderUnitLogging = (systemdMajorVersion: number): string => {
   return s;
 };
 
-const renderPlist = (binPath: string): string => {
+export const renderPlist = (binPath: string): string => {
   const { out, err } = serviceLogPaths();
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -158,7 +159,10 @@ const renderPlist = (binPath: string): string => {
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>2</integer>
+  <!-- Minimum seconds between respawns ("cap on retry" — backoff floor). launchd
+       has no exponential ramp or start-limit, so a higher floor is the only
+       native throttle on a crash loop; the hard ceiling is boot-guard.ts. -->
+  <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>${out}</string>
   <key>StandardErrorPath</key><string>${err}</string>
@@ -222,25 +226,44 @@ SystemCallArchitectures=native
 `;
 };
 
-const renderUnit = (binPath: string): string => `[Unit]
+/**
+ * Restart policy for the systemd unit — exponential backoff with a hard ceiling
+ * ("cap on retry"). Takes the systemd major (from `systemdMajor()`) so the
+ * version gate is injectable for tests (like `renderUnitLogging`).
+ *
+ * Always `Restart=always` (recover from clean exit, crash, OOM, signal — only an
+ * explicit `systemctl --user stop` keeps it down). On systemd ≥254 the respawn
+ * interval RAMPS from `RestartSec` to `RestartMaxDelaySec` over `RestartSteps`
+ * rather than hammering at a fixed 2s — so a persistent boot failure backs off
+ * to a 30s cadence instead of pegging the CPU. Older systemd lacks `RestartSteps`
+ * (it would reject the unit), so it falls back to a fixed, slightly slower 5s.
+ */
+export const renderUnitRestart = (systemdMajorVersion: number): string => {
+  if (systemdMajorVersion >= 254) {
+    return "Restart=always\nRestartSec=2\nRestartSteps=8\nRestartMaxDelaySec=30\n";
+  }
+  return "Restart=always\nRestartSec=5\n";
+};
+
+export const renderUnit = (binPath: string): string => `[Unit]
 Description=OpenLLM local daemon
 After=network-online.target
 Wants=network-online.target
-# Never give up. systemd's default start-limit (5 starts / 10s) would park the
-# unit in "failed" after a brief crash loop and stop trying — the daemon is
-# meant to run forever, so disable the rate limiter entirely.
-StartLimitIntervalSec=0
+# Start-limit cap ("cap on retry"). The daemon is meant to run forever, so the
+# bound is generous — but NOT infinite: a persistent boot failure (port
+# permanently in use, a bad binary) used to crash-loop forever with the limiter
+# disabled, flooding the log + burning CPU. With backoff (RestartSteps below) a
+# real loop runs at ~30s/boot, so 20 starts in 5 min only triggers after minutes
+# of genuine thrashing → systemd parks the unit "failed" and stops. The app-side
+# crash-loop guard (boot-guard.ts) is the cross-platform backstop (+ the only one
+# on macOS). Recover from a parked unit with \`openllmd restart\`.
+StartLimitIntervalSec=300
+StartLimitBurst=20
 
 [Service]
 EnvironmentFile=${envFilePath()}
 ExecStart=${binPath}
-# Always restart: clean exit, crash, OOM-kill, signal — anything. The ONLY
-# thing that keeps it down is an explicit \`systemctl --user stop openllmd\` (a
-# manual stop does not re-trigger Restart=). RestartSec throttles the respawn so
-# a hard crash loop can't peg the CPU.
-Restart=always
-RestartSec=2
-${renderUnitLogging(systemdMajor())}${renderUnitHardening()}
+${renderUnitRestart(systemdMajor())}${renderUnitLogging(systemdMajor())}${renderUnitHardening()}
 [Install]
 WantedBy=default.target
 `;
@@ -314,17 +337,102 @@ const stopLinux = (): void => {
   tryRun("systemctl", ["--user", "disable", "--now", "openllmd.service"]);
 };
 
-const macRunning = (): boolean => {
-  // `launchctl print` exits non-zero when the label isn't bootstrapped; when it
-  // is, the output carries a `state = running` (or a numeric pid) line.
-  const out = capture("launchctl", ["print", guiTarget()]);
-  if (out.length === 0) return false;
-  return /state = running/.test(out) || /\bpid = \d+/.test(out);
+// ─── Supervisor state (real, not a boolean) ──────────────────────────
+// `is-active`/`state = running` answers "does the supervisor have a process",
+// NOT "is the daemon actually serving". A daemon crash-looping on its listener
+// bind (e.g. port in use) flickers through `active`/`running` between respawns
+// and reports "running" — the bug this replaces. We now surface the supervisor's
+// REAL state (systemd sub-state + restart count + last exit; launchd pid + last
+// exit) and pair it with a live `/status` probe (see `serviceStatus`) so a crash
+// loop reads as `activating (auto-restart) · N restarts` + `health: NOT
+// responding` instead of a falsely reassuring "running".
+
+/** Parse `key=value` lines (systemctl show output) into a record. */
+export const parseKeyValues = (out: string): Record<string, string> => {
+  const rec: Record<string, string> = {};
+  for (const line of out.split("\n")) {
+    const eq = line.indexOf("=");
+    if (eq > 0) rec[line.slice(0, eq)] = line.slice(eq + 1).trim();
+  }
+  return rec;
 };
 
-const linuxRunning = (): boolean =>
-  capture("systemctl", ["--user", "is-active", "openllmd.service"]).trim() ===
-  "active";
+/** Render a systemd `show` record into a human supervisor line. Pure. */
+export const renderSystemdSupervisor = (f: Record<string, string>): string => {
+  const active = f.ActiveState ?? "unknown";
+  const sub = f.SubState ?? "";
+  const parts = [sub && sub !== active ? `${active} (${sub})` : active];
+  const n = Number.parseInt(f.NRestarts ?? "", 10);
+  if (Number.isFinite(n) && n > 0) parts.push(`${n} restarts`);
+  const exit = Number.parseInt(f.ExecMainStatus ?? "", 10);
+  if (Number.isFinite(exit) && exit !== 0) parts.push(`last exit ${exit}`);
+  return parts.join(" · ");
+};
+
+/** Parse the fields we need from `launchctl print` output. */
+export const parseLaunchctlPrint = (
+  out: string,
+): { running: boolean; pid: number | null; lastExitCode: number | null } => {
+  const pidMatch = out.match(/\bpid = (\d+)/);
+  const exitMatch = out.match(/last exit code = (\d+)/); // `(none)` → no match
+  return {
+    running: /state = running/.test(out) || pidMatch !== null,
+    pid: pidMatch ? Number.parseInt(pidMatch[1], 10) : null,
+    lastExitCode: exitMatch ? Number.parseInt(exitMatch[1], 10) : null,
+  };
+};
+
+/** Render parsed launchd fields into a human supervisor line. Pure. */
+export const renderLaunchdSupervisor = (s: {
+  running: boolean;
+  pid: number | null;
+  lastExitCode: number | null;
+}): string => {
+  if (s.running) return s.pid !== null ? `running (pid ${s.pid})` : "running";
+  const exit =
+    s.lastExitCode !== null && s.lastExitCode !== 0
+      ? ` · last exit ${s.lastExitCode}`
+      : "";
+  return `not running${exit}`;
+};
+
+const supervisorState = (): string => {
+  if (isMac) {
+    // `launchctl print` exits non-zero (empty capture) when the label isn't
+    // bootstrapped at all.
+    const out = capture("launchctl", ["print", guiTarget()]);
+    return out.length === 0
+      ? "not loaded"
+      : renderLaunchdSupervisor(parseLaunchctlPrint(out));
+  }
+  const out = capture("systemctl", [
+    "--user",
+    "show",
+    "-p",
+    "ActiveState,SubState,NRestarts,ExecMainStatus,Result",
+    "openllmd.service",
+  ]);
+  return out.length === 0
+    ? "unknown"
+    : renderSystemdSupervisor(parseKeyValues(out));
+};
+
+/**
+ * Probe the running daemon's read-only `/status` (see `health.ts`/`main.ts`).
+ * A successful fetch is the authoritative "actually serving" signal — and the
+ * only source of the LIVE sandbox posture (the CLI never ran the sandbox). Short
+ * timeout so a hung daemon can't hang the CLI; null on any failure.
+ */
+const probeHealth = async (port: number): Promise<TDaemonHealth | null> => {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/status`, {
+      signal: AbortSignal.timeout(750),
+    });
+    return res.ok ? ((await res.json()) as TDaemonHealth) : null;
+  } catch {
+    return null;
+  }
+};
 
 /**
  * Register + start the service in full self-restore mode. Idempotent. Refuses
@@ -391,23 +499,36 @@ export const serviceUninstall = (): string | null => {
   return existed ? path : null;
 };
 
-/** Print the service's registration + run state. */
-export const serviceStatus = (): void => {
+/**
+ * Print the service's registration + RUN state. Three independent signals:
+ *   - service:    is a launch agent / systemd unit registered (file on disk);
+ *   - supervisor: the OS supervisor's REAL state (sub-state, restarts, last
+ *                 exit) — a crash loop shows here, not a false "running";
+ *   - health:     a live `/status` probe — the authoritative "actually serving"
+ *                 signal, and the source of the live sandbox + cloud state.
+ * Async because of the health probe.
+ */
+export const serviceStatus = async (): Promise<void> => {
   const registered = isMac ? existsSync(plistPath()) : existsSync(unitPath());
-  const running = isMac ? macRunning() : linuxRunning();
   const port = daemonPort();
+  const supervisor = supervisorState();
+  const health = await probeHealth(port);
   const logs = serviceLogPaths();
+  const unknown = "unknown (daemon not responding)";
   process.stdout.write(
     [
       `openllmd v${DAEMON_VERSION}`,
-      `  service:   ${registered ? "registered" : "not registered"}`,
-      `  state:     ${running ? "running (self-restore on)" : "stopped"}`,
-      `  port:      ${port}`,
-      `  binary:    ${process.execPath}`,
-      `  state dir: ${stateDir()}`,
-      `  logs:      ${join(stateDir(), "openllmd.log")}`,
-      `  stdout:    ${logs.out}`,
-      `  stderr:    ${logs.err}`,
+      `  service:    ${registered ? "registered" : "not registered"}`,
+      `  supervisor: ${supervisor}`,
+      `  health:     ${health !== null ? `serving on 127.0.0.1:${port}` : `NOT responding on :${port}`}`,
+      `  sandbox:    ${health !== null ? health.sandbox : unknown}`,
+      `  cloud:      ${health !== null ? health.cloud_state : unknown}`,
+      `  port:       ${port}`,
+      `  binary:     ${process.execPath}`,
+      `  state dir:  ${stateDir()}`,
+      `  logs:       ${join(stateDir(), "openllmd.log")}`,
+      `  stdout:     ${logs.out}`,
+      `  stderr:     ${logs.err}`,
       "",
     ].join("\n"),
   );

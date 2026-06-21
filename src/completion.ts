@@ -98,7 +98,7 @@ const fishScript = (): string => {
     `complete -c openllmd -n '__fish_seen_subcommand_from auto-update' -a '${AUTO_UPDATE_ARGS.join(" ")}'`,
     `complete -c openllmd -n '__fish_seen_subcommand_from ${INTEGRATION_GROUPS.join(" ")}' -a '${INTEGRATION_ARGS.join(" ")}'`,
     `complete -c openllmd -s h -l help -d 'Show help'`,
-    `complete -c openllmd -l version -d 'Print the version'`,
+    `complete -c openllmd -s v -l version -d 'Print the version'`,
   );
   return `# openllmd fish completion\ncomplete -c openllmd -f\n${lines.join("\n")}\n`;
 };

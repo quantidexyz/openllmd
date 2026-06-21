@@ -12,6 +12,7 @@
  *   openllmd stop                 stop + disable self-restore
  *   openllmd status               show service + run status
  *   openllmd restart              stop then start
+ *   openllmd logs [-f] [-n N]     show or follow the daemon log
  *   openllmd skill  <install|uninstall|list> [slug]   manage a Claude Code skill
  *   openllmd plugin <install|uninstall|list> [slug]   manage a Claude Code plugin
  *   openllmd setup  <install|uninstall|list> [id]     manage a client setup
@@ -19,7 +20,7 @@
  *   openllmd uninstall [--yes]    remove the daemon + ALL state (credentials)
  *   openllmd completion <shell>   emit / install shell completion
  *   openllmd -h | --help          show help
- *   openllmd --version            show version
+ *   openllmd -v | --version       show version
  */
 import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { COMMANDS, FLAGS } from "./commands";
@@ -28,6 +29,7 @@ import { daemonEnv } from "./env";
 import type { TIntegrationAction, TIntegrationKind } from "./integrations";
 import { runIntegration } from "./integrations";
 import { logError } from "./logger";
+import { runLogs } from "./logs";
 import {
   serviceRestart,
   serviceStart,
@@ -166,7 +168,11 @@ export const runCli = (): boolean => {
     process.stdout.write(HELP);
     process.exit(0);
   }
-  if (args.includes("--version") || args[0] === "version") {
+  if (
+    args.includes("--version") ||
+    args.includes("-v") ||
+    args[0] === "version"
+  ) {
     process.stdout.write(`openllmd v${DAEMON_VERSION}\n`);
     process.exit(0);
   }
@@ -186,8 +192,18 @@ export const runCli = (): boolean => {
       process.exit(0);
       break;
     case "status":
-      serviceStatus();
-      process.exit(0);
+      // Async (it probes the running daemon's /status over loopback). Mirror the
+      // skill/plugin/setup pattern: the promise process.exit()s when done and
+      // returning true prevents the server boot path.
+      serviceStatus()
+        .then(() => process.exit(0))
+        .catch((err) => {
+          logError("cli", err);
+          process.exit(1);
+        });
+      return true;
+    case "logs":
+      runLogs(rest);
       break;
     case "skill":
     case "plugin":

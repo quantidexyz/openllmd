@@ -21,6 +21,7 @@
  * `bun build --compile --minify --bytecode` (see scripts/compile.ts).
  */
 import { migrateLegacyAutoUpdate } from "./auto-update-pref";
+import { guardCrashLoop } from "./boot-guard";
 import { runCli } from "./cli";
 import { getCloudState, latestVersion, refreshBootstrap } from "./config";
 import {
@@ -29,10 +30,11 @@ import {
   stopControlChannel,
 } from "./control-channel";
 import { corsHeaders, isPreflight, preflightResponse } from "./cors";
-import { daemonPort, deviceId, isDevMode, stateDir } from "./env";
+import { daemonPort, deviceId, hasApiKey, isDevMode, stateDir } from "./env";
+import { buildHealth } from "./health";
 import { handleInference } from "./listener";
 import { logError, logInfo } from "./logger";
-import { applyDaemonSandbox } from "./sandbox/landlock";
+import { applyDaemonSandbox, sandboxState } from "./sandbox/landlock";
 import {
   beginRequest,
   endRequest,
@@ -50,6 +52,10 @@ const BOOTSTRAP_TTL_MS = 5 * 60 * 1000;
 // or a `next dev` that finished compiling — without waiting a full TTL.
 const BOOTSTRAP_RETRY_MS = 5 * 1000;
 
+// Wall-clock at process start, for the `/status` uptime field. Module-load time
+// is "boot" for our purposes (the listener binds within the same tick).
+const BOOT_AT = Date.now();
+
 const main = async (): Promise<void> => {
   // `daemonPort()` loads the env file, so the kill-switch / opt-in vars are
   // resolved before the sandbox decision.
@@ -59,6 +65,18 @@ const main = async (): Promise<void> => {
   // remove the stray files) before anything reads it — the `auto-update` flag
   // here; `api-key` / `device-id` migrate lazily in env.ts on first read.
   migrateLegacyAutoUpdate();
+
+  // Crash-loop circuit breaker. The supervisor (systemd `Restart=always` /
+  // launchd `KeepAlive`) relaunches us on every exit, so a persistent boot
+  // failure (port permanently in use, a bad binary) would otherwise respawn
+  // forever — flooding the log + burning CPU on each boot's sandbox/FFI setup.
+  // Record this boot and, if we've restarted too many times in a short window,
+  // disable self-restore and exit cleanly so the thrashing STOPS (recover with
+  // `openllmd restart`). systemd ALSO has a native start-limit backstop
+  // (`service.ts`); this is the cross-platform half (launchd has no equivalent).
+  // Runs before the sandbox so it can't be tripped by an FS-confinement bug,
+  // and before the (costly) sandbox/FFI work it's meant to stop repeating.
+  guardCrashLoop();
 
   // OS sandbox (Linux Landlock / macOS Seatbelt — see `sandbox/landlock.ts`'s
   // `applyDaemonSandbox` dispatcher): confine this process + every child it
@@ -155,83 +173,125 @@ const main = async (): Promise<void> => {
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-  Bun.serve({
-    hostname: "127.0.0.1",
-    port,
-    // Long-lived connections: streaming `/v1/*` inference. The default
-    // ~10s idle timeout would sever a stream between writes, so raise it to
-    // Bun's max; the stream emits its own keep-alives well under it.
-    idleTimeout: 255,
-    fetch: async (req: Request): Promise<Response> => {
-      const url = new URL(req.url);
-      if (url.pathname.startsWith("/v1/")) {
-        // Stamp every inference response as daemon-served — an
-        // observability marker (you can always tell a response came from
-        // the local daemon vs the cloud) AND a safety net: an unexpected
-        // throw in `handleInference` becomes a clean error envelope
-        // instead of a bare runtime 500. Body is passed through
-        // untouched so streaming responses keep streaming.
-        //
-        // Count this request as in-flight so a self-update holds the restart
-        // until it finishes (no cut streams). A streaming body keeps flowing
-        // AFTER this handler returns, so `endRequest` must fire when the BODY
-        // completes (or cancels/errors), not when the handler resolves —
-        // `trackBodyDone` wraps the stream to do exactly that.
-        beginRequest();
-        let res: Response;
-        try {
-          res = await handleInference(req);
-        } catch (err) {
-          logError("inference", err, { path: url.pathname });
-          res = new Response(
-            JSON.stringify({
-              error: {
-                message: err instanceof Error ? err.message : String(err),
-              },
-            }),
-            { status: 500, headers: { "content-type": "application/json" } },
-          );
-        }
-        const headers = new Headers(res.headers);
-        headers.set("x-openllm-served-by", "daemon");
-        if (res.body === null) {
-          endRequest();
-          return new Response(null, {
+  // Bun.serve throws synchronously when the port can't be bound. The headline
+  // failure is EADDRINUSE (another openllmd, or a stray process, on the port) —
+  // emit ONE clear line instead of an opaque stack trace on every supervised
+  // respawn, then exit non-zero (the crash-loop guard above bounds the retries).
+  try {
+    Bun.serve({
+      hostname: "127.0.0.1",
+      port,
+      // Long-lived connections: streaming `/v1/*` inference. The default
+      // ~10s idle timeout would sever a stream between writes, so raise it to
+      // Bun's max; the stream emits its own keep-alives well under it.
+      idleTimeout: 255,
+      fetch: async (req: Request): Promise<Response> => {
+        const url = new URL(req.url);
+        if (url.pathname.startsWith("/v1/")) {
+          // Stamp every inference response as daemon-served — an
+          // observability marker (you can always tell a response came from
+          // the local daemon vs the cloud) AND a safety net: an unexpected
+          // throw in `handleInference` becomes a clean error envelope
+          // instead of a bare runtime 500. Body is passed through
+          // untouched so streaming responses keep streaming.
+          //
+          // Count this request as in-flight so a self-update holds the restart
+          // until it finishes (no cut streams). A streaming body keeps flowing
+          // AFTER this handler returns, so `endRequest` must fire when the BODY
+          // completes (or cancels/errors), not when the handler resolves —
+          // `trackBodyDone` wraps the stream to do exactly that.
+          beginRequest();
+          let res: Response;
+          try {
+            res = await handleInference(req);
+          } catch (err) {
+            logError("inference", err, { path: url.pathname });
+            res = new Response(
+              JSON.stringify({
+                error: {
+                  message: err instanceof Error ? err.message : String(err),
+                },
+              }),
+              { status: 500, headers: { "content-type": "application/json" } },
+            );
+          }
+          const headers = new Headers(res.headers);
+          headers.set("x-openllm-served-by", "daemon");
+          if (res.body === null) {
+            endRequest();
+            return new Response(null, {
+              status: res.status,
+              statusText: res.statusText,
+              headers,
+            });
+          }
+          return new Response(trackBodyDone(res.body, endRequest), {
             status: res.status,
             statusText: res.statusText,
             headers,
           });
         }
-        return new Response(trackBodyDone(res.body, endRequest), {
-          status: res.status,
-          statusText: res.statusText,
-          headers,
+        // `/whoami` — the ONLY non-`/v1` loopback route: returns this daemon's
+        // opaque `device_id` so the dashboard can learn which key's daemon is on
+        // THIS host (a daemon answering your own loopback IS on your machine —
+        // the single authoritative locality signal, replacing the IP heuristic +
+        // localStorage device-code guess). No PII, no token; reuses the same
+        // cross-origin CORS/PNA grant the browser already holds for `/v1/*`. See
+        // `docs/proposals/this-machine-detection-audit.md`.
+        if (url.pathname === "/whoami") {
+          if (isPreflight(req)) return preflightResponse(req);
+          const headers = new Headers(corsHeaders(req));
+          headers.set("content-type", "application/json");
+          return new Response(JSON.stringify({ device_id: deviceId() }), {
+            status: 200,
+            headers,
+          });
+        }
+        // `/status` — read-only loopback health snapshot. A successful fetch is
+        // the authoritative "this daemon is actually SERVING" signal (the
+        // supervisor only knows it has a process, not that it bound the port),
+        // and it carries the real sandbox posture this process applied at boot —
+        // which `openllmd status` can't compute itself. Secret-free subset of
+        // `computeStatus()`; see `health.ts`. Shares the loopback CORS grant.
+        if (url.pathname === "/status") {
+          if (isPreflight(req)) return preflightResponse(req);
+          const headers = new Headers(corsHeaders(req));
+          headers.set("content-type", "application/json");
+          const health = buildHealth({
+            version: DAEMON_VERSION,
+            port,
+            sandbox: sandboxState(),
+            cloudState: getCloudState(),
+            keyConfigured: hasApiKey(),
+            bootAt: BOOT_AT,
+            now: Date.now(),
+          });
+          return new Response(JSON.stringify(health), { status: 200, headers });
+        }
+        // Everything else: control comes via the cloud relay, not a
+        // browser→loopback call.
+        return new Response(JSON.stringify({ error: "not found" }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
         });
-      }
-      // `/whoami` — the ONLY non-`/v1` loopback route: returns this daemon's
-      // opaque `device_id` so the dashboard can learn which key's daemon is on
-      // THIS host (a daemon answering your own loopback IS on your machine —
-      // the single authoritative locality signal, replacing the IP heuristic +
-      // localStorage device-code guess). No PII, no token; reuses the same
-      // cross-origin CORS/PNA grant the browser already holds for `/v1/*`. See
-      // `docs/proposals/this-machine-detection-audit.md`.
-      if (url.pathname === "/whoami") {
-        if (isPreflight(req)) return preflightResponse(req);
-        const headers = new Headers(corsHeaders(req));
-        headers.set("content-type", "application/json");
-        return new Response(JSON.stringify({ device_id: deviceId() }), {
-          status: 200,
-          headers,
-        });
-      }
-      // Everything else: control comes via the cloud relay, not a
-      // browser→loopback call.
-      return new Response(JSON.stringify({ error: "not found" }), {
-        status: 404,
-        headers: { "content-type": "application/json" },
-      });
-    },
-  });
+      },
+    });
+  } catch (err) {
+    const code =
+      err && typeof err === "object" && "code" in err
+        ? String((err as { code?: unknown }).code)
+        : "";
+    if (code === "EADDRINUSE") {
+      logError(
+        "boot",
+        `port ${port} already in use — another openllmd (or a stray process) holds 127.0.0.1:${port}. ` +
+          "Stop it (`openllmd stop`) or set OPENLLM_DAEMON_PORT to a free port.",
+      );
+    } else {
+      logError("boot", err);
+    }
+    process.exit(1);
+  }
   // Single line to stdout so the install-time launcher can confirm boot.
   process.stdout.write(
     `openllmd v${DAEMON_VERSION}${isDevMode() ? " (dev)" : ""} listening on http://127.0.0.1:${port}\n`,

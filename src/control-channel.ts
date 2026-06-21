@@ -82,6 +82,13 @@ let connectionGeneration = 0;
  *  "connected" vs a recovery "reconnected", so the log shows the channel coming
  *  back, not just dropping. */
 let hasConnected = false;
+/** Last logged socket error reason / close line, to SUPPRESS the per-dial repeat
+ *  during a sustained outage (cloud down, keyless): partysocket re-dials forever,
+ *  and an unguarded warn-per-attempt floods the log. We log a NEW reason once,
+ *  then stay quiet until it changes; `onopen` resets both so the next outage logs
+ *  fresh (paired with the `reconnected` line). */
+let lastErrorReason = "";
+let lastCloseLine = "";
 
 const send = (frame: TRelayFrame): void => {
   if (ws === null || ws.readyState !== ws.OPEN) return;
@@ -257,6 +264,8 @@ export const startControlChannel = (): void => {
       hasConnected ? "reconnected over websocket" : "connected over websocket",
     );
     hasConnected = true;
+    lastErrorReason = ""; // recovered — let the next outage log fresh
+    lastCloseLine = "";
     helloSent = false; // a fresh connection — nothing may precede ITS hello
     connectionGeneration += 1;
     const generation = connectionGeneration;
@@ -289,7 +298,11 @@ export const startControlChannel = (): void => {
       (typeof e?.message === "string" && e.message) ||
       (e?.error instanceof Error && e.error.message) ||
       "unknown";
-    logWarn("control-channel", `socket error: ${reason} (reconnecting)`);
+    // Suppress the per-dial repeat of an UNCHANGED reason (sustained outage).
+    if (reason !== lastErrorReason) {
+      lastErrorReason = reason;
+      logWarn("control-channel", `socket error: ${reason} (reconnecting)`);
+    }
   };
   socket.onclose = (ev): void => {
     stopWatcher();
@@ -302,9 +315,14 @@ export const startControlChannel = (): void => {
     const line = `socket closed code=${ev.code}${ev.reason ? ` reason=${ev.reason}` : ""}${clean ? "" : " (reconnecting)"}`;
     // A clean close (relay cycling its box, or our own graceful stop) is routine
     // → debug. An abnormal close (1006 unreachable, 4003 rejected ticket) is a
-    // real drop the user needs to see → warn, paired with the `reconnected` line.
-    if (clean) logDebug("control-channel", line);
-    else logWarn("control-channel", line);
+    // real drop the user needs to see → warn, paired with the `reconnected` line
+    // — but only ONCE per sustained outage (suppress the unchanged per-dial repeat).
+    if (clean) {
+      logDebug("control-channel", line);
+    } else if (line !== lastCloseLine) {
+      lastCloseLine = line;
+      logWarn("control-channel", line);
+    }
   };
 };
 
