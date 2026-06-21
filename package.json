@@ -12,7 +12,8 @@
   },
   "scripts": {
     "compile": "bun scripts/compile.ts",
-    "compile:host": "bun scripts/compile.ts --host"
+    "compile:host": "bun scripts/compile.ts --host",
+    "verify": "bun scripts/verify.ts"
   },
   "dependencies": {
     "@quantidexyz/openllmp": "workspace:*",

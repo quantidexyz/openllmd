@@ -48,6 +48,28 @@ Or consume the source as a package:
 bun install github:quantidexyz/openllmd # latest
 ```
 
+## Verify
+
+Every published binary is pinned by SHA-256 in [`manifest.ts`](./manifest.ts),
+committed to this repo. Confirm the artifacts the cloud serves are exactly what
+this source vouches for — no trust required:
+
+```sh
+bun install
+bun run verify                       # download every published target, hash it, check vs manifest.ts
+bun run verify -- --host             # just this machine's target
+bun run verify -- --file ./openllmd  # a binary you already installed/downloaded
+bun run verify -- --installed        # the `openllmd` on your $PATH
+```
+
+Exit code is `0` only when every checked binary matches its pinned digest.
+
+> Note: the binary is **not** byte-reproducible (`bun build --compile
+> --bytecode` embeds non-deterministic bytecode), so rebuilding from source
+> won't hash-match the release. The verifiable guarantee is that the
+> **published** asset matches the SHA-256 committed here — the same digest
+> `install.sh` and the daemon's self-update enforce on download.
+
 ## License
 
 **Source-available** under the [Business Source License 1.1](./LICENSE)

@@ -49,6 +49,7 @@ cloud at runtime** (not compiled in) to keep the closure clean.
 daemon/
   index.ts                  re-exports
   scripts/compile.ts        bun build --compile --minify --bytecode (4 targets)
+  scripts/verify.ts         download each published binary → sha256 → assert == manifest.ts pin (bun run verify)
   scripts/dist.ts           compile + emit a self-contained installer per target (daemon:dist)
   scripts/dist-install.ts   run an emitted installer by target on this host (daemon:dist:install)
   src/
@@ -509,6 +510,20 @@ installs are migrated into daemon.env and removed), then hands off to
 `openllmd start`. That one file is what both the installed service
 (systemd `EnvironmentFile=` / the macOS launch agent's
 `OPENLLM_DAEMON_ENV_FILE`) and `bun dev:daemon` boot from.
+
+**Anyone can verify a published binary.** `scripts/verify.ts` (`bun run
+verify`) downloads each published `openllmd-<target>.gz` straight from the
+GitHub Release named in `manifest.ts`, decompresses it, sha256's the
+decompressed bytes (what runs), and asserts the digest equals the pin
+committed in `manifest.ts` — exiting non-zero on any mismatch. `--host` /
+`--target` narrow the set; `--file <path>` / `--installed` hash a local
+binary instead of downloading. This is the same digest `install.sh` and
+`src/self-update.ts` enforce on download, surfaced as a standalone
+source-repo check so the source-available mirror's users can independently
+confirm the served artifact matches what the source pins. It is NOT a
+reproducible-build check: `--compile --bytecode` is not byte-deterministic,
+so a fresh local build won't hash-match — the trust anchor is the committed
+manifest plus the published asset, not two identical builds.
 
 **The binary supervises itself.** Service registration is NOT open-coded in
 `install.sh` — it lives in `src/service.ts`, exposed as the `openllmd

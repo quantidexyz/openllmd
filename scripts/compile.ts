@@ -20,11 +20,21 @@
  *   bun run packages/daemon/scripts/compile.ts --version 1.2.3
  */
 import { readFileSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import { $ } from "bun";
 
-const ENTRY = "packages/daemon/src/main.ts";
-const OUT_DIR = "packages/daemon/dist";
+// Resolve paths from THIS script's location, not the cwd. `scripts/` sits
+// directly under the package root in BOTH layouts — the monorepo
+// (`packages/daemon/scripts`) and the source-available mirror that subtree-
+// splits `packages/daemon` to its own root (`openllmd/scripts`). Deriving the
+// package root as the script dir's parent makes `bun run compile` work
+// identically from either, instead of assuming a `packages/daemon/` cwd prefix
+// that doesn't exist in the flattened mirror.
+const PKG_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const ENTRY = join(PKG_ROOT, "src", "main.ts");
+const OUT_DIR = join(PKG_ROOT, "dist");
 const CLOUD_ORIGIN = process.env.OPENLLM_CLOUD_ORIGIN ?? "https://openllm.sh";
 
 const TARGETS = [
