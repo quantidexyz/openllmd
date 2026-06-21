@@ -27,7 +27,6 @@ import {
   FLAGS,
   INTEGRATION_ACTIONS,
   INTEGRATION_GROUPS,
-  PROVIDERS,
 } from "./commands";
 
 export type { TCompletionShell } from "./commands";
@@ -54,7 +53,6 @@ _openllmd() {
   fi
   case "$cmd" in
     completion) COMPREPLY=( $(compgen -W "${COMPLETION_ARGS.join(" ")}" -- "$cur") ) ;;
-    set-token)  [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=( $(compgen -W "${PROVIDERS.join(" ")}" -- "$cur") ) ;;
     auto-update) [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=( $(compgen -W "${AUTO_UPDATE_ARGS.join(" ")}" -- "$cur") ) ;;
     ${INTEGRATION_GROUPS.join("|")}) [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=( $(compgen -W "${INTEGRATION_ARGS.join(" ")}" -- "$cur") ) ;;
   esac
@@ -81,7 +79,6 @@ _openllmd() {
     args)
       case "$line[1]" in
         completion) _values 'shell' ${COMPLETION_ARGS.join(" ")} ;;
-        set-token)  _values 'provider' ${PROVIDERS.join(" ")} ;;
         auto-update) _values 'action' ${AUTO_UPDATE_ARGS.join(" ")} ;;
         ${INTEGRATION_GROUPS.join("|")}) _values 'action' ${INTEGRATION_ARGS.join(" ")} ;;
       esac ;;
@@ -98,7 +95,6 @@ const fishScript = (): string => {
   );
   lines.push(
     `complete -c openllmd -n '__fish_seen_subcommand_from completion' -a '${COMPLETION_ARGS.join(" ")}'`,
-    `complete -c openllmd -n '__fish_seen_subcommand_from set-token' -a '${PROVIDERS.join(" ")}'`,
     `complete -c openllmd -n '__fish_seen_subcommand_from auto-update' -a '${AUTO_UPDATE_ARGS.join(" ")}'`,
     `complete -c openllmd -n '__fish_seen_subcommand_from ${INTEGRATION_GROUPS.join(" ")}' -a '${INTEGRATION_ARGS.join(" ")}'`,
     `complete -c openllmd -s h -l help -d 'Show help'`,

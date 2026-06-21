@@ -47,11 +47,6 @@ export const COMMANDS: readonly TCommand[] = [
     description: "Remove the daemon and ALL state (credentials, service)",
   },
   {
-    name: "set-token",
-    args: "<provider> <token>",
-    description: "Store a subscription setup-token (omit token to clear)",
-  },
-  {
     name: "completion",
     args: "<bash|zsh|fish|install>",
     description: "Print or install shell completion",

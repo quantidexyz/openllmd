@@ -239,6 +239,6 @@ const main = async (): Promise<void> => {
   logInfo("boot", `openllmd v${DAEMON_VERSION} listening on :${port}`);
 };
 
-// Dispatch management subcommands (start/stop/status/set-token/completion/…);
+// Dispatch management subcommands (start/stop/status/completion/…);
 // a bare `openllmd` with no args falls through to boot the server. See `cli.ts`.
 if (!runCli()) void main();

@@ -101,11 +101,11 @@ export type TSpawnLoginOpts = {
    *  A browser OAuth needs the user to sign in, so it's generous. */
   readonly timeoutMs?: number;
   /** When the COMBINED output matches this, the child has produced what we
-   *  need (e.g. the printed setup-token) — kill it and return immediately
+   *  need (e.g. a printed verification prompt) — kill it and return immediately
    *  instead of waiting for it to exit. Vendor CLIs (themselves Bun/Node
-   *  binaries) can hang in `__cxa_finalize`/atexit AFTER printing the token,
-   *  so waiting on `proc.exited` would block forever + pile up 99%-CPU
-   *  runaways. We don't need the exit — only the output. */
+   *  binaries) can hang in `__cxa_finalize`/atexit AFTER printing it, so waiting
+   *  on `proc.exited` would block forever + pile up 99%-CPU runaways. We don't
+   *  need the exit — only the output. */
   readonly until?: RegExp;
 };
 
@@ -121,9 +121,8 @@ const UNTIL_SETTLE_MS = 400;
 /**
  * Spawn a vendor CLI's login command and capture its output. The CLI opens the
  * user's browser; the user signs in and the CLI completes via its own localhost
- * callback, at which point the credential is in the CLI's OWN store (and, for
- * `setup-token`, the token is printed). stdin is ignored (browser-driven;
- * headless daemon has no usable stdin).
+ * callback, at which point the credential is in the CLI's OWN store. stdin is
+ * ignored (browser-driven; headless daemon has no usable stdin).
  *
  * Robustness (load-bearing): we NEVER block indefinitely on the child exiting.
  * Output is STREAMED; if `opts.until` matches we kill the child and return
@@ -441,8 +440,8 @@ export const stripAnsi = (s: string): string => s.replace(ANSI_RE, "");
  * Build the `script(1)` argv that runs `argv` under a PSEUDO-TERMINAL, writing
  * the terminal capture to `typescript` — or null on an OS without `script`
  * (caller falls back to a plain pipe spawn). Some vendor CLIs only run attached
- * to a real terminal (`claude setup-token`'s TTY-only TUI; `kimi -p`'s
- * raw-mode-gated print mode), emitting NOTHING under a plain pipe. Shared by
+ * to a real terminal (e.g. `kimi -p`'s raw-mode-gated print mode), emitting
+ * NOTHING under a plain pipe. Shared by
  * {@link spawnLoginPty} (which POLLS the typescript for an `until` regex) and
  * the exec-fixture capture (which ignores the typescript — pass `/dev/null` —
  * and drives off its HTTP recorder instead).
@@ -476,13 +475,12 @@ export const ptyScriptArgv = (
 
 /**
  * Like {@link spawnLogin}, but runs `argv` under a PSEUDO-TERMINAL (via
- * `script(1)`). Some vendor CLIs only work attached to a real terminal —
- * `claude setup-token` is a TTY-only interactive TUI that writes the auth URL +
- * token to its controlling terminal (`/dev/tty`), so spawned with a plain pipe
- * (no controlling TTY) it emits NOTHING and the headless daemon captures
- * `outputLen: 0`. A PTY makes it actually run, and we capture its terminal
- * output to a `script` typescript file which we POLL — so `opts.until` (the
- * printed token) returns the instant it appears.
+ * `script(1)`). Some vendor CLIs only work attached to a real terminal — e.g.
+ * `kimi -p`'s raw-mode-gated print mode writes to its controlling terminal
+ * (`/dev/tty`), so spawned with a plain pipe (no controlling TTY) it emits
+ * NOTHING and the headless daemon captures `outputLen: 0`. A PTY makes it
+ * actually run, and we capture its terminal output to a `script` typescript
+ * file which we POLL — so `opts.until` returns the instant the match appears.
  *
  * Key subtleties, each load-bearing (see the harness in `tests/`):
  *   - stdin is `/dev/null` (`"ignore"`): a Bun pipe/stream/inherited stdin makes
@@ -660,8 +658,8 @@ export const ensureIsolatedKeychain = async (home: string): Promise<void> => {
     await mkdir(dirname(kc), { recursive: true });
     const created = await runSecurity(["create-keychain", "-p", "", kc], home);
     // If creation failed AND the file still isn't there, a later
-    // `claude setup-token`/`auth login` will pop the system "Keychain login
-    // cannot be found to store …" dialog and WEDGE. Surface it loudly here
+    // `claude auth login` will pop the system "Keychain login cannot be found
+    // to store …" dialog and WEDGE. Surface it loudly here
     // (don't cache success) so the real cause is in openllmd.err.log.
     if (!created && !existsSync(kc)) {
       logError(

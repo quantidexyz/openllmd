@@ -17,7 +17,6 @@
  *   openllmd setup  <install|uninstall|list> [id]     manage a client setup
  *   openllmd auto-update <on|off|status>  opt in/out of self-update (default on)
  *   openllmd uninstall [--yes]    remove the daemon + ALL state (credentials)
- *   openllmd set-token <p> <tok>  store a subscription setup-token
  *   openllmd completion <shell>   emit / install shell completion
  *   openllmd -h | --help          show help
  *   openllmd --version            show version
@@ -35,7 +34,6 @@ import {
   serviceStatus,
   serviceStop,
 } from "./service";
-import { setSetupToken } from "./setup-token";
 import { runUninstall } from "./uninstall";
 import { DAEMON_VERSION } from "./version";
 
@@ -67,26 +65,6 @@ State lives under ~/.openllm (override with OPENLLM_DAEMON_STATE_DIR).
  * entry) — so user args always start at index 2.
  */
 const userArgs = (): string[] => process.argv.slice(2);
-
-/** Persist (or clear) a subscription setup-token, then exit. */
-const runSetToken = (args: readonly string[]): never => {
-  const provider = args[0];
-  const token = args[1] ?? null;
-  if (provider === undefined || provider.length === 0) {
-    process.stderr.write("usage: openllmd set-token <provider> <token>\n");
-    process.exit(2);
-  }
-  if (!setSetupToken(provider, token)) {
-    process.stderr.write(
-      "refused: that doesn't look like a setup token (expected sk-ant-oat01-…/sk-ant-at01-…)\n",
-    );
-    process.exit(1);
-  }
-  process.stdout.write(
-    `setup token ${token !== null && token.length > 0 ? "saved" : "cleared"} for ${provider}\n`,
-  );
-  process.exit(0);
-};
 
 /**
  * Opt in/out of automatic self-updates (or print the current state), then exit.
@@ -223,9 +201,6 @@ export const runCli = (): boolean => {
         process.exit(1);
       });
       return true;
-    case "set-token":
-      runSetToken(rest);
-      break;
     case "auto-update":
       runAutoUpdate(rest);
       break;

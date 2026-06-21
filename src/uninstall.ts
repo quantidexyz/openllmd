@@ -11,7 +11,7 @@
  *   3. remove shell completion (rc line + fish file)
  *   4. remove the `openllmd` PATH symlink (only if it's ours)
  *   5. delete the entire state dir `~/.openllm` — binary, paired API key,
- *      subscription CREDENTIALS, setup-tokens, the encryption keypair, logs
+ *      subscription CREDENTIALS, the encryption keypair, logs
  *
  * The running process keeps executing from its already-loaded binary even
  * after its file is unlinked (the inode survives until exit), so deleting the
@@ -77,8 +77,8 @@ const CONFIRM_PROMPT = `⚠️  This will COMPLETELY remove the OpenLLM daemon f
   • stop and UNREGISTER the background service (launch agent / systemd unit),
     so it no longer self-restores on login or reboot
   • DELETE all local state under ${stateDir()} — including your stored
-    subscription CREDENTIALS, setup-tokens, the paired API key, and the
-    daemon's encryption keypair
+    subscription CREDENTIALS, the paired API key, and the daemon's
+    encryption keypair
   • remove the openllmd binary, its PATH symlink, and shell completion
 
 This is IRREVERSIBLE. You'll need to reinstall and reconnect your

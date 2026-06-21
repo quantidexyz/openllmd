@@ -352,8 +352,8 @@ const urlFresh = (cfg: TAuthConfig, cliVer: string | null): boolean =>
  * freshly captured one. Returns the stale stored URL (or null) if capture fails
  * so serving never hard-breaks. `force` bypasses the cache (used right after a
  * re-login). `captureIfMissing: false` NEVER spawns the CLI — it serves the best
- * stored URL (even stale) or null (the setup-token path leaves the isolated CLI
- * logged OUT, so a capture would spawn a doomed `claude -p ping`).
+ * stored URL (even stale) or null, for callers that must not spawn a capture
+ * (e.g. when the isolated CLI may be logged OUT).
  */
 const ensureUpstreamUrl = async (
   provider: TCliProvider,
@@ -392,7 +392,7 @@ const ensureUpstreamUrl = async (
 /**
  * Resolve the upstream URL for a served hop — the captured URL, or the
  * delegate's default when none exists. `opts` forwarded to {@link
- * ensureUpstreamUrl} (e.g. `captureIfMissing: false` for the setup-token path).
+ * ensureUpstreamUrl}.
  */
 export const resolveUpstreamUrl = async (
   provider: TCliProvider,

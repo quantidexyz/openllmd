@@ -1,6 +1,6 @@
 /**
  * The daemon's command executor — the kind→handler mapping for every control
- * command (connect / cli-install / integration / setup-token / auto-update / …).
+ * command (connect / cli-install / integration / login-code / auto-update / …).
  *
  * It is transport-agnostic: the WebSocket control channel (`control-channel.ts`)
  * pulls a command off the relay socket, runs it through `runCommandInner`, and
@@ -18,7 +18,6 @@ import { runIntegration } from "./integrations";
 import { openSealed } from "./keypair";
 import { clearPendingAuth } from "./pending-auth";
 import { maybeSelfUpdate } from "./self-update";
-import { setSetupToken } from "./setup-token";
 import { invalidateUsage } from "./usage-cache";
 
 /**
@@ -166,19 +165,6 @@ export const runCommandInner = async (
         }
         const r = await delegate.submitLoginCode(code);
         return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
-      }
-      case "remove_setup_token": {
-        // Clear an on-box setup-token (Claude). Independent of `logout` —
-        // they're separate credential sources for claude_code.
-        if (getDelegate(cmd.payload.slug) === null) {
-          return {
-            id: cmd.id,
-            status: "error",
-            result: { error: "unknown provider" },
-          };
-        }
-        setSetupToken(cmd.payload.slug, null);
-        return { id: cmd.id, status: "done", result: { ok: true } };
       }
       // A bare refresh: nothing to do — the status push below carries the
       // fresh snapshot back.

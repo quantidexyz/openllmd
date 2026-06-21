@@ -38,7 +38,6 @@ import {
   pendingAuthDetail,
   setPendingAuth,
 } from "../pending-auth";
-import { hasSetupToken, loadSetupToken } from "../setup-token";
 import {
   ensureAuthConfig,
   oauthConfig,
@@ -208,15 +207,6 @@ const readToken = async (): Promise<{
   accessToken: string;
   expiresAtMs: number | null;
 } | null> => {
-  // On-box setup-token (sk-ant-oat01-) wins: a long-lived Pro/Max
-  // subscription credential the user delivered to this box (env /
-  // `set-token`). It carries no refresh token, so there's nothing to
-  // self-refresh — used verbatim until it expires (the user re-sets it).
-  // This path needs NO isolated `claude` CLI install or `auth login`.
-  const setupToken = loadSetupToken(PROVIDER);
-  if (setupToken !== null) {
-    return { accessToken: setupToken, expiresAtMs: null };
-  }
   const store = await loadStore();
   const oauth = store?.claudeAiOauth;
   if (oauth?.accessToken === undefined || oauth.accessToken.length === 0) {
@@ -298,19 +288,6 @@ export const claudeCodeDelegate: TProviderDelegate = {
 
   status: async () => {
     const { installed, version } = await cliInstallState(PROVIDER);
-    // Setup-token mode: connected via the on-box subscription token,
-    // independent of any isolated CLI install / `auth login`.
-    if (hasSetupToken(PROVIDER)) {
-      return {
-        provider: PROVIDER,
-        connected: true,
-        cli_installed: installed,
-        ...(version !== null ? { cli_version: version } : {}),
-        detail: "connected via setup token",
-        auth_mode: "setup_token",
-        last_login_at_ms: null,
-      };
-    }
     if (!installed) {
       return {
         provider: PROVIDER,
@@ -339,7 +316,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
       cli_installed: true,
       ...(version !== null ? { cli_version: version } : {}),
       ...(connected
-        ? { auth_mode: "login" as const, last_login_at_ms: null }
+        ? { last_login_at_ms: null }
         : pending !== null
           ? {
               pending_auth: {
@@ -354,11 +331,6 @@ export const claudeCodeDelegate: TProviderDelegate = {
   },
 
   connect: async () => {
-    // Already authenticated via an on-box setup token — there's no browser
-    // login to run; the dashboard surfaces token instructions, not Connect.
-    if (hasSetupToken(PROVIDER)) {
-      return { connected: true, detail: "connected via setup token" };
-    }
     if (!(await cliInstallState(PROVIDER)).installed) {
       return {
         connected: false,
@@ -405,17 +377,14 @@ export const claudeCodeDelegate: TProviderDelegate = {
     };
   },
 
-  // Headless paste-back login for a REMOTE box (replaces the setup-token mint
-  // for remote Claude): spawn `claude auth login --claudeai` with DISPLAY
-  // stripped + the browser suppressed, surface the hosted authorize URL via
-  // pending-auth (status → dashboard paste panel), and hold the process open on
-  // stdin until the user pastes the code (`submitLoginCode`) or cancels. The
-  // credential that lands is the REAL refreshable claude.ai OAuth one (not a
-  // setup-token). Reuses the `connect_device_code` control command + hook.
+  // Headless paste-back login for a REMOTE box (remote Claude auth): spawn
+  // `claude auth login --claudeai` with DISPLAY stripped + the browser
+  // suppressed, surface the hosted authorize URL via pending-auth (status →
+  // dashboard paste panel), and hold the process open on stdin until the user
+  // pastes the code (`submitLoginCode`) or cancels. The credential that lands is
+  // the real refreshable claude.ai OAuth one. Reuses the `connect_device_code`
+  // control command + hook.
   connectDeviceCode: async () => {
-    if (hasSetupToken(PROVIDER)) {
-      return { connected: true, detail: "connected via setup token" };
-    }
     if (!(await cliInstallState(PROVIDER)).installed) {
       return {
         connected: false,
@@ -590,21 +559,13 @@ export const claudeCodeDelegate: TProviderDelegate = {
     // walker carries the originator's own headers, and the wire builder layers
     // the OAuth `anthropic-beta` + `anthropic-version` on top (isOAuth). Claude
     // has no per-credential header to add, so `headers` is empty.
-    //
-    // Setup-token mode: the token was delivered out-of-band (env / `set-token` /
-    // sealed relay), so the isolated CLI is NOT logged in and can't produce a
-    // genuine request — `captureIfMissing: false` serves any stored URL or the
-    // default, without spawning a doomed `claude -p ping` on every inference.
-    const url = await resolveUpstreamUrl(PROVIDER, {
-      captureIfMissing: !hasSetupToken(PROVIDER),
-    });
+    const url = await resolveUpstreamUrl(PROVIDER, { captureIfMissing: true });
     return { access_token: token.accessToken, headers: {}, url };
   },
 
   logout: async () => {
-    // Clear the CLI-LOGIN credential only (NOT an on-box setup-token —
-    // that's `remove_setup_token`). `claude auth logout` clears the isolated
-    // store (keychain item on macOS, .credentials.json on Linux).
+    // `claude auth logout` clears the isolated login credential (keychain item
+    // on macOS, .credentials.json on Linux).
     if ((await cliInstallState(PROVIDER)).installed) {
       await ensureIsolatedKeychain(cliHome(PROVIDER)); // macOS: reach the store
       await runCapture([bin(), "auth", "logout"], env());
