@@ -329,13 +329,19 @@ Two orthogonal hardenings from
     `EACCES` and connect/integrations silently break).
   - **macOS → Seatbelt** (`sandbox/seatbelt.ts`) — an SBPL profile applied via
     `sandbox_init()` (`bun:ffi` → `libsandbox`), deprecated-but-functional, no
-    Developer ID signing (App Sandbox is Phase C). It is **asymmetric**, because
-    macOS forces it: WRITES are a deny-by-default whitelist (working set +
-    workflow targets only — strong tamper guard), but READS are allow-default
-    with a credential deny-list (`~/.ssh`, `~/.aws`, `~/Library/Keychains`,
-    browser data). A read-whitelist isn't viable — a spawned child's dyld needs
-    broad read at `exec` (which `sandbox-exec` grants implicitly but a raw
-    `sandbox_init` profile can't), so it SIGABRTs every child. Non-file ops stay
+    Developer ID signing (App Sandbox is Phase C). BOTH WRITES and READS are
+    deny-by-default whitelists (parity with Landlock): WRITES grant only the
+    working set + workflow targets (tamper guard); READS stay open OUTSIDE
+    `$HOME` — where the dynamic loader's broad `exec`-time read lives and no
+    user secret does (`(allow file-read* (require-not (subpath $HOME)))`) — but
+    deny-by-default INSIDE `$HOME`, re-allowing only the daemon footprint, so
+    `~/.ssh`, `~/.aws`, `~/Library/Keychains`, browser data, and any
+    unenumerated `$HOME` secret are unreadable. (The two vendor credential files
+    inside the re-allowed config dirs — `~/.codex/auth.json`,
+    `~/.claude/.credentials.json` — are re-denied last, SBPL being
+    last-match-wins.) The earlier "a read-whitelist SIGABRTs every child" note
+    was a too-narrow system-read set, not a hard limit — validated in-process
+    (`sandbox_init` + child inheritance, `tests/sandbox`). Non-file ops stay
     allowed so the OAuth-browser + keychain login flows run.
 
   The **systemd user unit** (`renderUnitHardening()` in `service.ts`) adds a

@@ -4,8 +4,11 @@
  * through `bun:ffi`, BEFORE the listener binds: a deny-by-default SBPL profile
  * grants filesystem access ONLY to the daemon's working set (`working-set.ts`)
  * plus the system trees the runtime needs, and is inherited by every spawned
- * child — the same confinement model `sandbox-exec` uses. Everything else
- * (`~/.ssh`, `~/.aws`, the user's real `~/.codex`, other `~/Library` data) is
+ * child — the same confinement model `sandbox-exec` uses. Both WRITES and READS
+ * are deny-by-default whitelists (parity with Landlock): reads are open outside
+ * `$HOME` — where the dynamic loader's broad system read lives and no user
+ * secret does — but deny-by-default inside it, so `~/.ssh`, `~/.aws`, the user's
+ * real `~/.codex`, keychains, browser cookies, and any other `$HOME` secret are
  * unreadable even if the daemon process is fully compromised.
  *
  * Why Seatbelt and not the App Sandbox: the App Sandbox (proposal §3.2) is the
@@ -48,68 +51,69 @@ const macRuntimeWrite = (home: string): string[] => [
 ];
 
 /**
- * The user's credential stores a compromised daemon (or a poisoned integration
- * script) must never READ. The daemon's OWN isolated vendor creds live under
- * `~/.openllm` (never denied); these are the user's REAL secrets, which no
- * workflow needs to read. Also covers the vendor credential FILES inside the
- * write-target config dirs (`~/.codex/auth.json`, `~/.claude/.credentials.json`)
- * — the daemon writes config there but never needs the user's tokens.
+ * Read-allow paths INSIDE `$HOME`, beyond the working set: the macOS runtime
+ * read surface the browser-open / LaunchServices path needs (`Caches` +
+ * `Preferences` — the LaunchServices database `open` consults). Everything
+ * OUTSIDE `$HOME` is blanket-readable (see {@link buildProfile}), so only the
+ * in-home additions live here.
  */
-const readDenyList = (home: string): string[] => [
-  `(subpath "${esc(home)}/.ssh")`,
-  `(subpath "${esc(home)}/.aws")`,
-  `(subpath "${esc(home)}/.gnupg")`,
-  `(subpath "${esc(home)}/.config/gcloud")`,
-  `(subpath "${esc(home)}/.config/gh")`,
-  `(subpath "${esc(home)}/.kube")`,
-  `(subpath "${esc(home)}/.docker")`,
-  `(literal "${esc(home)}/.netrc")`,
-  `(literal "${esc(home)}/.npmrc")`,
-  `(literal "${esc(home)}/.pypirc")`,
-  // Vendor credential files inside the write-target config dirs.
-  `(literal "${esc(home)}/.codex/auth.json")`,
-  `(literal "${esc(home)}/.claude/.credentials.json")`,
-  // The user's REAL login keychain (the daemon's isolated one is under
-  // ~/.openllm and unaffected).
-  `(subpath "${esc(home)}/Library/Keychains")`,
-  // Browser cookies / profiles (session tokens).
-  `(subpath "${esc(home)}/Library/Cookies")`,
-  `(subpath "${esc(home)}/Library/HTTPStorages")`,
-  `(subpath "${esc(home)}/Library/Application Support/Google/Chrome")`,
-  `(subpath "${esc(home)}/Library/Application Support/BraveSoftware")`,
-  `(subpath "${esc(home)}/Library/Application Support/Firefox")`,
-  `(subpath "${esc(home)}/Library/Safari")`,
-  `(subpath "${esc(home)}/Library/Containers/com.apple.Safari")`,
+const macHomeRead = (home: string): string[] => [
+  join(home, "Library", "Caches"),
+  join(home, "Library", "Preferences"),
 ];
 
 /**
- * Build the SBPL profile. Two asymmetric halves, because macOS forces it:
+ * Vendor credential FILES that sit INSIDE the re-allowed working-set config
+ * dirs (`~/.codex`, `~/.claude`) and so must be re-denied even though their
+ * parent dir is read-granted — the daemon writes config there but never needs
+ * the user's vendor tokens. Every OTHER user secret (`~/.ssh`, `~/.aws`,
+ * `~/.gnupg`, `~/.config/{gcloud,gh}`, the login keychain, browser cookies,
+ * and anything unenumerated) is already denied by the deny-`$HOME`-default and
+ * needs no explicit entry — that is the whole point of flipping to a whitelist.
+ */
+const credentialReadDeny = (home: string): string[] => [
+  `(literal "${esc(home)}/.codex/auth.json")`,
+  `(literal "${esc(home)}/.claude/.credentials.json")`,
+];
+
+/**
+ * Build the SBPL profile. WRITES and READS are now BOTH deny-by-default
+ * whitelists — parity with Linux Landlock (`landlock.ts`):
  *
- *   WRITES — **deny-by-default whitelist.** Only the daemon working set + the
- *   workflow targets (`working-set.ts`, incl. ~/.claude, ~/.codex, ~/.kimi-code,
- *   ~/.local/bin) + the macOS runtime ({@link macRuntimeWrite}) are writable.
- *   Everything else (the rest of `$HOME`, the system) is write-denied — strong
- *   tamper protection, and the model the request asked for.
+ *   WRITES — only the daemon working set + the workflow targets
+ *   (`working-set.ts`, incl. ~/.claude, ~/.codex, ~/.kimi-code, ~/.local/bin)
+ *   + the macOS runtime ({@link macRuntimeWrite}) are writable. Everything else
+ *   (the rest of `$HOME`, the system) is write-denied — tamper protection.
  *
- *   READS — **allow-default with a credential deny-list** ({@link readDenyList}).
- *   A read-WHITELIST is not viable: a spawned child's dynamic loader needs broad
- *   read access at `exec` (the dyld shared cache + dylibs), which `sandbox-exec`
- *   grants implicitly but a raw `sandbox_init` profile does not — a read-
- *   whitelist SIGABRTs EVERY child (`echo`, `open`, the vendor CLIs). So reads
- *   are open except the user's credential stores, which blocks the concrete
- *   exfiltration threat without breaking the login flows.
+ *   READS — **deny-by-default WITHIN `$HOME`, whitelisted.** Everything OUTSIDE
+ *   `$HOME` stays readable: the OS, the dyld shared cache, frameworks, the
+ *   vendor binaries, and the TLS trust store hold no USER secret, and the
+ *   dynamic loader needs broad system read at every child `exec`. Inside
+ *   `$HOME` only the daemon's own footprint (the working set + {@link
+ *   macHomeRead}) is granted, so the user's secrets are unreadable even if the
+ *   daemon is fully compromised. (The earlier note that a read-whitelist
+ *   "SIGABRTs every child" was a too-narrow system-read set, not a hard limit:
+ *   a `(require-not (subpath $HOME))` allow keeps the loader's reads open while
+ *   confining the only zone that holds secrets — validated in-process via
+ *   `sandbox_init` + child inheritance, `tests/sandbox`.)
  *
  * `(allow default)` keeps non-file ops (mach/IPC/process/network) allowed so
  * the OAuth browser launch + keychain access run. `(with kill)` is NOT used —
- * a denial is a graceful `EPERM`. (Full read-whitelist parity is the App
- * Sandbox, proposal Phase C, where the container grants the dyld essentials.)
+ * a denial is a graceful `EPERM`. SBPL is last-match-wins, so the trailing
+ * credential-file deny overrides the broader working-set allow above it.
  */
 const buildProfile = (home: string): string => {
   const ws = daemonWorkingSet();
   const writeAllow = [...ws.readWrite, ...macRuntimeWrite(home)]
     .map((p) => `  (subpath "${esc(p)}")`)
     .join("\n");
-  const readDeny = readDenyList(home)
+  // Re-allow the daemon's own footprint inside `$HOME` (the working set + the
+  // macOS runtime read paths). Non-home reads are blanket-allowed below, so the
+  // working-set entries that fall outside `$HOME` are redundant-but-harmless.
+  const readAllow = [...ws.readWrite, ...ws.readOnly, ...macHomeRead(home)]
+    .map((p) => `  (subpath "${esc(p)}")`)
+    .join("\n");
+  const readDeny = credentialReadDeny(home)
     .map((rule) => `  ${rule}`)
     .join("\n");
   return `(version 1)
@@ -119,9 +123,17 @@ const buildProfile = (home: string): string => {
 (deny file-write*)
 (allow file-write*
 ${writeAllow})
-; READS — allow by default (the dynamic loader needs broad read at exec, so a
-; read-whitelist SIGABRTs every child), but DENY the user's credential stores so
-; secrets can't be exfiltrated. See buildProfile() for the full rationale.
+; READS — deny-by-default WITHIN $HOME, whitelisted. Everything outside $HOME
+; stays readable (the dynamic loader needs broad system read at every child
+; exec, and no USER secret lives there); inside $HOME only the daemon footprint
+; is granted, so ~/.ssh, ~/.aws, keychains, browser cookies — every user secret
+; — are unreadable even if the daemon is fully compromised.
+(deny file-read*)
+(allow file-read* (require-not (subpath "${esc(home)}")))
+(allow file-read*
+${readAllow})
+; …but the vendor credential FILES inside the re-allowed config dirs stay denied
+; (last-match-wins): the daemon writes config there but never needs the tokens.
 (deny file-read*
 ${readDeny})
 `;

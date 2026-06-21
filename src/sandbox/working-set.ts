@@ -175,10 +175,11 @@ export const daemonWorkingSet = (): TWorkingSet => {
     // ── Dev-source-only grant (NEVER the shipped binary) ───────────────
     // A source/dev run executes `bun packages/daemon/src/main.ts`, so the
     // runtime must READ the repo's `.ts` sources + hoisted `node_modules`
-    // (e.g. `effect`) at import time. Landlock is a strict read-WHITELIST
-    // (unlike macOS Seatbelt, whose reads are open), so the repo root must be
-    // granted or the from-source daemon can't load its own modules under
-    // confinement. The COMPILED binary (`DAEMON_VERSION !== "0.0.0-dev"`) is
+    // (e.g. `effect`) at import time. Both backends are read-WHITELISTs
+    // (Landlock everywhere; macOS Seatbelt deny-by-default within `$HOME`), and
+    // a dev checkout lives under `$HOME`, so the repo root must be granted or
+    // the from-source daemon can't load its own modules under confinement. The
+    // COMPILED binary (`DAEMON_VERSION !== "0.0.0-dev"`) is
     // a self-contained executable in the state dir, needs no source tree, and
     // gets NO such grant — production confinement is unchanged. The repo root
     // is derived from this module's own location, so it's correct regardless
