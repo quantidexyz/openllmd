@@ -17,7 +17,8 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { stateDir } from "./env";
 
-const DEFAULT_LINES = 200;
+/** Initial tail length when `-n`/`--lines` isn't given. */
+export const DEFAULT_LOG_LINES = 200;
 const UNIT = "openllmd.service";
 const isMac = process.platform === "darwin";
 
@@ -30,7 +31,7 @@ export type TLogsOpts = { readonly follow: boolean; readonly lines: number };
  */
 export const parseLogsArgs = (args: readonly string[]): TLogsOpts | null => {
   let follow = false;
-  let lines = DEFAULT_LINES;
+  let lines = DEFAULT_LOG_LINES;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "-f" || a === "--follow") {

@@ -206,13 +206,18 @@ const main = async (): Promise<void> => {
             res = await handleInference(req);
           } catch (err) {
             logError("inference", err, { path: url.pathname });
+            // Carry CORS on the synthesized error too — a cross-origin dashboard
+            // call must see the JSON error payload, not a CORS failure (the
+            // success path inherits CORS from `handleInference`'s response).
+            const errorHeaders = new Headers(corsHeaders(req));
+            errorHeaders.set("content-type", "application/json");
             res = new Response(
               JSON.stringify({
                 error: {
                   message: err instanceof Error ? err.message : String(err),
                 },
               }),
-              { status: 500, headers: { "content-type": "application/json" } },
+              { status: 500, headers: errorHeaders },
             );
           }
           const headers = new Headers(res.headers);

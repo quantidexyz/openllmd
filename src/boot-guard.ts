@@ -43,8 +43,11 @@ export const shouldPark = (
   bootTimestamps: readonly number[],
   now: number,
 ): { recent: number[]; park: boolean } => {
+  // `t <= now` drops future-dated entries: a clock rollback (or a corrupt
+  // history) would otherwise make `now - t` negative — counted as in-window —
+  // and could falsely park the daemon.
   const recent = [...bootTimestamps, now].filter(
-    (t) => now - t < CRASH_WINDOW_MS,
+    (t) => t <= now && now - t < CRASH_WINDOW_MS,
   );
   return { recent, park: recent.length >= CRASH_LIMIT };
 };
