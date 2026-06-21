@@ -176,9 +176,17 @@ const parseArgs = (
     const a = argv[i];
     if (a === "--host") host = true;
     else if (a === "--installed") installed = true;
-    else if (a === "--target") target = argv[++i] ?? null;
-    else if (a === "--file") file = argv[++i] ?? null;
-    else throw new Error(`unknown argument: ${a}`);
+    else if (a === "--target" || a === "--file") {
+      // Require a real value: a missing one (`--file` at end of argv) or a
+      // flag-shaped one (`--file --host`) would otherwise silently leave the
+      // option null and switch verification mode — misleading "verified" output.
+      const v = argv[++i];
+      if (v === undefined || v.startsWith("--")) {
+        throw new Error(`${a} requires a value`);
+      }
+      if (a === "--target") target = v;
+      else file = v;
+    } else throw new Error(`unknown argument: ${a}`);
   }
   return { host, installed, target, file };
 };
