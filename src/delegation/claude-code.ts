@@ -32,19 +32,13 @@ import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@quantidexyz/openllmp";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
-import { logError, logInfo } from "../logger";
 import {
   clearPendingAuth,
   getPendingAuth,
   pendingAuthDetail,
   setPendingAuth,
 } from "../pending-auth";
-import {
-  hasSetupToken,
-  loadSetupToken,
-  SETUP_TOKEN_RE,
-  setSetupToken,
-} from "../setup-token";
+import { hasSetupToken, loadSetupToken } from "../setup-token";
 import {
   ensureAuthConfig,
   oauthConfig,
@@ -61,8 +55,6 @@ import {
   runCapture,
   spawnHeadlessLogin,
   spawnLogin,
-  spawnLoginPty,
-  stripAnsi,
   toEpochMs,
   writeIsolatedKeychain,
 } from "./util";
@@ -301,78 +293,6 @@ const authStatusLoggedIn = async (): Promise<boolean | null> => {
   }
 };
 
-/**
- * Run `claude setup-token` (a browser login on THIS box that prints a
- * long-lived `sk-ant-oat01-` token) and capture the token. Used by the
- * this-machine `connectSetupToken` (store locally) AND the remote-copy
- * `mintSetupToken` (return for sealing — never stored here).
- *
- * The token is parsed out of the CLI's terminal output, which is fragile:
- * colour codes can fuse onto it, a default 80-col width can line-wrap it, and
- * stdout/stderr can run together. We harden against all three — force a plain,
- * unwrapped render (NO_COLOR + TERM=dumb + a very wide COLUMNS), strip any
- * residual ANSI, and match the base64url token body (`[A-Za-z0-9_-]`, NOT `.`,
- * so a trailing sentence can't bleed in). A redacted diagnostic is logged so a
- * future "grabbed extra text" report can be pinned from `~/.openllm/openllmd.log`.
- * The token matcher is the SHARED `SETUP_TOKEN_RE` from `../setup-token`, so
- * capture, storage, and reload never disagree on what a valid token is.
- */
-const captureSetupToken = async (): Promise<
-  { token: string } | { error: string }
-> => {
-  if (!(await cliInstallState(PROVIDER)).installed) {
-    return {
-      error: "Install the Claude Code CLI from the Providers tab first.",
-    };
-  }
-  // macOS: setup-token is still an OAuth login, so the isolated keychain must
-  // exist (it may write session state alongside printing the token).
-  await ensureIsolatedKeychain(cliHome(PROVIDER));
-  // `claude setup-token` is a TTY-only interactive TUI: it writes the auth URL +
-  // token to its CONTROLLING TERMINAL, so spawned with a plain pipe (no TTY) it
-  // emits nothing and the daemon captured `outputLen: 0`. Run it under a PTY so
-  // it actually renders, and capture its terminal output. `until` returns the
-  // instant the token appears (the TUI can wedge/linger after printing it).
-  const result = await spawnLoginPty(
-    [bin(), "setup-token"],
-    {
-      ...env(),
-      // ONLY pin TERM (so the TUI renders under the PTY when the daemon's own
-      // env lacks one, e.g. under systemd). We deliberately do NOT force
-      // NO_COLOR / FORCE_COLOR=0 / COLUMNS / LINES: turning COLOR OFF flips
-      // `claude setup-token` into its NON-INTERACTIVE browser-OAuth path
-      // (`scope=user:inference`), which mints an `sk-ant-at01-` credential that
-      // is NOT a usable Bearer (401 even via the official CLI). With color left
-      // alone it takes the interactive session-mint path and emits a working
-      // `sk-ant-oat01-` access token. We strip ANSI from the captured output
-      // regardless, so inherited color is harmless; the PTY ioctl owns size.
-      TERM: process.env.TERM ?? "xterm-256color",
-    },
-    { until: SETUP_TOKEN_RE },
-  );
-  const cleaned = stripAnsi(result.output);
-  const match = cleaned.match(SETUP_TOKEN_RE);
-  if (match === null) {
-    logError("setup-token", "no token in `claude setup-token` output", {
-      code: result.code,
-      outputLen: cleaned.length,
-      // Safe (no token in THIS branch): a whitespace-collapsed sample so a TUI
-      // that fragments the token, or an onboarding/login screen blocking the
-      // flow, is diagnosable from openllmd.err.log.
-      sample: cleaned.replace(/\s+/g, " ").trim().slice(0, 400),
-    });
-    return {
-      error:
-        cleaned.length > 0
-          ? cleaned.replace(/\s+/g, " ").trim().slice(0, 300)
-          : `claude setup-token exited ${result.code} without a token`,
-    };
-  }
-  const token = match[0];
-  logInfo("setup-token", "captured setup token", { tokenLen: token.length });
-  return { token };
-};
-
 export const claudeCodeDelegate: TProviderDelegate = {
   slug: "claude_code",
 
@@ -484,22 +404,6 @@ export const claudeCodeDelegate: TProviderDelegate = {
           : `claude auth login exited ${result.code} without a stored credential`,
     };
   },
-
-  // This-machine setup-token: mint it here AND store it here (used when the
-  // daemon you're connecting IS this machine). The remote case uses
-  // `mintSetupToken` below + a sealed copy.
-  connectSetupToken: async () => {
-    const r = await captureSetupToken();
-    if ("error" in r) return { connected: false, detail: r.error };
-    setSetupToken(PROVIDER, r.token);
-    return { connected: true, detail: "setup token saved" };
-  },
-
-  // Remote-copy mint: run `claude setup-token` on THIS (the browser) machine
-  // and RETURN the token so the caller can SEAL it to a remote daemon's key
-  // and relay the ciphertext. Deliberately does NOT store it here — this box
-  // isn't the one being authenticated.
-  mintSetupToken: async () => captureSetupToken(),
 
   // Headless paste-back login for a REMOTE box (replaces the setup-token mint
   // for remote Claude): spawn `claude auth login --claudeai` with DISPLAY

@@ -34,28 +34,6 @@ export type TProviderDelegate = {
   }>;
 
   /**
-   * Obtain a long-lived SETUP-TOKEN via the official CLI's own flow (Claude
-   * Code only: `claude setup-token` — a browser login that mints a portable
-   * `sk-ant-oat01-` token), then store it on the box. Same shape + browser
-   * mechanics as `connect` (loopback-forwarded for a remote box); the token
-   * is captured locally and never crosses the cloud. Absent on providers
-   * without a setup-token flow (chatgpt/kimi use device-code).
-   */
-  connectSetupToken?: () => Promise<{
-    connected: boolean;
-    detail?: string;
-    pending?: boolean;
-  }>;
-
-  /**
-   * Remote-copy mint (Claude only): run the setup-token flow in the user's
-   * browser on THIS machine and RETURN the captured token so the caller can
-   * seal it to a remote daemon's key and relay the ciphertext. Does NOT store
-   * it locally (this box isn't the one being authenticated).
-   */
-  mintSetupToken?: () => Promise<{ token: string } | { error: string }>;
-
-  /**
    * Login for a REMOTE/headless box, surfacing an authorize URL via
    * pending-auth → status so the user authorizes in THEIR browser:
    *   - codex: the vendor's device-code flow (URL + one-time code, background

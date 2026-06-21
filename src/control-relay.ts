@@ -11,12 +11,11 @@
 import type { TDaemonCommand, TDaemonCommandAck } from "@quantidexyz/openllmp";
 import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { installCli } from "./cli-install";
-import { relayCredential } from "./cloud-client";
 import { latestVersion, refreshBootstrap } from "./config";
 import { getDelegate } from "./delegation";
 import { clearInstalling, setInstalling } from "./installing-state";
 import { runIntegration } from "./integrations";
-import { openSealed, sealTo } from "./keypair";
+import { openSealed } from "./keypair";
 import { clearPendingAuth } from "./pending-auth";
 import { maybeSelfUpdate } from "./self-update";
 import { setSetupToken } from "./setup-token";
@@ -107,25 +106,6 @@ export const runCommandInner = async (
           result: r,
         };
       }
-      case "connect_setup_token": {
-        // Obtain a setup-token via the provider's own flow (Claude only) —
-        // the daemon runs `claude setup-token`, captures the printed token,
-        // and stores it on the box. Same control-surface path as `connect`.
-        const delegate = getDelegate(cmd.payload.slug);
-        if (delegate?.connectSetupToken === undefined) {
-          return {
-            id: cmd.id,
-            status: "error",
-            result: { error: "setup token not supported for this provider" },
-          };
-        }
-        const r = await delegate.connectSetupToken();
-        return {
-          id: cmd.id,
-          status: r.connected || r.pending === true ? "done" : "error",
-          result: r,
-        };
-      }
       case "cancel_connect": {
         // Abort an in-flight device-code / browser login: the delegate kills
         // its spawned process / stops its background poll and clears the
@@ -162,59 +142,6 @@ export const runCommandInner = async (
         }
         const r = await delegate.logout();
         return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
-      }
-      case "mint_setup_token": {
-        // LOCAL daemon (this machine, browser signed in): mint a Claude
-        // setup-token here, SEAL it to the TARGET daemon's pubkey, and relay
-        // the ciphertext via the cloud. The token never touches this box's
-        // store nor the cloud in the clear.
-        const delegate = getDelegate(cmd.payload.slug);
-        if (delegate?.mintSetupToken === undefined) {
-          return {
-            id: cmd.id,
-            status: "error",
-            result: { error: "mint_setup_token: unsupported provider" },
-          };
-        }
-        const minted = await delegate.mintSetupToken();
-        if ("error" in minted) {
-          return {
-            id: cmd.id,
-            status: "error",
-            result: { error: minted.error },
-          };
-        }
-        try {
-          const sealed = sealTo(cmd.payload.target_pubkey, minted.token);
-          await relayCredential(cmd.payload.target_key, sealed);
-        } catch (err) {
-          return {
-            id: cmd.id,
-            status: "error",
-            result: {
-              error: err instanceof Error ? err.message : "relay failed",
-            },
-          };
-        }
-        return {
-          id: cmd.id,
-          status: "done",
-          result: { relayed: true },
-        };
-      }
-      case "receive_setup_token": {
-        // TARGET daemon: open the sealed setup-token with our own key and
-        // store it. We're now authenticated via the caller's browser identity.
-        const token = openSealed(cmd.payload.sealed);
-        if (token === null) {
-          return {
-            id: cmd.id,
-            status: "error",
-            result: { error: "could not open sealed credential" },
-          };
-        }
-        setSetupToken("claude_code", token);
-        return { id: cmd.id, status: "done", result: { received: true } };
       }
       case "submit_login_code": {
         // TARGET (remote) daemon: open the sealed OAuth authorization code the
