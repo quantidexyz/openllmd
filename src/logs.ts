@@ -64,7 +64,7 @@ const tailFile = (opts: TLogsOpts): number => {
   const file = join(stateDir(), "openllmd.log");
   if (!existsSync(file)) {
     process.stderr.write(`no log file yet at ${file}\n`);
-    return 0;
+    return 1; // distinguish "nothing to show" from a clean tail for `$?` callers
   }
   const args = ["-n", String(opts.lines)];
   if (opts.follow) args.push("-F"); // -F follows across rotation (.log → .log.1)

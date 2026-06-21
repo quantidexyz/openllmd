@@ -62,12 +62,14 @@ const tryRun = (cmd: string, args: readonly string[]): boolean => {
   }
 };
 
-/** Run a command and capture stdout (empty string on failure). */
+/** Run a command and capture stdout (empty string on failure). The 5s timeout
+ *  keeps a hung supervisor (e.g. a wedged systemctl) from hanging the CLI. */
 const capture = (cmd: string, args: readonly string[]): string => {
   try {
     return execFileSync(cmd, args as string[], {
       stdio: ["ignore", "pipe", "ignore"],
       encoding: "utf-8",
+      timeout: 5000,
     });
   } catch {
     return "";
@@ -426,7 +428,7 @@ const supervisorState = (): string => {
 const probeHealth = async (port: number): Promise<TDaemonHealth | null> => {
   try {
     const res = await fetch(`http://127.0.0.1:${port}/status`, {
-      signal: AbortSignal.timeout(750),
+      signal: AbortSignal.timeout(1500),
     });
     return res.ok ? ((await res.json()) as TDaemonHealth) : null;
   } catch {

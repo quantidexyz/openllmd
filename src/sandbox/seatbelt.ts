@@ -108,9 +108,14 @@ const buildProfile = (home: string): string => {
     .map((p) => `  (subpath "${esc(p)}")`)
     .join("\n");
   // Re-allow the daemon's own footprint inside `$HOME` (the working set + the
-  // macOS runtime read paths). Non-home reads are blanket-allowed below, so the
-  // working-set entries that fall outside `$HOME` are redundant-but-harmless.
+  // macOS runtime read paths). Non-home reads are blanket-allowed below, so only
+  // in-`$HOME` paths need explicit re-granting — everything outside is already
+  // covered by the `(require-not (subpath $HOME))` allow. Filter them out so the
+  // profile carries only live rules (on a prod build `ws.readOnly` is entirely
+  // system paths, so the unfiltered list was all dead rules).
+  const inHome = (p: string): boolean => p === home || p.startsWith(`${home}/`);
   const readAllow = [...ws.readWrite, ...ws.readOnly, ...macHomeRead(home)]
+    .filter(inHome)
     .map((p) => `  (subpath "${esc(p)}")`)
     .join("\n");
   const readDeny = credentialReadDeny(home)
