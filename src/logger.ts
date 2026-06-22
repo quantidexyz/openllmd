@@ -77,18 +77,23 @@ const write = (
     // Logging is best-effort — never let it throw into the caller.
   }
   try {
-    // The boot readiness sentinel ("openllmd v<VERSION> listening on :<port>")
-    // in main.ts must be a single plain-text line on stdout, but all other
-    // structured JSON logs go to stderr during bootstrap. The "boot" scope
-    // carries the readiness message; send all JSON to stderr so the sentinel
-    // stands alone on stdout.
+    // Split stdout/stderr BY LEVEL so the launch agent's `openllmd.err.log`
+    // (← stderr) holds only faults — NOT a near-duplicate of the combined
+    // `openllmd.log`. Readiness is an HTTP `/status` probe (`service.ts`
+    // `probeHealth`), NOT a stdout parse, so info/debug JSON on stdout can't
+    // break the bootstrap contract — the earlier "send everything to stderr so
+    // the sentinel stands alone" rule was unnecessary and made err.log mirror
+    // the combined log.
     if (scope === "boot" && level === "info") {
-      // Plain sentinel line to stdout (the install-time launcher reads it).
+      // The readiness line stays a single PLAIN-text line on stdout (humans
+      // tailing openllmd.out.log; the install-time launcher logs it).
       process.stdout.write(`${message}\n`);
-    } else {
-      // All other logs (JSON-structured) go to stderr so they don't break
-      // the bootstrap readiness contract.
+    } else if (level === "error" || level === "warn") {
+      // Faults → stderr → openllmd.err.log (errors + warns ONLY).
       process.stderr.write(line);
+    } else {
+      // Routine info/debug → stdout → openllmd.out.log.
+      process.stdout.write(line);
     }
   } catch {
     // streams may be closed under a service manager — ignore.
