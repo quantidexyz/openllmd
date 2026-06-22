@@ -188,6 +188,17 @@ export const daemonWorkingSet = (): TWorkingSet => {
     ...(DAEMON_VERSION === "0.0.0-dev"
       ? [resolve(import.meta.dir, "..", "..", "..", "..")]
       : []),
+    // ── Host (non-isolated) CLI install dirs — READ-only, for adoption ──
+    // The isolated-CLI install fast path COPIES the user's already-installed
+    // vendor binary into the isolated env instead of re-downloading it
+    // (`cli-install.ts` `adoptHostCli`). The codex (`~/.codex`) and kimi
+    // (`~/.kimi-code`) homes are already read-write above, so only claude's
+    // install dir needs a READ grant: the `~/.local/bin/claude` launcher
+    // resolves to `~/.local/share/claude/versions/<v>`, outside the working
+    // set. This is the user's own claude BINARY (no credentials — those live in
+    // `~/.claude`), so a read grant is low-risk; adoption falls back to a fresh
+    // download when the source isn't present/readable.
+    join(home, ".local", "share", "claude"),
     // Toolchain + loaders for spawned children (bash, curl, vendor CLIs).
     "/usr",
     "/lib",

@@ -12,6 +12,8 @@
  *     bin/<binary>     the isolated CLI executable
  *     home/            the CLI's home/config + credentials (isolated)
  */
+
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type { TSubscriptionProviderSlug } from "@quantidexyz/openllmp";
 import { stateDir } from "./env";
@@ -48,6 +50,39 @@ export const cliHome = (provider: TCliProvider): string =>
 /** Absolute path to the installed isolated binary. */
 export const cliBin = (provider: TCliProvider): string =>
   join(cliRoot(provider), SPECS[provider].binRel);
+
+/**
+ * Candidate paths to the user's EXISTING non-isolated vendor CLI, in priority
+ * order — the install fast path (`cli-install.ts` `adoptHostCli`) copies the
+ * first one that resolves to a WORKING binary into the isolated env instead of
+ * re-downloading from upstream (no network, instant onboarding). Symlinks are
+ * resolved before copying, and the result is verified by running `--version`
+ * isolated, so a non-runnable candidate is harmless (falls back to download).
+ *
+ * Only paths the daemon can READ under the OS sandbox yield a hit: the codex
+ * (`~/.codex`) + kimi (`~/.kimi-code`) homes (read-write working set) and
+ * claude's install dir (`~/.local/share/claude`, granted read-only in
+ * `working-set.ts`) + anything outside `$HOME`; others simply fall back.
+ */
+export const hostCliCandidates = (provider: TCliProvider): string[] => {
+  const home = homedir();
+  switch (provider) {
+    case "claude_code":
+      // The official installer's launcher → resolves to
+      // ~/.local/share/claude/versions/<v> (the self-contained binary).
+      return [join(home, ".local", "bin", "claude")];
+    case "chatgpt":
+      return [
+        join(home, ".local", "bin", "codex"),
+        join(home, ".codex", "bin", "codex"),
+      ];
+    case "kimi_code":
+      return [
+        join(home, ".kimi-code", "bin", "kimi"),
+        join(home, ".local", "bin", "kimi"),
+      ];
+  }
+};
 
 /**
  * The CLI's home/config root as the CLI itself sees it (the value of its
