@@ -13,7 +13,7 @@
  * only.
  */
 import { chmodSync, existsSync } from "node:fs";
-import { mkdir, rename, rm } from "node:fs/promises";
+import { mkdir, readdir, rename, rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { dirname, join } from "node:path";
 import { logError } from "../logger";
@@ -706,7 +706,18 @@ const ensureKeychainNow = async (home: string, kc: string): Promise<void> => {
     // use the explicit path. See
     // docs/audit/2026-06-22-daemon-mac-sandbox-failures.md §3.
     const staging = join(dir, `.openllm-staging-${process.pid}.keychain-db`);
-    await rm(staging, { force: true });
+    // Sweep orphaned staging files from a prior run that crashed between
+    // create + rename (the filename carries the pid, so they'd otherwise
+    // accumulate). Best-effort.
+    try {
+      for (const f of await readdir(dir)) {
+        if (f.startsWith(".openllm-staging-") && f.endsWith(".keychain-db")) {
+          await rm(join(dir, f), { force: true });
+        }
+      }
+    } catch {
+      // dir unreadable / race — non-fatal
+    }
     const created = await runSecurity(
       ["create-keychain", "-p", "", staging],
       home,

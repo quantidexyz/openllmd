@@ -77,10 +77,12 @@ const write = (
     // Unserializable meta — drop it rather than throw; keep the message.
     line = `${JSON.stringify({ ts: new Date().toISOString(), level, scope, message })}\n`;
   }
+  let wroteCombinedLog = false;
   try {
     mkdirSync(stateDir(), { recursive: true });
     rotateIfBig(logFile());
     appendFileSync(logFile(), line, { mode: 0o600 });
+    wroteCombinedLog = true;
   } catch {
     // Logging is best-effort — never let it throw into the caller.
   }
@@ -99,6 +101,12 @@ const write = (
     // stdout parse, so this line is informational only.
     if (scope === "boot" && level === "info") {
       process.stdout.write(`${message}\n`);
+    } else if (!wroteCombinedLog) {
+      // Failure-only fallback: when the combined-log file write failed (disk
+      // full, perms, read-only FS), echo to stderr so a fault during filesystem
+      // trouble isn't a total diagnostics blind spot. In healthy operation this
+      // never fires, so out/err stay free of structured-log duplication.
+      process.stderr.write(line);
     }
   } catch {
     // streams may be closed under a service manager — ignore.

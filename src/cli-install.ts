@@ -37,6 +37,11 @@ const INSTALL_SCRIPT: Readonly<Record<TCliProvider, string>> = {
   kimi_code: "https://code.kimi.com/kimi-code/install.sh",
 };
 
+/** Hard ceiling for a vendor install — a stalled download/install is killed so
+ *  it can't wedge the daemon's serial control loop. Generous (binaries are
+ *  100MB+), short enough to fail visibly rather than hang forever. */
+const INSTALL_TIMEOUT_MS = 5 * 60_000;
+
 export type TCliInstallState = {
   readonly installed: boolean;
   readonly version: string | null;
@@ -101,12 +106,34 @@ export const ensureHostCli = async (
     stderr: "pipe",
     env: { ...process.env, TMPDIR: daemonTempDir() },
   });
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-  await proc.exited;
-  const output = `${stdout}${stderr}`.trim();
+  // Bound the installer so a stalled download/install can't wedge the
+  // serial control loop forever — kill it and surface a timeout.
+  let timedOut = false;
+  const killTimer = setTimeout(() => {
+    timedOut = true;
+    try {
+      proc.kill("SIGKILL");
+    } catch {
+      // already exited
+    }
+  }, INSTALL_TIMEOUT_MS);
+  let output: string;
+  try {
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    await proc.exited;
+    output = `${stdout}${stderr}`.trim();
+  } finally {
+    clearTimeout(killTimer);
+  }
+  if (timedOut) {
+    return {
+      path: null,
+      output: `timed out after ${INSTALL_TIMEOUT_MS / 1000}s installing ${provider}\n${output.slice(-400)}`,
+    };
+  }
 
   const installed = candidates.find((c) => existsSync(c));
   return {
