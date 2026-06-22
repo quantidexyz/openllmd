@@ -61,7 +61,16 @@ export const runCommandInner = async (
         setInstalling(slug);
         try {
           const r = await installCli(slug);
-          return { id: cmd.id, status: "done", result: r };
+          // The vendor installer can run to completion yet never produce a
+          // working binary (sandbox EACCES, network failure, …). Reflect the
+          // REAL outcome in the ack status so the dashboard shows the failure
+          // (and `r.output` carries the installer tail) instead of a misleading
+          // "done". See docs/audit/2026-06-22-daemon-mac-sandbox-failures.md §2.
+          return {
+            id: cmd.id,
+            status: r.installed ? "done" : "error",
+            result: r,
+          };
         } finally {
           clearInstalling(slug);
         }
