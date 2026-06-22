@@ -1,20 +1,28 @@
 /**
- * Daemon logs. Two destinations, by design:
+ * Daemon logs. ONE structured destination, plus native-only stream capture —
+ * no duplication between files:
  *
- *   1. `~/.openllm/openllmd.log` — the COMBINED stream (every level), one
+ *   1. `~/.openllm/openllmd.log` — the SINGLE structured log: every level, one
  *      timestamped JSON line per event, rotated past a size cap. The canonical
- *      `tail -f ~/.openllm/openllmd.log` target.
- *   2. stdout / stderr, split BY LEVEL — `error`/`warn` go to **stderr**,
- *      `info`/`debug` to **stdout**. The launch agent routes those to separate
- *      files (`openllmd.err.log` ← stderr, `openllmd.out.log` ← stdout — see
- *      `service.ts`), so the ERROR log holds only faults + their culprits and
- *      isn't drowned by routine info. systemd's journald captures both streams
- *      together; the split still tags each line's level.
+ *      `tail -f` / `openllmd logs` target. Find faults by grepping
+ *      `"level":"error"` (or `"warn"`); every scope is tagged.
+ *   2. `openllmd.out.log` / `openllmd.err.log` — the OS supervisor's capture of
+ *      the daemon's raw stdout / stderr (launchd `StandardOut/ErrorPath`,
+ *      systemd `append:` — see `service.ts`). These are reserved for NATIVE
+ *      output the app logger CAN'T produce (Bun panics, uncaught exceptions,
+ *      OOM, a sandbox SIGKILL's dying breath). The app does NOT echo its
+ *      structured logs to the streams, so out/err NEVER duplicate the combined
+ *      log — `err.log` is crash forensics, usually empty in steady state.
+ *
+ * The one stream write the app makes is the boot readiness line (a plain stdout
+ * line → out.log, for humans + the install-time launcher); readiness GATING is
+ * the HTTP `/status` probe (`service.ts`), not a stdout parse.
  *
  * The daemon is headless and the control loop deliberately BACKS OFF on errors
  * instead of crashing — so a relay 404, a sealed-open miss, an unreachable
  * cloud, or a SANDBOX-KILLED child used to vanish with no trace. These helpers
- * make every fault land in the error stream with enough context to diagnose it.
+ * make every fault land in `openllmd.log` at `error` level with enough context
+ * to diagnose it.
  *
  * Best-effort + self-contained: never throws (a logging failure must not take
  * down the daemon), depends only on `stateDir`, rotates past a size cap.
@@ -77,23 +85,20 @@ const write = (
     // Logging is best-effort — never let it throw into the caller.
   }
   try {
-    // Split stdout/stderr BY LEVEL so the launch agent's `openllmd.err.log`
-    // (← stderr) holds only faults — NOT a near-duplicate of the combined
-    // `openllmd.log`. Readiness is an HTTP `/status` probe (`service.ts`
-    // `probeHealth`), NOT a stdout parse, so info/debug JSON on stdout can't
-    // break the bootstrap contract — the earlier "send everything to stderr so
-    // the sentinel stands alone" rule was unnecessary and made err.log mirror
-    // the combined log.
+    // App structured logs go ONLY to the combined `openllmd.log` (the
+    // appendFileSync above). They are deliberately NOT echoed to stdout/stderr:
+    // the supervisor-captured `openllmd.out.log` (← stdout) / `openllmd.err.log`
+    // (← stderr) are reserved for NATIVE output the app logger can't produce
+    // (Bun panics, uncaught crashes, OOM) — so those files never DUPLICATE the
+    // combined log. Find app errors by grepping `openllmd.log` for
+    // `"level":"error"` (or `openllmd logs`); `err.log` is crash forensics.
+    //
+    // The ONE exception: the boot readiness line, emitted as a single PLAIN
+    // stdout line (→ out.log) for humans + the install-time launcher. Readiness
+    // GATING is the HTTP `/status` probe (`service.ts probeHealth`), not a
+    // stdout parse, so this line is informational only.
     if (scope === "boot" && level === "info") {
-      // The readiness line stays a single PLAIN-text line on stdout (humans
-      // tailing openllmd.out.log; the install-time launcher logs it).
       process.stdout.write(`${message}\n`);
-    } else if (level === "error" || level === "warn") {
-      // Faults → stderr → openllmd.err.log (errors + warns ONLY).
-      process.stderr.write(line);
-    } else {
-      // Routine info/debug → stdout → openllmd.out.log.
-      process.stdout.write(line);
     }
   } catch {
     // streams may be closed under a service manager — ignore.
