@@ -1,19 +1,21 @@
 /**
- * Install / locate the daemon's OWN isolated copies of the vendor CLIs,
- * so it never collides with the user's personal `~/.claude` / `~/.codex`
- * / `~/.kimi-code` setups. Each CLI is installed under
- * `<stateDir>/cli/<provider>/` and run with an isolated home (see
- * `cli-paths.ts`). This is the SINGLE isolated-CLI install path: the
- * Claude harness (`tests/matrix/claude-harness/harness.ts`) reuses it
- * rather than maintaining its own download.
+ * Provision the daemon's isolated view of the vendor CLIs WITHOUT duplicating
+ * any bytes on disk. There is ONE binary per CLI — the user's NON-isolated copy
+ * — and the isolated path under `<stateDir>/cli/<provider>/` is always a
+ * SYMLINK to it. Isolation is preserved by the RUN env (`cliEnv` points
+ * HOME/config at the isolated dir), not by a separate binary, so credentials +
+ * config never collide with the user's personal `~/.claude` / `~/.codex` /
+ * `~/.kimi-code` while the binary itself is shared.
  *
- * All three install via the OFFICIAL vendor script, with the install
- * location + home redirected into the provider dir via `cliEnv`:
+ * Single install path (no reverse copy): if the user already has the CLI (or
+ * ran the integrations setup first, which installs it), it's reused as-is;
+ * otherwise the OFFICIAL vendor installer runs ONCE for the non-isolated
+ * location. Either way the isolated path is then symlinked to it:
  *   claude → https://claude.ai/install.sh
  *   codex  → https://chatgpt.com/codex/install.sh
  *   kimi   → https://code.kimi.com/kimi-code/install.sh
  */
-import { chmodSync, copyFileSync, existsSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, symlinkSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 import {
@@ -27,6 +29,7 @@ import {
 } from "./cli-paths";
 import { runCapture } from "./delegation/util";
 import { logInfo } from "./logger";
+import { daemonTempDir } from "./sandbox/working-set";
 
 const INSTALL_SCRIPT: Readonly<Record<TCliProvider, string>> = {
   claude_code: "https://claude.ai/install.sh",
@@ -64,91 +67,39 @@ const ensureIsolatedDirs = async (provider: TCliProvider): Promise<void> => {
   await mkdir(cliConfigDir(provider), { recursive: true });
 };
 
-/**
- * Install fast path: ADOPT the user's already-installed non-isolated vendor CLI
- * by copying its binary into the isolated env — skipping the upstream download
- * entirely (no network, instant onboarding, no duplicate bytes pulled). For each
- * candidate (`cli-paths.ts` `hostCliCandidates`, priority order) it resolves
- * symlinks to the real binary, copies it to the isolated bin path, and VERIFIES
- * it actually runs there (`cliInstallState` → `<bin> --version` under the
- * isolation env). A candidate that can't be read (OS sandbox), copied, or run
- * isolated (a wrapper script, wrong arch, missing deps) is discarded so the next
- * candidate — and ultimately the download path — still gets a chance.
- *
- * Returns the install state on success, or null when no candidate yields a
- * working binary (the caller then downloads as before). `candidates` is
- * injectable for tests; production callers use the default.
- */
-export const adoptHostCli = async (
-  provider: TCliProvider,
-  candidates: readonly string[] = hostCliCandidates(provider),
-): Promise<TCliInstallResult | null> => {
-  const dst = cliBin(provider);
-  for (const candidate of candidates) {
-    try {
-      if (!existsSync(candidate)) continue;
-      // Follow symlinks to the real binary — the launcher in ~/.local/bin is
-      // often a symlink into a versions dir; copying the link would dangle.
-      const real = realpathSync(candidate);
-      if (real === dst) continue;
-      await ensureIsolatedDirs(provider);
-      await mkdir(dirname(dst), { recursive: true });
-      copyFileSync(real, dst);
-      chmodSync(dst, 0o755);
-      // Verify it actually RUNS isolated: require a parsed version, not mere
-      // existence (`cliInstallState.installed` is true for any present file). A
-      // successful `--version` is the proof the copied binary is self-contained
-      // and runnable under the isolation env.
-      const state = await cliInstallState(provider);
-      if (state.installed && state.version !== null) {
-        logInfo("cli-install", `adopted host ${provider} CLI (no download)`, {
-          provider,
-          source: real,
-          version: state.version,
-        });
-        return { installed: true, version: state.version, output: "" };
-      }
-      // Copied but doesn't run isolated — discard and try the next candidate.
-      await rm(dst, { force: true });
-    } catch {
-      // Unreadable source (sandbox deny), copy failure, etc. — try next.
-    }
-  }
-  return null;
+export type TEnsureHostResult = {
+  /** Path to the user's non-isolated CLI binary, or null if it couldn't be
+   *  provisioned. */
+  readonly path: string | null;
+  /** Installer output tail when an install was attempted and failed. */
+  readonly output: string;
 };
 
 /**
- * Provision the isolated CLI for `provider`. Idempotent. Order:
- *   1. already installed → no-op;
- *   2. ADOPT the user's non-isolated CLI binary if present (fast, offline);
- *   3. otherwise run the vendor install script, redirected into the isolated
- *      provider dir (`cliEnv` points HOME/install-dir/TMPDIR inside it and skips
- *      shell-rc edits). Returns the resulting install state + captured output.
+ * Ensure the user's NON-isolated vendor CLI exists, returning its binary path.
+ * The SINGLE install path: if the CLI is already present (the user had it, or
+ * the integrations setup installed it first) it's reused untouched; otherwise
+ * the OFFICIAL vendor installer runs ONCE for the default (non-isolated)
+ * location. No isolated copy is ever downloaded.
+ *
+ * The install runs with the DEFAULT env (so the binary lands in the user's own
+ * `~/.local/bin` etc. and the installer wires up PATH) — only `TMPDIR` is
+ * redirected to a sandbox-granted dir so the installer's `mktemp` doesn't EACCES
+ * on the ungranted `/tmp`. `candidates` is injectable for tests.
  */
-export const installCli = async (
+export const ensureHostCli = async (
   provider: TCliProvider,
-): Promise<TCliInstallResult> => {
-  // Fast-path: already installed.
-  const existing = await cliInstallState(provider);
-  if (existing.installed) {
-    return { installed: true, version: existing.version, output: "" };
-  }
+  candidates: readonly string[] = hostCliCandidates(provider),
+): Promise<TEnsureHostResult> => {
+  const present = candidates.find((c) => existsSync(c));
+  if (present !== undefined) return { path: present, output: "" };
 
-  // Fast-path: adopt the user's existing non-isolated CLI binary (no download).
-  const adopted = await adoptHostCli(provider);
-  if (adopted !== null) return adopted;
-
-  // Ensure the isolated dirs exist before the script writes into them.
-  await ensureIsolatedDirs(provider);
-
-  // `curl -fsSL <url> | bash` with the isolation env merged. We run it
-  // through a shell so the vendor script's own pipeline works verbatim.
   const url = INSTALL_SCRIPT[provider];
   const proc = Bun.spawn(["bash", "-c", `curl -fsSL ${url} | bash`], {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env, ...cliEnv(provider) },
+    env: { ...process.env, TMPDIR: daemonTempDir() },
   });
   const [stdout, stderr] = await Promise.all([
     new Response(proc.stdout).text(),
@@ -157,12 +108,75 @@ export const installCli = async (
   await proc.exited;
   const output = `${stdout}${stderr}`.trim();
 
-  const state = await cliInstallState(provider);
+  const installed = candidates.find((c) => existsSync(c));
   return {
-    installed: state.installed,
+    path: installed ?? null,
+    output: installed !== undefined ? "" : output.slice(-500),
+  };
+};
+
+/**
+ * Point the isolated CLI path (`cliBin(provider)`) at the host binary via a
+ * SYMLINK — never a copy, so the isolated CLI takes no disk space. Replaces any
+ * existing link/file at the isolated path so it always tracks the current host
+ * binary (e.g. after the user updates their CLI).
+ */
+export const linkIsolatedCli = async (
+  provider: TCliProvider,
+  hostBin: string,
+): Promise<void> => {
+  await ensureIsolatedDirs(provider);
+  const dst = cliBin(provider);
+  await mkdir(dirname(dst), { recursive: true });
+  await rm(dst, { force: true });
+  symlinkSync(hostBin, dst);
+};
+
+/**
+ * Provision the isolated CLI for `provider`. Idempotent. Order:
+ *   1. isolated symlink already present + runnable → no-op;
+ *   2. ensure the user's NON-isolated CLI exists (reuse, else official install);
+ *   3. SYMLINK the isolated path to it (no copy — zero duplicate bytes).
+ * Isolation comes from the run env (`cliEnv`), not a separate binary.
+ */
+export const installCli = async (
+  provider: TCliProvider,
+): Promise<TCliInstallResult> => {
+  // Fast-path: the isolated path is ALREADY a symlink that resolves to a
+  // runnable binary. A regular FILE here is a legacy COPY (from the older
+  // copy-based daemon) — deliberately fall through so it gets replaced by a
+  // symlink, reclaiming the duplicate bytes.
+  const dst = cliBin(provider);
+  if (existsSync(dst) && lstatSync(dst).isSymbolicLink()) {
+    const existing = await cliInstallState(provider);
+    if (existing.installed && existing.version !== null) {
+      return { installed: true, version: existing.version, output: "" };
+    }
+  }
+
+  // Ensure the single (non-isolated) binary exists — reuse or install once.
+  const host = await ensureHostCli(provider);
+  if (host.path === null) {
+    return { installed: false, version: null, output: host.output };
+  }
+
+  // Point the isolated CLI at it (symlink — no duplicate data).
+  await linkIsolatedCli(provider, host.path);
+
+  const state = await cliInstallState(provider);
+  if (state.installed && state.version !== null) {
+    logInfo("cli-install", `linked isolated ${provider} CLI → host (no copy)`, {
+      provider,
+      host: host.path,
+      version: state.version,
+    });
+  }
+  return {
+    installed: state.installed && state.version !== null,
     version: state.version,
-    // Surface the tail of the installer output when it didn't produce a
-    // working binary, so the dashboard can show why.
-    output: state.installed ? "" : output.slice(-500),
+    output:
+      state.installed && state.version !== null
+        ? ""
+        : "isolated symlink did not resolve to a runnable binary",
   };
 };

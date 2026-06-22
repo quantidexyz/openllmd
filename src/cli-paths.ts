@@ -53,16 +53,15 @@ export const cliBin = (provider: TCliProvider): string =>
 
 /**
  * Candidate paths to the user's EXISTING non-isolated vendor CLI, in priority
- * order — the install fast path (`cli-install.ts` `adoptHostCli`) copies the
- * first one that resolves to a WORKING binary into the isolated env instead of
- * re-downloading from upstream (no network, instant onboarding). Symlinks are
- * resolved before copying, and the result is verified by running `--version`
- * isolated, so a non-runnable candidate is harmless (falls back to download).
+ * order — `cli-install.ts` `ensureHostCli` returns the first that exists (else
+ * installs the official CLI there once), and `installCli` SYMLINKS the isolated
+ * path to it (no copy, zero duplicate bytes). The single binary on disk is the
+ * non-isolated one; the isolated CLI is always a link to it.
  *
- * Only paths the daemon can READ under the OS sandbox yield a hit: the codex
+ * The symlink target must be EXEC-able under the OS sandbox: the codex
  * (`~/.codex`) + kimi (`~/.kimi-code`) homes (read-write working set) and
- * claude's install dir (`~/.local/share/claude`, granted read-only in
- * `working-set.ts`) + anything outside `$HOME`; others simply fall back.
+ * claude's install dir (`~/.local/share/claude`, granted in `working-set.ts`)
+ * + anything outside `$HOME` all qualify.
  */
 export const hostCliCandidates = (provider: TCliProvider): string[] => {
   const home = homedir();

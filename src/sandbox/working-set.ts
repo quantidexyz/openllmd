@@ -150,8 +150,31 @@ export const daemonWorkingSet = (): TWorkingSet => {
     //   kimi-code (non-isolated setup): ~/.kimi-code.
     join(home, ".kimi-code"),
     //   the user-level bin dir: the `openllmd` PATH symlink AND where the
-    //   non-isolated `claude install` drops its launcher.
+    //   non-isolated `claude`/`codex` installers drop their launcher + where the
+    //   setup fast path copies an adopted CLI binary.
     join(home, ".local", "bin"),
+    //   claude's install dir: the `~/.local/bin/claude` launcher resolves to
+    //   `~/.local/share/claude/versions/<v>`. The official `claude install`
+    //   WRITES versions here, and the daemon's isolated CLI is a SYMLINK to that
+    //   launcher — so EXECUTING the isolated claude reads through to this dir.
+    //   Read-write so the setup can install claude AND the isolated symlink can
+    //   run it. The user's own claude binary — no credentials (those live in
+    //   `~/.claude`).
+    join(home, ".local", "share", "claude"),
+    //   shell rc / profile files: the non-isolated setup's tier-3 official
+    //   installers (codex/kimi/claude) append a PATH line to the user's shell
+    //   profile so the freshly-installed CLI is on PATH. Only these specific
+    //   files are granted (existing ones grant the file; absent ones the
+    //   to-be-created path), NOT all of `$HOME` — the tamper guard stays tight
+    //   everywhere else. SECURITY NOTE: this is a deliberate, scoped widening of
+    //   the deny-`$HOME` tamper guard to let the setup wire up PATH; a
+    //   compromised daemon could append to these startup files, so the set is
+    //   kept to the minimum the installers touch.
+    join(home, ".zshrc"),
+    join(home, ".zprofile"),
+    join(home, ".bashrc"),
+    join(home, ".bash_profile"),
+    join(home, ".profile"),
     //   the integration scripts' OWN staging dir: the shared script preamble
     //   (`packages/api/lib/scripts.ts` `pick_tmpdir`) points TMPDIR at
     //   `$HOME/.cache/openllm` (the root fs, to dodge the small /tmp tmpfs on
@@ -188,17 +211,9 @@ export const daemonWorkingSet = (): TWorkingSet => {
     ...(DAEMON_VERSION === "0.0.0-dev"
       ? [resolve(import.meta.dir, "..", "..", "..", "..")]
       : []),
-    // ── Host (non-isolated) CLI install dirs — READ-only, for adoption ──
-    // The isolated-CLI install fast path COPIES the user's already-installed
-    // vendor binary into the isolated env instead of re-downloading it
-    // (`cli-install.ts` `adoptHostCli`). The codex (`~/.codex`) and kimi
-    // (`~/.kimi-code`) homes are already read-write above, so only claude's
-    // install dir needs a READ grant: the `~/.local/bin/claude` launcher
-    // resolves to `~/.local/share/claude/versions/<v>`, outside the working
-    // set. This is the user's own claude BINARY (no credentials — those live in
-    // `~/.claude`), so a read grant is low-risk; adoption falls back to a fresh
-    // download when the source isn't present/readable.
-    join(home, ".local", "share", "claude"),
+    // (~/.local/share/claude is granted READ-WRITE in the readWrite set above —
+    //  it serves both the install fast-path adoption READ and the non-isolated
+    //  setup's tier-3 claude install WRITE.)
     // Toolchain + loaders for spawned children (bash, curl, vendor CLIs).
     "/usr",
     "/lib",
