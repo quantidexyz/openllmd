@@ -10,9 +10,9 @@ import type { TDaemonStatus } from "@quantidexyz/openllmp";
 import { autoUpdateEnabled } from "./auto-update-pref";
 import { getCloudState } from "./config";
 import { DELEGATES } from "./delegation";
+import { getInstalledIntegrations } from "./device-state";
 import { daemonPort, hasApiKey } from "./env";
 import { isInstalling } from "./installing-state";
-import { detectInstalledIntegrations } from "./integrations-detect";
 import { daemonPublicKey } from "./keypair";
 import { sandboxState } from "./sandbox/landlock";
 import { cachedUsage } from "./usage-cache";
@@ -49,6 +49,9 @@ export const computeStatus = async (): Promise<TDaemonStatus> => {
     port: daemonPort(),
     sandbox: sandboxState(),
     connections,
-    integrations: detectInstalledIntegrations(),
+    // Cached manifest-driven device state (refreshed by the `-s` walk on boot
+    // + after install/uninstall + on refresh), NOT a live scan — the walk is
+    // too heavy to run on every status push.
+    integrations: getInstalledIntegrations(),
   };
 };

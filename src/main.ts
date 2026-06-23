@@ -30,6 +30,7 @@ import {
   stopControlChannel,
 } from "./control-channel";
 import { corsHeaders, isPreflight, preflightResponse } from "./cors";
+import { refreshDeviceState } from "./device-state";
 import { daemonPort, deviceId, hasApiKey, isDevMode, stateDir } from "./env";
 import { buildHealth } from "./health";
 import { handleInference } from "./listener";
@@ -127,6 +128,16 @@ const main = async (): Promise<void> => {
   // already current). Fire-and-forget: it self-guards and, when it updates,
   // swaps the binary + exits once `/v1` is idle so the supervisor relaunches.
   void maybeSelfUpdate(latestVersion());
+  // Eager manifest-driven device-state walk (`install.sh -s` per registry item)
+  // once the cloud is reachable, so the dashboard's Integrations tab paints
+  // installed-state on first connect. Fire-and-forget + cloud-gated; the status
+  // watcher re-pushes when the cache lands. Re-walked after install/uninstall
+  // and on a whole-daemon refresh (control-relay.ts).
+  if (getCloudState() === "ok") {
+    void refreshDeviceState()
+      .then(() => pushStatusIfChanged())
+      .catch((err) => logError("main", err));
+  }
   const scheduleBootstrap = (): void => {
     const delay =
       getCloudState() === "ok" ? BOOTSTRAP_TTL_MS : BOOTSTRAP_RETRY_MS;
@@ -139,6 +150,13 @@ const main = async (): Promise<void> => {
         // would catch it within a couple seconds anyway).
         const changed = await refreshBootstrap();
         if (changed) await pushStatusIfChanged();
+        // A bootstrap that just recovered to `ok` (boot-time unreachable, or a
+        // newly-set key) is the first chance to run the device-state walk.
+        if (changed && getCloudState() === "ok") {
+          void refreshDeviceState()
+            .then(() => pushStatusIfChanged())
+            .catch((err) => logError("main", err));
+        }
         // Periodic version check — picks up a release published while running.
         void maybeSelfUpdate(latestVersion());
       } catch (err) {

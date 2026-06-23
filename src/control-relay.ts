@@ -13,6 +13,7 @@ import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { installCli } from "./cli-install";
 import { latestVersion, refreshBootstrap } from "./config";
 import { getDelegate } from "./delegation";
+import { probeIntegration, refreshDeviceState } from "./device-state";
 import { clearInstalling, setInstalling } from "./installing-state";
 import { runIntegration } from "./integrations";
 import { openSealed } from "./keypair";
@@ -101,6 +102,14 @@ export const runCommandInner = async (
           cmd.payload.slug,
           cmd.payload.target,
         );
+        // Re-probe just this item's `-s` state so the post-command status push
+        // reflects the change (no full walk). Best-effort — a failed probe
+        // leaves the cached entry, corrected on the next boot/refresh walk.
+        if (r.ok) {
+          await probeIntegration(cmd.payload.kind, cmd.payload.slug).catch(
+            () => {},
+          );
+        }
         return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
       }
       case "connect_device_code": {
@@ -194,6 +203,11 @@ export const runCommandInner = async (
         // provider; the dashboard's whole-daemon refresh sends none → clears
         // all. `status` is the passive read and keeps the cache.
         invalidateUsage(cmd.payload?.slug);
+        // A whole-daemon refresh (no slug) also re-walks the manifest-driven
+        // device state, so the dashboard's Integrations tab can force a fresh
+        // `-s` sweep. Fire-and-forget; the status push reflects it on the next
+        // watcher tick.
+        if (cmd.payload?.slug === undefined) void refreshDeviceState();
         return { id: cmd.id, status: "done" };
       case "status":
         return { id: cmd.id, status: "done" };
