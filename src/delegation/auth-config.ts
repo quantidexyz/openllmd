@@ -32,7 +32,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TCliProvider } from "../cli-paths";
 import { cliBin, cliEnv, cliRoot } from "../cli-paths";
-import { logDebug, logInfo } from "../logger";
+import { logDebug, logInfo, logWarn } from "../logger";
 import { cliVersion, ptyScriptArgv, readJsonFile } from "./util";
 
 /** The persisted shape (all fields optional — the URL-capture and the OAuth
@@ -510,7 +510,20 @@ const extractOAuthFromBinary = async (
     const file = Bun.file(bin);
     if (!(await file.exists())) return null;
     const text = await file.text(); // ASCII literals survive a latin1-ish read
-    return OAUTH_SPECS[provider].extract(text);
+    const extracted = OAUTH_SPECS[provider].extract(text);
+    if (extracted === null) {
+      // The binary read fine but the OAuth `token_url`/`client_id` pattern didn't
+      // match — almost always a CLI version whose layout drifted past the
+      // extractor. WARN (not debug): with no cached config this silently disables
+      // token refresh, so the access token expires and usage/inference start
+      // 401ing. This line is the breadcrumb to update the extractor.
+      logWarn(
+        "auth-config",
+        "no OAuth config found in CLI binary — extractor likely needs updating for this CLI version; token refresh is disabled until a valid config is cached",
+        { provider, bin, bytes: text.length },
+      );
+    }
+    return extracted;
   } catch (err) {
     logDebug("auth-config", "binary extraction failed", {
       provider,
