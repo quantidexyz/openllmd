@@ -126,6 +126,28 @@ export const daemonWorkingSet = (): TWorkingSet => {
     // Best-effort — if creation fails, `existing()` still climbs to whatever
     // ancestor DOES exist (or returns the leaf, which fails to grant safely).
   }
+  // Pre-create the vendor CLI install/config dirs the host-install + setup flows
+  // write into (claude / codex / kimi). REQUIRED on Linux: Landlock can only
+  // grant an EXISTING path (`existing()` drops a non-existent leaf rather than
+  // widen the grant to bare $HOME), so on a fresh box `~/.kimi-code` etc. would
+  // be UNgranted and the vendor installer's `mkdir -p ~/.kimi-code/bin` EACCESes
+  // (the Linux EC2 failure). macOS Seatbelt grants by path pattern so it doesn't
+  // need this — pre-creating is a harmless no-op there. Same pattern as the
+  // daemonTempDir / integrationTmp pre-creation above.
+  for (const d of [
+    join(home, ".claude"),
+    join(home, ".codex"),
+    join(home, ".kimi-code"),
+    join(home, ".local", "bin"),
+    join(home, ".local", "share", "claude"),
+  ]) {
+    try {
+      mkdirSync(d, { recursive: true });
+    } catch {
+      // best-effort — an ungranted leaf just means that vendor's install falls
+      // back / fails visibly, not a daemon-boot failure.
+    }
+  }
   const readWrite = new Set<string>([
     // The whole state dir: daemon.env (config + key + device id) + logs + isolated CLI roots
     // (`cli/<provider>/{home,bin}` all nest under it — see `cli-paths.ts`)
