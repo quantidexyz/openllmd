@@ -140,6 +140,13 @@ export const daemonWorkingSet = (): TWorkingSet => {
     join(home, ".kimi-code"),
     join(home, ".local", "bin"),
     join(home, ".local", "share", "claude"),
+    // claude's XDG dirs — its native installer/runtime use the full XDG layout
+    // ON LINUX (`~/.local/state/claude`, `~/.cache/claude`); absent on macOS.
+    // Pre-creating makes the parents exist so the installer's mkdir succeeds,
+    // and the grants below let claude write its state/cache. (`~/.claude` is the
+    // config dir, granted above; `~/.local/share/claude` is the binary.)
+    join(home, ".local", "state", "claude"),
+    join(home, ".cache", "claude"),
   ]) {
     try {
       mkdirSync(d, { recursive: true });
@@ -183,6 +190,12 @@ export const daemonWorkingSet = (): TWorkingSet => {
     //   run it. The user's own claude binary — no credentials (those live in
     //   `~/.claude`).
     join(home, ".local", "share", "claude"),
+    //   claude's XDG STATE + CACHE dirs — its Linux native installer/runtime
+    //   write `~/.local/state/claude` (logs/state) + `~/.cache/claude`; absent
+    //   on macOS. Scoped to the claude subdirs (not the whole `~/.local/state`
+    //   / `~/.cache`) — no secrets there.
+    join(home, ".local", "state", "claude"),
+    join(home, ".cache", "claude"),
     //   shell rc / profile files: the non-isolated setup's tier-3 official
     //   installers (codex/kimi/claude) append a PATH line to the user's shell
     //   profile so the freshly-installed CLI is on PATH. Only these specific
