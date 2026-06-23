@@ -13,7 +13,7 @@ import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { installCli } from "./cli-install";
 import { latestVersion, refreshBootstrap } from "./config";
 import { getDelegate } from "./delegation";
-import { probeIntegration, refreshDeviceState } from "./device-state";
+import { probeIntegration } from "./device-state";
 import { clearInstalling, setInstalling } from "./installing-state";
 import { runIntegration } from "./integrations";
 import { openSealed } from "./keypair";
@@ -203,11 +203,11 @@ export const runCommandInner = async (
         // provider; the dashboard's whole-daemon refresh sends none → clears
         // all. `status` is the passive read and keeps the cache.
         invalidateUsage(cmd.payload?.slug);
-        // A whole-daemon refresh (no slug) also re-walks the manifest-driven
-        // device state, so the dashboard's Integrations tab can force a fresh
-        // `-s` sweep. Fire-and-forget; the status push reflects it on the next
-        // watcher tick.
-        if (cmd.payload?.slug === undefined) void refreshDeviceState();
+        // NB: a bare `refresh` does NOT re-walk device state — the `-s` walk is
+        // heavy (a fetch + bash per registry item) and the dashboard fires
+        // `refresh` often, which would flood. Device state refreshes on connect
+        // (eager) and after each install/uninstall (single-item probe); a
+        // dedicated on-demand re-walk is future work (proposal §9 cadence).
         return { id: cmd.id, status: "done" };
       case "status":
         return { id: cmd.id, status: "done" };

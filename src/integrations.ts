@@ -21,7 +21,7 @@
 import { createHash } from "node:crypto";
 import type { TDaemonIntegrationKind } from "@quantidexyz/openllmp";
 import { daemonEnv } from "./env";
-import { logError, logInfo } from "./logger";
+import { logDebug, logError, logInfo } from "./logger";
 import { DEFAULT_BIN_DIRS } from "./path-utils";
 
 /** Aliased to the closed `DaemonIntegrationKind` control-schema enum so the
@@ -188,6 +188,10 @@ export const runIntegration = async (
       code,
       output: redactTail(output.slice(-2000)),
     });
+  } else if (mode === "state") {
+    // The device-state walk runs one probe per registry item (10+) on connect —
+    // log success at DEBUG so it doesn't flood the daemon log.
+    logDebug("integrations", `${mode} ${kind} ${slug}`, { ok: true, code });
   } else {
     logInfo("integrations", `${mode} ${kind} ${slug}`, { ok: true, code });
   }
