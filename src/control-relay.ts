@@ -13,6 +13,7 @@ import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { installCli } from "./cli-install";
 import { latestVersion, refreshBootstrap } from "./config";
 import { getDelegate } from "./delegation";
+import { probeIntegration } from "./device-state";
 import { clearInstalling, setInstalling } from "./installing-state";
 import { runIntegration } from "./integrations";
 import { openSealed } from "./keypair";
@@ -20,6 +21,12 @@ import { logError } from "./logger";
 import { clearPendingAuth } from "./pending-auth";
 import { maybeSelfUpdate } from "./self-update";
 import { invalidateUsage } from "./usage-cache";
+
+// Cap how long the post-install/uninstall `-s` re-probe may delay the command
+// ack. The probe only warms the device-state cache for the next status push, so
+// missing this window just defers the refreshed state to the next walk — never a
+// reason to hold the dashboard's optimistic button.
+const PROBE_ACK_TIMEOUT_MS = 15_000;
 
 /**
  * Execute one delivered command via the control handlers. Returns the terminal
@@ -101,6 +108,26 @@ export const runCommandInner = async (
           cmd.payload.slug,
           cmd.payload.target,
         );
+        // Re-probe just this item's `-s` state (against the SAME target that was
+        // just modified) so the post-command status push reflects the change (no
+        // full walk). Best-effort AND bounded: we don't let a slow probe block
+        // the command ack — if it doesn't settle within PROBE_ACK_TIMEOUT_MS the
+        // ack returns anyway and the cache is corrected on the next boot/refresh
+        // walk. A failed probe likewise leaves the cached entry.
+        if (r.ok) {
+          const probe = probeIntegration(
+            cmd.payload.kind,
+            cmd.payload.slug,
+            cmd.payload.target,
+          ).catch(() => {});
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          await Promise.race([
+            probe.finally(() => clearTimeout(timer)),
+            new Promise<void>((resolve) => {
+              timer = setTimeout(resolve, PROBE_ACK_TIMEOUT_MS);
+            }),
+          ]);
+        }
         return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
       }
       case "connect_device_code": {
@@ -194,6 +221,11 @@ export const runCommandInner = async (
         // provider; the dashboard's whole-daemon refresh sends none → clears
         // all. `status` is the passive read and keeps the cache.
         invalidateUsage(cmd.payload?.slug);
+        // NB: a bare `refresh` does NOT re-walk device state — the `-s` walk is
+        // heavy (a fetch + bash per registry item) and the dashboard fires
+        // `refresh` often, which would flood. Device state refreshes on connect
+        // (eager) and after each install/uninstall (single-item probe); a
+        // dedicated on-demand re-walk is future work (proposal §9 cadence).
         return { id: cmd.id, status: "done" };
       case "status":
         return { id: cmd.id, status: "done" };

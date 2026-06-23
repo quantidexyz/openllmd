@@ -32,6 +32,7 @@ import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@quantidexyz/openllmp";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
+import { logDebug, logWarn } from "../logger";
 import {
   clearPendingAuth,
   getPendingAuth,
@@ -148,7 +149,15 @@ const refreshOAuth = async (
     // cached — skip the refresh (no hardcoded fallback to fall back to); the
     // stale access token then surfaces the vendor's own 401 → re-login.
     const cfg = await oauthConfig(PROVIDER);
-    if (cfg === null) return null;
+    if (cfg === null) {
+      // `oauthConfig`/`extractOAuthFromBinary` already WARNed the root cause
+      // (extraction drift). Just note that this refresh is being skipped.
+      logDebug(
+        "claude-code",
+        "token refresh skipped — no OAuth config available",
+      );
+      return null;
+    }
     const { token_url, client_id } = cfg;
     const resp = await fetch(token_url, {
       method: "POST",
@@ -169,7 +178,20 @@ const refreshOAuth = async (
       // thus every inference/usage call that awaits it) — abort → caught → null.
       signal: AbortSignal.timeout(REFRESH_FETCH_TIMEOUT_MS),
     });
-    if (!resp.ok) return null;
+    if (!resp.ok) {
+      // A 400/401 here means the stored REFRESH token was rejected (expired or
+      // already rotated away) — every later refresh fails too, so the access
+      // token stays stale and usage/inference 401/429. Surface it loudly: this
+      // is a re-login situation, not a transient blip.
+      const reLogin = resp.status === 400 || resp.status === 401;
+      logWarn("claude-code", "OAuth token refresh rejected by token endpoint", {
+        status: resp.status,
+        hint: reLogin
+          ? "stored refresh token is invalid — re-sign in via `openllmd connect claude_code` / `claude` login"
+          : "transient token-endpoint error — will retry on the next stale read",
+      });
+      return null;
+    }
     const d = (await resp.json()) as {
       access_token?: string;
       refresh_token?: string;
@@ -188,7 +210,12 @@ const refreshOAuth = async (
           ? Date.now() + d.expires_in * 1000
           : null,
     };
-  } catch {
+  } catch (err) {
+    // Network error or the REFRESH_FETCH_TIMEOUT abort — transient; the stale
+    // access token surfaces the vendor's own 401 and we retry next stale read.
+    logDebug("claude-code", "OAuth token refresh failed (network/timeout)", {
+      err: err instanceof Error ? err.message : String(err),
+    });
     return null;
   }
 };

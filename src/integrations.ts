@@ -3,11 +3,11 @@
  * and the relay command (`install_integration` from the dashboard). Coreless —
  * fetch + `Bun.spawn`. See `docs/proposals/daemon-integration-triggers.md` §4.
  *
- * It never forks install logic onto the box: it fetches the gateway's EXISTING
- * `/api/<area>/<slug>/<action>.sh` script (which already encapsulates the
- * per-target install/uninstall logic) and pipes it to `bash`. The user's API
- * key is passed as `OPENLLM_API_KEY` so an install.sh that pipes it through
- * works; uninstall.sh ignores it.
+ * It never forks install logic onto the box: it fetches the gateway's unified
+ * `/api/<area>/<slug>/install.sh?mode=<mode>` script (which encapsulates the
+ * per-target install / uninstall / state logic) and pipes it to `bash`. The
+ * user's API key is injected as `OPENLLM_API_KEY` for the `install` mode ONLY —
+ * the uninstall/state paths don't need it, so it's never exposed to them.
  *
  * Script integrity (fail-closed). The script is fetched and piped to `bash`
  * with the daemon's key in its environment — so a corrupted/tampered script
@@ -21,13 +21,16 @@
 import { createHash } from "node:crypto";
 import type { TDaemonIntegrationKind } from "@quantidexyz/openllmp";
 import { daemonEnv } from "./env";
-import { logError, logInfo } from "./logger";
+import { logDebug, logError, logInfo } from "./logger";
 import { DEFAULT_BIN_DIRS } from "./path-utils";
 
 /** Aliased to the closed `DaemonIntegrationKind` control-schema enum so the
  *  executor's vocabulary can't drift from the wire's. */
 export type TIntegrationKind = TDaemonIntegrationKind;
-export type TIntegrationAction = "install" | "uninstall";
+/** The unified install endpoint's mode. `state` (`-s`) reports install state as
+ *  one JSON line on stdout (the device-state walk parses it); `install` /
+ *  `uninstall` run the bundle's `install.sh` with no flag / `-u`. */
+export type TIntegrationMode = "install" | "uninstall" | "state";
 
 const AREA: Record<TIntegrationKind, string> = {
   skill: "skills",
@@ -47,6 +50,12 @@ export type TIntegrationResult = {
 // an AbortError, which both call sites already handle → fail-closed.
 const FETCH_TIMEOUT_MS = 15_000;
 
+// Bound the spawned `install.sh` so a hung script (a wedged install, a `-s`
+// probe that blocks on a missing tool) can't stall `refreshDeviceState()` or a
+// post-command re-probe indefinitely. On expiry Bun kills the process and sets
+// `signalCode`, which the kill branch below already reports.
+const SCRIPT_TIMEOUT_MS = 120_000;
+
 const sha256Hex = (s: string): string =>
   createHash("sha256").update(s).digest("hex");
 
@@ -60,12 +69,12 @@ const fetchExpectedDigest = async (
   cloudOrigin: string,
   area: string,
   slug: string,
-  action: TIntegrationAction,
+  mode: TIntegrationMode,
   target: string,
 ): Promise<string | null> => {
   const url =
     `${cloudOrigin}/api/daemon/integrity?area=${encodeURIComponent(area)}` +
-    `&slug=${encodeURIComponent(slug)}&action=${action}` +
+    `&slug=${encodeURIComponent(slug)}&mode=${mode}` +
     `&target=${encodeURIComponent(target)}`;
   try {
     const res = await fetch(url, {
@@ -81,7 +90,7 @@ const fetchExpectedDigest = async (
 
 export const runIntegration = async (
   kind: TIntegrationKind,
-  action: TIntegrationAction,
+  mode: TIntegrationMode,
   slug: string,
   target = "claude-code",
 ): Promise<TIntegrationResult> => {
@@ -89,7 +98,7 @@ export const runIntegration = async (
   const area = AREA[kind];
   const scriptUrl =
     `${cloudOrigin}/api/${area}/${encodeURIComponent(slug)}` +
-    `/${action}.sh?target=${encodeURIComponent(target)}`;
+    `/install.sh?target=${encodeURIComponent(target)}&mode=${mode}`;
 
   // 1. Fetch the script (PUBLIC endpoint — no auth header needed).
   let res: Response;
@@ -114,18 +123,18 @@ export const runIntegration = async (
     cloudOrigin,
     area,
     slug,
-    action,
+    mode,
     target,
   );
   if (expected === null) {
     return fail(
-      `integrity: no digest for ${area}/${slug}/${action} — refusing to run`,
+      `integrity: no digest for ${area}/${slug}/${mode} — refusing to run`,
     );
   }
   const actual = sha256Hex(script);
   if (expected !== actual) {
     return fail(
-      `integrity mismatch for ${area}/${slug}/${action}: expected ${expected} got ${actual} — refusing to run`,
+      `integrity mismatch for ${area}/${slug}/${mode}: expected ${expected} got ${actual} — refusing to run`,
     );
   }
 
@@ -143,12 +152,18 @@ export const runIntegration = async (
   const pathValue = [...DEFAULT_BIN_DIRS, baseEnv.PATH ?? ""]
     .filter((p) => p.length > 0)
     .join(":");
-  const env = { ...baseEnv, PATH: pathValue, OPENLLM_API_KEY: apiKey ?? "" };
+  // The key is exposed to the `install` script only — uninstall/state don't
+  // need it, so they run with it stripped from the env entirely.
+  const env =
+    mode === "install"
+      ? { ...baseEnv, PATH: pathValue, OPENLLM_API_KEY: apiKey ?? "" }
+      : { ...baseEnv, PATH: pathValue };
   const proc = Bun.spawn(["bash", "-s"], {
     stdin: new TextEncoder().encode(script),
     env,
     stdout: "pipe",
     stderr: "pipe",
+    timeout: SCRIPT_TIMEOUT_MS,
   });
   const [out, err, code] = await Promise.all([
     new Response(proc.stdout).text(),
@@ -167,9 +182,9 @@ export const runIntegration = async (
   // exit code — name the actual culprit at error level so it lands in
   // openllmd.err.log instead of vanishing.
   if (proc.signalCode !== null) {
-    logError("integrations", `${action} ${kind} ${slug}: script killed`, {
+    logError("integrations", `${mode} ${kind} ${slug}: script killed`, {
       signal: proc.signalCode,
-      hint: "likely an OS sandbox denial — a path the script writes isn't in the daemon working set",
+      hint: `likely an OS sandbox denial (a path the script writes isn't in the daemon working set) or the ${SCRIPT_TIMEOUT_MS}ms script timeout`,
       // The captured tail — even on a kill there may be partial output that
       // names the offending path.
       output: redactTail(output.slice(-2000)),
@@ -181,12 +196,16 @@ export const runIntegration = async (
     // failure is undiagnosable from the box (the relay ack carries `output`, but
     // it isn't persisted anywhere). This is how an install/uninstall that exits
     // 1 surfaces its real reason in openllmd.err.log.
-    logError("integrations", `${action} ${kind} ${slug} failed`, {
+    logError("integrations", `${mode} ${kind} ${slug} failed`, {
       code,
       output: redactTail(output.slice(-2000)),
     });
+  } else if (mode === "state") {
+    // The device-state walk runs one probe per registry item (10+) on connect —
+    // log success at DEBUG so it doesn't flood the daemon log.
+    logDebug("integrations", `${mode} ${kind} ${slug}`, { ok: true, code });
   } else {
-    logInfo("integrations", `${action} ${kind} ${slug}`, { ok: true, code });
+    logInfo("integrations", `${mode} ${kind} ${slug}`, { ok: true, code });
   }
   return {
     ok: code === 0 && proc.signalCode === null,
