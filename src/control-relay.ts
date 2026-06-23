@@ -16,6 +16,7 @@ import { getDelegate } from "./delegation";
 import { clearInstalling, setInstalling } from "./installing-state";
 import { runIntegration } from "./integrations";
 import { openSealed } from "./keypair";
+import { logError } from "./logger";
 import { clearPendingAuth } from "./pending-auth";
 import { maybeSelfUpdate } from "./self-update";
 import { invalidateUsage } from "./usage-cache";
@@ -61,7 +62,25 @@ export const runCommandInner = async (
         setInstalling(slug);
         try {
           const r = await installCli(slug);
-          return { id: cmd.id, status: "done", result: r };
+          // The vendor installer can run to completion yet never produce a
+          // working binary (sandbox EACCES, network failure, …). Reflect the
+          // REAL outcome in the ack status so the dashboard shows the failure
+          // (and `r.output` carries the installer tail) instead of a misleading
+          // "done". See docs/audit/2026-06-22-daemon-mac-sandbox-failures.md §2.
+          if (!r.installed) {
+            // Log the failure at ERROR with the captured installer output so
+            // the WHY lands in the error log — without it, a failed install was
+            // invisible (the ack was the only signal and it carried no reason).
+            logError("cli-install", `cli_install failed for ${slug}`, {
+              slug,
+              output: r.output,
+            });
+          }
+          return {
+            id: cmd.id,
+            status: r.installed ? "done" : "error",
+            result: r,
+          };
         } finally {
           clearInstalling(slug);
         }

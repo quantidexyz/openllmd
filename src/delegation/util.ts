@@ -13,7 +13,7 @@
  * only.
  */
 import { chmodSync, existsSync } from "node:fs";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, readdir, rename, rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { dirname, join } from "node:path";
 import { logError } from "../logger";
@@ -636,41 +636,116 @@ const runSecurity = async (
 // need to re-spawn `security` on every status poll (which runs ~every 5s).
 const ensuredKeychains = new Set<string>();
 
+// In-flight ensures, keyed by keychain path. The status watcher fires every
+// ~2.5s and is NOT serialized, so a slow `status()` lets ticks overlap; without
+// this, concurrent callers would race `security create-keychain` on the same
+// path and collide with `errSecDuplicateKeychain`. Overlapping callers instead
+// await the SAME operation.
+const inFlightKeychains = new Map<string, Promise<void>>();
+
+// Throttle the create-failure log so a persistent failure doesn't spam the
+// error stream on every ~2.5s status tick (it used to re-log forever because a
+// failure never entered `ensuredKeychains`). One line per keychain per window.
+const lastKeychainFailureLogMs = new Map<string, number>();
+const KEYCHAIN_FAILURE_LOG_INTERVAL_MS = 5 * 60 * 1000;
+
+const logKeychainFailure = (kc: string): void => {
+  const now = Date.now();
+  if (
+    now - (lastKeychainFailureLogMs.get(kc) ?? 0) <
+    KEYCHAIN_FAILURE_LOG_INTERVAL_MS
+  )
+    return;
+  lastKeychainFailureLogMs.set(kc, now);
+  logError(
+    "keychain",
+    "failed to create the isolated login keychain — claude login will pop the 'Keychain Not Found' dialog and hang",
+    { keychain: kc },
+  );
+};
+
 /**
  * macOS only: ensure an isolated, unlocked login keychain exists at
  * `<home>/Library/Keychains/login.keychain-db` so a CLI run with
  * `HOME=<home>` (e.g. `claude auth login`) can WRITE its credential
  * without the "Keychain Not Found" dialog. Empty password; auto-lock
  * disabled so subsequent reads don't prompt. Idempotent + process-cached;
- * no-op off macOS.
+ * concurrency-deduped; no-op off macOS.
  */
 export const ensureIsolatedKeychain = async (home: string): Promise<void> => {
   if (!MAC) return;
   const kc = loginKeychainPath(home);
-  // The cache skips re-spawning `security` on the hot path (the ~5s
-  // status watcher), but ALWAYS re-verify the file still exists first —
-  // `existsSync` is cheap (no spawn) and a missing keychain (deleted out
-  // from under us, or a fresh install) must be recreated, or
-  // `claude auth login` later pops the "Keychain Not Found" dialog.
+  // The cache skips re-spawning `security` on the hot path (the ~2.5s status
+  // watcher), but ALWAYS re-verify the file still exists first — `existsSync`
+  // is cheap (no spawn) and a missing keychain (deleted out from under us, or a
+  // fresh install) must be recreated, or `claude auth login` later pops the
+  // "Keychain Not Found" dialog.
   if (ensuredKeychains.has(kc) && existsSync(kc)) return;
+  const pending = inFlightKeychains.get(kc);
+  if (pending !== undefined) return pending;
+  const op = ensureKeychainNow(home, kc).finally(() => {
+    inFlightKeychains.delete(kc);
+  });
+  inFlightKeychains.set(kc, op);
+  return op;
+};
+
+const ensureKeychainNow = async (home: string, kc: string): Promise<void> => {
   if (!existsSync(kc)) {
     ensuredKeychains.delete(kc); // stale cache entry — file is gone
-    await mkdir(dirname(kc), { recursive: true });
-    const created = await runSecurity(["create-keychain", "-p", "", kc], home);
-    // If creation failed AND the file still isn't there, a later
-    // `claude auth login` will pop the system "Keychain login cannot be found
-    // to store …" dialog and WEDGE. Surface it loudly here
-    // (don't cache success) so the real cause is in openllmd.err.log.
-    if (!created && !existsSync(kc)) {
-      logError(
-        "keychain",
-        "failed to create the isolated login keychain — claude login will pop the 'Keychain Not Found' dialog and hang",
-        { keychain: kc },
-      );
+    const dir = dirname(kc);
+    await mkdir(dir, { recursive: true });
+    // macOS `securityd` REFUSES to `create-keychain` at the RESERVED
+    // `login.keychain-db` name when it sits inside the $HOME subtree under the
+    // Seatbelt sandbox: it routes through the session login-keychain machinery,
+    // which needs the real `~/Library/Keychains` the deny-$HOME read policy
+    // blocks → `errSec 161` (no file) or a GUI auth prompt. So create +
+    // configure at a NON-reserved staging name (which securityd treats as an
+    // ordinary keychain), THEN atomically rename the finished file into place.
+    // Claude finds `login.keychain-db` by default-resolution and our own reads
+    // use the explicit path. See
+    // docs/audit/2026-06-22-daemon-mac-sandbox-failures.md §3.
+    const staging = join(dir, `.openllm-staging-${process.pid}.keychain-db`);
+    // Sweep orphaned staging files from a prior run that crashed between
+    // create + rename (the filename carries the pid, so they'd otherwise
+    // accumulate). Best-effort.
+    try {
+      for (const f of await readdir(dir)) {
+        if (f.startsWith(".openllm-staging-") && f.endsWith(".keychain-db")) {
+          await rm(join(dir, f), { force: true });
+        }
+      }
+    } catch {
+      // dir unreadable / race — non-fatal
+    }
+    const created = await runSecurity(
+      ["create-keychain", "-p", "", staging],
+      home,
+    );
+    if (created) {
+      // Disable auto-lock on the STAGING name (set-keychain-settings on the
+      // reserved name pops "User canceled the operation" under the sandbox);
+      // the setting persists in the file through the rename.
+      await runSecurity(["set-keychain-settings", staging], home);
+      try {
+        await rename(staging, kc);
+      } catch {
+        await rm(staging, { force: true });
+      }
+    } else {
+      await rm(staging, { force: true });
+    }
+    // If the file STILL isn't there, a later `claude auth login` will pop the
+    // "Keychain Not Found" dialog and WEDGE. Surface it (throttled) so the real
+    // cause is in openllmd.err.log without spamming every status tick.
+    if (!existsSync(kc)) {
+      logKeychainFailure(kc);
       return; // not ensured; retried next call
     }
   }
-  await runSecurity(["set-keychain-settings", kc], home); // no auto-lock
+  // Unlock at the FINAL path (securityd keys unlock state by path, so re-unlock
+  // after the rename). Unlocking the reserved name by explicit path is fine —
+  // only `create-keychain` at it fails.
   await runSecurity(["unlock-keychain", "-p", "", kc], home);
   ensuredKeychains.add(kc);
 };

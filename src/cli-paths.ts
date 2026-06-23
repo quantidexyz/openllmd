@@ -12,6 +12,8 @@
  *     bin/<binary>     the isolated CLI executable
  *     home/            the CLI's home/config + credentials (isolated)
  */
+
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type { TSubscriptionProviderSlug } from "@quantidexyz/openllmp";
 import { stateDir } from "./env";
@@ -48,6 +50,38 @@ export const cliHome = (provider: TCliProvider): string =>
 /** Absolute path to the installed isolated binary. */
 export const cliBin = (provider: TCliProvider): string =>
   join(cliRoot(provider), SPECS[provider].binRel);
+
+/**
+ * Candidate paths to the user's EXISTING non-isolated vendor CLI, in priority
+ * order — `cli-install.ts` `ensureHostCli` returns the first that exists (else
+ * installs the official CLI there once), and `installCli` SYMLINKS the isolated
+ * path to it (no copy, zero duplicate bytes). The single binary on disk is the
+ * non-isolated one; the isolated CLI is always a link to it.
+ *
+ * The symlink target must be EXEC-able under the OS sandbox: the codex
+ * (`~/.codex`) + kimi (`~/.kimi-code`) homes (read-write working set) and
+ * claude's install dir (`~/.local/share/claude`, granted in `working-set.ts`)
+ * + anything outside `$HOME` all qualify.
+ */
+export const hostCliCandidates = (provider: TCliProvider): string[] => {
+  const home = homedir();
+  switch (provider) {
+    case "claude_code":
+      // The official installer's launcher → resolves to
+      // ~/.local/share/claude/versions/<v> (the self-contained binary).
+      return [join(home, ".local", "bin", "claude")];
+    case "chatgpt":
+      return [
+        join(home, ".local", "bin", "codex"),
+        join(home, ".codex", "bin", "codex"),
+      ];
+    case "kimi_code":
+      return [
+        join(home, ".kimi-code", "bin", "kimi"),
+        join(home, ".local", "bin", "kimi"),
+      ];
+  }
+};
 
 /**
  * The CLI's home/config root as the CLI itself sees it (the value of its

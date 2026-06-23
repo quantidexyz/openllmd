@@ -137,6 +137,15 @@ ${writeAllow})
 (allow file-read* (require-not (subpath "${esc(home)}")))
 (allow file-read*
 ${readAllow})
+; STAT (metadata only, NOT contents) of $HOME itself. Path resolution + BSD
+; \`mkdir -p\` walk every ancestor of a target and \`stat()\` each one; \`$HOME\` is
+; an ancestor of the granted working set (\`~/.openllm\`, \`~/.claude\`, …), so
+; denying its metadata makes \`mkdir -p ~/.openllm/.../x\` EPERM at \`$HOME\` and
+; breaks the vendor CLI installers (claude.ai/install.sh \`mkdir -p
+; $HOME/.claude/downloads\`). This grants ONLY \`file-read-metadata\` on the home
+; DIRECTORY node — not its contents (every $HOME subpath stays deny-default, and
+; the credential denies below still apply), so no user secret becomes readable.
+(allow file-read-metadata (literal "${esc(home)}"))
 ; …but the vendor credential FILES inside the re-allowed config dirs stay denied
 ; (last-match-wins): the daemon writes config there but never needs the tokens.
 (deny file-read*
