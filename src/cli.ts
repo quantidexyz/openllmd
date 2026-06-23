@@ -26,7 +26,7 @@ import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { COMMANDS, FLAGS } from "./commands";
 import { runCompletion } from "./completion";
 import { daemonEnv } from "./env";
-import type { TIntegrationAction, TIntegrationKind } from "./integrations";
+import type { TIntegrationKind, TIntegrationMode } from "./integrations";
 import { runIntegration } from "./integrations";
 import { logError } from "./logger";
 import { runLogs } from "./logs";
@@ -145,14 +145,10 @@ const runIntegrationCli = async (
     }
   }
 
-  if (action === "install" || action === "uninstall") {
+  if (action === "install" || action === "uninstall" || action === "state") {
     const slug = args[1];
     if (slug === undefined || slug.length === 0) return integrationUsage(kind);
-    const result = await runIntegration(
-      kind,
-      action as TIntegrationAction,
-      slug,
-    );
+    const result = await runIntegration(kind, action as TIntegrationMode, slug);
     if (result.output.length > 0) process.stdout.write(`${result.output}\n`);
     process.exit(result.ok ? 0 : 1);
   }
