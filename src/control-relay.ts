@@ -22,6 +22,12 @@ import { clearPendingAuth } from "./pending-auth";
 import { maybeSelfUpdate } from "./self-update";
 import { invalidateUsage } from "./usage-cache";
 
+// Cap how long the post-install/uninstall `-s` re-probe may delay the command
+// ack. The probe only warms the device-state cache for the next status push, so
+// missing this window just defers the refreshed state to the next walk — never a
+// reason to hold the dashboard's optimistic button.
+const PROBE_ACK_TIMEOUT_MS = 15_000;
+
 /**
  * Execute one delivered command via the control handlers. Returns the terminal
  * ack. `cmd` is the CLOSED `DaemonCommand` union — the relay socket's schema
@@ -102,13 +108,25 @@ export const runCommandInner = async (
           cmd.payload.slug,
           cmd.payload.target,
         );
-        // Re-probe just this item's `-s` state so the post-command status push
-        // reflects the change (no full walk). Best-effort — a failed probe
-        // leaves the cached entry, corrected on the next boot/refresh walk.
+        // Re-probe just this item's `-s` state (against the SAME target that was
+        // just modified) so the post-command status push reflects the change (no
+        // full walk). Best-effort AND bounded: we don't let a slow probe block
+        // the command ack — if it doesn't settle within PROBE_ACK_TIMEOUT_MS the
+        // ack returns anyway and the cache is corrected on the next boot/refresh
+        // walk. A failed probe likewise leaves the cached entry.
         if (r.ok) {
-          await probeIntegration(cmd.payload.kind, cmd.payload.slug).catch(
-            () => {},
-          );
+          const probe = probeIntegration(
+            cmd.payload.kind,
+            cmd.payload.slug,
+            cmd.payload.target,
+          ).catch(() => {});
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          await Promise.race([
+            probe.finally(() => clearTimeout(timer)),
+            new Promise<void>((resolve) => {
+              timer = setTimeout(resolve, PROBE_ACK_TIMEOUT_MS);
+            }),
+          ]);
         }
         return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
       }

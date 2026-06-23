@@ -105,7 +105,7 @@ const LIST_PATH: Record<TIntegrationKind, string> = {
 
 const integrationUsage = (kind: TIntegrationKind): never => {
   process.stderr.write(
-    `usage: openllmd ${kind} <install|uninstall|list> [${kind === "setup" ? "id" : "slug"}]\n`,
+    `usage: openllmd ${kind} <install|uninstall|state|list> [${kind === "setup" ? "id" : "slug"}]\n`,
   );
   process.exit(2);
 };

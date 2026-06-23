@@ -81,12 +81,15 @@ const fetchCatalogSlugs = async (
 
 /** Probe ONE item's state (`install.sh -s`) and patch its cache entry. Used
  *  after an install/uninstall so the next status push reflects the change
- *  without a full walk. A null verdict (probe failed) leaves the cache as-is. */
+ *  without a full walk. `target` MUST match the one the install/uninstall ran
+ *  against (defaults to `claude-code`) so the probe inspects the directory that
+ *  actually changed. A null verdict (probe failed) leaves the cache as-is. */
 export const probeIntegration = async (
   kind: TDaemonIntegrationKind,
   slug: string,
+  target = "claude-code",
 ): Promise<void> => {
-  const r = await runIntegration(kind, "state", slug);
+  const r = await runIntegration(kind, "state", slug, target);
   const installed = parseInstalled(r.output);
   if (installed === null) {
     logWarn(
