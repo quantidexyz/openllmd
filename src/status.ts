@@ -15,7 +15,7 @@ import { daemonPort, hasApiKey } from "./env";
 import { isInstalling } from "./installing-state";
 import { daemonPublicKey } from "./keypair";
 import { sandboxState } from "./sandbox/landlock";
-import { cachedUsage } from "./usage-cache";
+import { cachedUsage, peekUsage } from "./usage-cache";
 import { DAEMON_VERSION } from "./version";
 
 export const computeStatus = async (): Promise<TDaemonStatus> => {
@@ -27,17 +27,16 @@ export const computeStatus = async (): Promise<TDaemonStatus> => {
       // Attach a metadata-only usage snapshot for connected providers so the
       // dashboard can show remaining quota (read locally; never a token).
       if (!conn.connected) return conn;
-      // Read through the per-provider TTL cache, NOT live: `computeStatus`
-      // runs on every status push (~30s, ~2.5s during a flow), but the vendor
-      // usage endpoints rate-limit independently of inference — a live read
-      // here 429s after ~5 min while inference keeps working. The cache hits
-      // the vendor at most once per few minutes and serves the last good
-      // snapshot if a refresh fails. See `usage-cache.ts`.
-      try {
-        return { ...conn, usage: await cachedUsage(d.slug, () => d.usage()) };
-      } catch {
-        return conn; // usage read failed — status still useful
-      }
+      // PEEK only — never hit the vendor here. `computeStatus` runs on every
+      // status push (hello/reconnect, the ~2.5s flow watcher, post-command),
+      // and the vendor usage endpoint rate-limits independently of inference;
+      // reading it on that cadence 429'd it ("Claude usage is rate-limited
+      // right now") on a daemon nobody was even looking at. Usage is read ONLY
+      // on demand — the `refresh` command → `refreshUsage` (the manual button
+      // or the providers page mounting). Here we just attach whatever that last
+      // on-demand read cached. See `usage-cache.ts`.
+      const usage = peekUsage(d.slug);
+      return usage === null ? conn : { ...conn, usage };
     }),
   );
   return {
@@ -54,4 +53,26 @@ export const computeStatus = async (): Promise<TDaemonStatus> => {
     // too heavy to run on every status push.
     integrations: getInstalledIntegrations(),
   };
+};
+
+/**
+ * On-demand usage read — the ONLY path that hits the vendor usage endpoint.
+ * Driven by the `refresh` command (the manual "Refresh usage" button or the
+ * providers page mounting for this device, via `control-relay.ts`). Fetches
+ * live figures for every CONNECTED provider (or just `slug` when scoped) into
+ * the usage cache; the status push that follows the command then carries them
+ * back via `peekUsage`. The caller busts the TTL first (`invalidateUsage`) so
+ * this read is genuinely live. Best-effort per provider — `cachedUsage` already
+ * swallows fetch failures into an `unavailable` snapshot.
+ */
+export const refreshUsage = async (slug?: string): Promise<void> => {
+  await Promise.all(
+    Object.values(DELEGATES)
+      .filter((d) => slug === undefined || d.slug === slug)
+      .map(async (d) => {
+        // Only connected providers have a usage endpoint to read.
+        if (!(await d.status()).connected) return;
+        await cachedUsage(d.slug, () => d.usage());
+      }),
+  );
 };
