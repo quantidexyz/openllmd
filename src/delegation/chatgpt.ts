@@ -17,7 +17,7 @@
  *     `ChatGPT-Account-Id: <account_id>`.
  *   - Usage: GET https://chatgpt.com/backend-api/wham/usage.
  */
-import { rm } from "node:fs/promises";
+import { rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@quantidexyz/openllmp";
 import { cliInstallState } from "../cli-install";
@@ -215,9 +215,13 @@ const refreshOAuth = async (
     }
     return {
       access: d.access_token,
-      // OpenAI rotates the refresh token; keep the old one if absent.
+      // OpenAI rotates the refresh token; keep the old one if absent OR empty.
+      // An empty `refresh_token` would otherwise OVERWRITE a working one with
+      // "", permanently stranding the credential (readToken won't refresh a "").
       refresh:
-        typeof d.refresh_token === "string" ? d.refresh_token : refreshToken,
+        typeof d.refresh_token === "string" && d.refresh_token.length > 0
+          ? d.refresh_token
+          : refreshToken,
       idToken: typeof d.id_token === "string" ? d.id_token : null,
     };
   } catch (err) {
@@ -248,7 +252,14 @@ const persistRefresh = async (next: {
     ...(next.idToken !== null ? { id_token: next.idToken } : {}),
   };
   raw.last_refresh = new Date().toISOString();
-  await Bun.write(authPath(), JSON.stringify(raw));
+  // Atomic write (temp + rename) — the isolated `codex` CLI writes the SAME
+  // auth.json via its own atomic write, so a plain overwrite could be lost to /
+  // interleave with it (the two-writer rotation race). rename(2) on the same dir
+  // is atomic, so a concurrent reader always sees a whole file.
+  const path = authPath();
+  const tmp = `${path}.openllmd.tmp`;
+  await Bun.write(tmp, JSON.stringify(raw));
+  await rename(tmp, path);
 };
 
 // Single-flight guard: concurrent callers that all see an expiring token share

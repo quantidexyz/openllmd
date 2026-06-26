@@ -114,6 +114,16 @@ type TCaptureSpec = {
   /** Run the headless CLI under a pseudo-terminal (`script(1)`) — set for a CLI
    *  whose print/exec mode is gated on a real TTY (kimi's `-p`). */
   readonly usePty?: boolean;
+  /** When `false`, NEVER spawn a live `-p ping` capture for this provider —
+   *  serve the default endpoint verbatim instead. Set for a provider whose
+   *  capture does more harm than good: the `-p ping` is a REAL inference, which
+   *  makes the isolated CLI refresh + ROTATE its single-use OAuth refresh token
+   *  behind the daemon's back. That rotation races the daemon's own self-refresh
+   *  and stranded claude_code's credential (the CLI cleared the refresh token to
+   *  `""` on a lost-race refresh → un-refreshable → re-login every ~8h). claude's
+   *  `/v1/messages` has never drifted (every capture returned the default), so
+   *  the capture was pure risk with no benefit. */
+  readonly liveCapture?: boolean;
 };
 
 const CAPTURE: Readonly<Record<TCliProvider, TCaptureSpec>> = {
@@ -122,10 +132,19 @@ const CAPTURE: Readonly<Record<TCliProvider, TCaptureSpec>> = {
     path: "/v1/messages",
     match: (p) => p.endsWith("/v1/messages"),
     // `-p/--print` = headless single-shot; ANTHROPIC_BASE_URL redirects it.
+    // RETAINED for shape only — `liveCapture: false` means this is NEVER run:
+    // a real `claude -p ping` would rotate the OAuth refresh token mid-capture
+    // (see `liveCapture`). The default `/v1/messages` (stable) is served instead.
     argv: (bin) => [bin, "-p", "ping"],
     env: (base) => ({ ANTHROPIC_BASE_URL: base }),
+    liveCapture: false,
   },
   chatgpt: {
+    // NOTE: codex's `/responses` endpoint genuinely DRIFTS on CLI updates
+    // (unlike claude's stable `/v1/messages`), so we can't set
+    // `liveCapture: false` here — the capture must keep running to track the
+    // real endpoint. Codex's analogous refresh-token rotation race is instead
+    // narrowed by the empty-token guard + atomic `auth.json` write in chatgpt.ts.
     origin: "https://chatgpt.com",
     path: "/backend-api/codex/responses",
     // Codex fires backend-api preamble (`/ps/plugins/installed`, `/wham/apps`,
@@ -364,6 +383,15 @@ const ensureUpstreamUrl = async (
     cfg.upstream_url !== undefined && urlIsInference(provider, cfg.upstream_url)
       ? cfg.upstream_url
       : null;
+  // Providers flagged `liveCapture: false` NEVER spawn a `-p ping` capture (it
+  // would rotate their OAuth refresh token behind the daemon's back). Short-
+  // circuit to the stored URL (or null → the stable default via
+  // `resolveUpstreamUrl`) BEFORE the `cliVersion` probe below, so a legacy
+  // stored URL can't trigger a pointless `claude --version` spawn either. For
+  // claude_code the only other isolated-CLI call the daemon makes is
+  // `claude auth status`, a pure local READ (verified — no token refresh), so
+  // with the capture gone the daemon is the SOLE refresher (no rotation race).
+  if (CAPTURE[provider].liveCapture === false) return stored;
   if (opts?.force !== true && stored !== null) {
     const ver = await cliVersion(cliBin(provider), cliEnv(provider));
     if (urlFresh(cfg, ver)) return stored;
