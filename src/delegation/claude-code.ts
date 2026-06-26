@@ -26,7 +26,7 @@
  *     2023-06-01`, `User-Agent: claude-cli/<version>`.
  *   - Usage: GET https://api.anthropic.com/api/oauth/usage.
  */
-import { rm } from "node:fs/promises";
+import { rename, rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@quantidexyz/openllmp";
@@ -130,7 +130,14 @@ const writeStore = async (store: TClaudeStore): Promise<void> => {
     await writeIsolatedKeychain(cliHome(PROVIDER), KEYCHAIN_SERVICE, payload);
     return;
   }
-  await Bun.write(join(cliConfigDir(PROVIDER), ".credentials.json"), payload);
+  // Atomic write (temp + rename) — the isolated `claude` CLI writes the SAME
+  // file via its OWN atomic temp+rename, so a plain overwrite here could be lost
+  // to / interleave with the CLI's write. rename(2) on the same dir is atomic,
+  // so a concurrent reader always sees either the old or the new file whole.
+  const path = join(cliConfigDir(PROVIDER), ".credentials.json");
+  const tmp = `${path}.openllmd.tmp`;
+  await Bun.write(tmp, payload);
+  await rename(tmp, path);
 };
 
 // Exchange the stored refresh token for a fresh access token (+ possibly
@@ -202,9 +209,14 @@ const refreshOAuth = async (
     }
     return {
       access: d.access_token,
-      // Anthropic rotates refresh tokens; keep the old one if absent.
+      // Anthropic rotates refresh tokens; keep the old one if absent OR empty.
+      // An empty `refresh_token` would otherwise OVERWRITE a working one with
+      // "", permanently stranding the credential (readToken won't refresh a ""),
+      // so treat "" exactly like absent.
       refresh:
-        typeof d.refresh_token === "string" ? d.refresh_token : refreshToken,
+        typeof d.refresh_token === "string" && d.refresh_token.length > 0
+          ? d.refresh_token
+          : refreshToken,
       expiresAtMs:
         typeof d.expires_in === "number"
           ? Date.now() + d.expires_in * 1000
@@ -310,6 +322,28 @@ const authStatusLoggedIn = async (): Promise<boolean | null> => {
   }
 };
 
+/**
+ * Whether the stored credential can AUTO-REFRESH — i.e. it carries a non-empty
+ * refresh token. The hosted paste-back login grant has been observed to land an
+ * EMPTY refresh token; the daemon then (correctly) refuses to refresh it, so the
+ * ~8h access token silently dies and the user must re-login. Surfacing this at
+ * login turns an invisible, delayed failure into an explicit one. Returns null
+ * when there is no credential at all.
+ */
+const credentialRefreshable = async (): Promise<boolean | null> => {
+  const oauth = (await loadStore())?.claudeAiOauth;
+  if (oauth?.accessToken === undefined || oauth.accessToken.length === 0) {
+    return null;
+  }
+  return (
+    typeof oauth.refreshToken === "string" && oauth.refreshToken.length > 0
+  );
+};
+
+// Logged + returned when a login lands a credential that can't self-refresh.
+const NO_REFRESH_HINT =
+  "signed in via Claude Code — warning: this credential has no refresh token and can't auto-refresh; you may need to re-sign in when it expires";
+
 export const claudeCodeDelegate: TProviderDelegate = {
   slug: "claude_code",
 
@@ -337,13 +371,26 @@ export const claudeCodeDelegate: TProviderDelegate = {
     // paste panel; drop it the moment the credential lands.
     if (connected) clearPendingAuth(PROVIDER);
     const pending = connected ? null : getPendingAuth(PROVIDER);
+    // When connected, flag a credential that can't auto-refresh (no refresh
+    // token) so the dashboard shows a persistent "re-sign in" hint instead of a
+    // green card that silently dies at access-token expiry.
+    const unrefreshable =
+      connected && (await credentialRefreshable()) === false;
     return {
       provider: PROVIDER,
       connected,
       cli_installed: true,
       ...(version !== null ? { cli_version: version } : {}),
       ...(connected
-        ? { last_login_at_ms: null }
+        ? {
+            last_login_at_ms: null,
+            ...(unrefreshable
+              ? {
+                  detail:
+                    "signed in, but this credential can't auto-refresh — re-sign in to restore automatic renewal",
+                }
+              : {}),
+          }
         : pending !== null
           ? {
               pending_auth: {
@@ -393,6 +440,17 @@ export const claudeCodeDelegate: TProviderDelegate = {
       // (a CLI update can rotate the upstream URL, token endpoint, or client
       // id). Best-effort + non-blocking.
       void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
+      // Loud-fail: a no-refresh credential works now but can't be renewed —
+      // flag it at login instead of letting the card die ~8h later. (Same guard
+      // as the headless paste-back paths; the local browser flow can land one
+      // too.)
+      if ((await credentialRefreshable()) === false) {
+        logWarn(
+          "claude-code",
+          "signed in (browser) but the stored credential has NO refresh token — it cannot auto-refresh; re-login will be needed at access-token expiry",
+        );
+        return { connected: true, detail: NO_REFRESH_HINT };
+      }
       return { connected: true, detail: "signed in via Claude Code" };
     }
     return {
@@ -454,6 +512,12 @@ export const claudeCodeDelegate: TProviderDelegate = {
       inFlightLogin = null;
       clearPendingAuth(PROVIDER);
       if ((await readToken()) !== null) {
+        if ((await credentialRefreshable()) === false) {
+          logWarn(
+            "claude-code",
+            "headless login landed a credential with NO refresh token — it cannot auto-refresh (re-login will be needed at access-token expiry)",
+          );
+        }
         void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
       }
     });
@@ -473,9 +537,22 @@ export const claudeCodeDelegate: TProviderDelegate = {
     await grantKeychainToolAccess(cliHome(PROVIDER));
     const connected =
       (await authStatusLoggedIn()) === true || (await readToken()) !== null;
-    return connected
-      ? { ok: true, detail: "signed in via Claude Code" }
-      : { ok: false, detail: "code accepted but no credential was stored." };
+    if (!connected) {
+      return {
+        ok: false,
+        detail: "code accepted but no credential was stored.",
+      };
+    }
+    // Loud-fail: a credential with no refresh token works now but can't be
+    // renewed — flag it at login instead of letting the card die ~8h later.
+    if ((await credentialRefreshable()) === false) {
+      logWarn(
+        "claude-code",
+        "signed in but the stored credential has NO refresh token — it cannot auto-refresh; the access token will expire (~8h) and require re-login",
+      );
+      return { ok: true, detail: NO_REFRESH_HINT };
+    }
+    return { ok: true, detail: "signed in via Claude Code" };
   },
 
   // Cancel an in-flight headless paste-back login: kill the process + drop the
