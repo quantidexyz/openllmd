@@ -371,17 +371,21 @@ codex's account id + the captured upstream URL — the local runner adds the
 ORIGINATOR's headers and the wire-derived ones). Nothing the delegate reads from
 a CLI's store is ever sent off-box.
 
-**Usage reads go through a TTL cache, not live (`usage-cache.ts`).**
-`computeStatus()` runs on every status push — every control-relay poll (~30s)
-and every ~2.5s while a background flow is in flight — but the vendor usage
+**Usage is read ON DEMAND, never polled (`usage-cache.ts`).** The vendor usage
 endpoints (e.g. Claude's `api/oauth/usage`) rate-limit **independently of
-inference**. Reading them live there 429s after ~5 minutes while inference keeps
-working. `cachedUsage(slug, () => delegate.usage())` hits the vendor at most
-once per few minutes (the quota windows are 5h/7d, so minute-level staleness is
-irrelevant), shares one in-flight fetch across concurrent callers, and serves
-the last good snapshot when a refresh fails (rather than flapping the card to an
-error) until it ages out. So the usage panel no longer couples to the push
-cadence.
+inference** — reading them on the status-push cadence 429'd them after ~5 min
+("Claude usage is rate-limited right now") on a daemon **nobody was even looking
+at**. So `computeStatus()` — which runs on every status push (hello/reconnect,
+the ~2.5s flow watcher, post-command) — only **peeks** the cache (`peekUsage`,
+never a vendor call); it attaches whatever was last fetched, or nothing. The
+**only** path that hits the vendor is the `refresh` command (`control-relay.ts`
+→ `refreshUsage` in `status.ts`), and its two demand signals are the manual
+**"Refresh usage"** button and the **providers page mounting** for that device.
+`cachedUsage(slug, () => delegate.usage())` still wraps that on-demand read in a
+TTL + back-off (at most once per few minutes — the quota windows are 5h/7d, so
+minute-level staleness is irrelevant — shared in-flight fetch, last-good
+fallback stamped `stale` when a refresh fails) so rapid refreshes or several
+dashboards can't hammer the endpoint either.
 
 **Originator passthrough (the compliance core, `auth-config.ts`).** The daemon
 is a transparent, credential-injecting reverse proxy: each inference request

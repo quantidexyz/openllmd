@@ -20,6 +20,7 @@ import { openSealed } from "./keypair";
 import { logError } from "./logger";
 import { clearPendingAuth } from "./pending-auth";
 import { maybeSelfUpdate } from "./self-update";
+import { refreshUsage } from "./status";
 import { invalidateUsage } from "./usage-cache";
 
 // Cap how long the post-install/uninstall `-s` re-probe may delay the command
@@ -212,15 +213,18 @@ export const runCommandInner = async (
         const r = await delegate.submitLoginCode(code);
         return { id: cmd.id, status: r.ok ? "done" : "error", result: r };
       }
-      // A bare refresh: nothing to do — the status push below carries the
-      // fresh snapshot back.
+      // The on-demand usage read. The demand is the manual "Refresh usage"
+      // button OR the providers page mounting for this device — this is the
+      // ONLY path that hits the vendor usage endpoint (the background status
+      // push only PEEKS the cache; see `status.ts`). `slug` scopes it to one
+      // provider; the dashboard's whole-daemon refresh sends none → all.
       case "refresh":
-        // Manual refresh: bust the usage cache so the post-command
-        // computeStatus() re-reads the vendor LIVE instead of serving the
-        // cached (possibly backing-off) snapshot. `slug` scopes it to one
-        // provider; the dashboard's whole-daemon refresh sends none → clears
-        // all. `status` is the passive read and keeps the cache.
+        // Bust the TTL so this read is genuinely LIVE, then fetch the connected
+        // providers' usage into the cache NOW. The post-command status push
+        // (below, in `control-channel.ts`) then carries the fresh figures via
+        // `peekUsage`. `status` is the passive read and keeps the cache.
         invalidateUsage(cmd.payload?.slug);
+        await refreshUsage(cmd.payload?.slug);
         // NB: a bare `refresh` does NOT re-walk device state — the `-s` walk is
         // heavy (a fetch + bash per registry item) and the dashboard fires
         // `refresh` often, which would flood. Device state refreshes on connect

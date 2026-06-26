@@ -1,13 +1,20 @@
 /**
  * Per-provider usage-snapshot cache.
  *
- * `computeStatus()` runs on every status push — every control-relay poll
- * (~25-35s) and every ~2.5s while a background flow (CLI install / device-code
- * login) is in flight. Each call used to hit the vendor's usage endpoint
- * LIVE (e.g. Claude's `api/oauth/usage`), which has its OWN low rate limit,
- * separate from inference. After ~5 minutes of pushes that endpoint started
- * returning 429 ("Claude couldn't report usage (HTTP 429)") even though
- * inference kept working fine.
+ * Usage is read ON DEMAND, never on a timer. The vendor usage endpoint (e.g.
+ * Claude's `api/oauth/usage`) has its OWN low rate limit, separate from
+ * inference — reading it on the status-push cadence 429'd it after ~5 min
+ * ("Claude usage is rate-limited right now") on a daemon nobody was even
+ * looking at. So the ONLY path that hits the vendor is {@link cachedUsage},
+ * driven by the `refresh` command (the manual "Refresh usage" button or the
+ * providers page mounting for this device). The background status push reads
+ * the cache PASSIVELY via {@link peekUsage}, which NEVER calls the vendor — it
+ * just attaches whatever was last fetched. See `status.ts` / `control-relay.ts`.
+ *
+ * The TTL + back-off below is a second layer of protection on that on-demand
+ * path: rapid refresh clicks (or several dashboards refreshing at once) still
+ * hit the vendor at most once per {@link FRESH_TTL_MS}, and a failed read backs
+ * off the same way instead of hammering a rate-limited endpoint.
  *
  * This cache decouples the usage read from the push cadence by gating the
  * vendor call on time-since-last-ATTEMPT — success OR failure — so we hit the
@@ -233,6 +240,26 @@ export const cachedUsage = async (
     inFlight: run,
   });
   return run;
+};
+
+/**
+ * PASSIVE read — return this provider's cached usage snapshot WITHOUT ever
+ * calling the vendor. `computeStatus()` uses this on every background status
+ * push so a push never triggers a usage read (usage is on-demand only — see the
+ * module header). Returns the last good figures (stamped `stale` past the
+ * freshness window) while they're within {@link STALE_TTL_MS}, else the last
+ * failure, else `null` when nothing has ever been fetched for this provider
+ * (the daemon booted but no one has demanded usage yet) — the card then simply
+ * shows no quota until a `refresh` populates it.
+ */
+export const peekUsage = (slug: string): TProviderUsageSnapshot | null => {
+  const entry = cache.get(slug);
+  if (entry === undefined) return null;
+  const now = Date.now();
+  if (entry.good !== null && now - entry.good.atMs < STALE_TTL_MS) {
+    return stampStale(entry.good.snapshot, entry.good.atMs, now);
+  }
+  return entry.failure;
 };
 
 /**
