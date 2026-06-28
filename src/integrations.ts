@@ -142,13 +142,13 @@ export const runIntegration = async (
   // OPENLLM_API_KEY first so an unverified value can never leak in.
   const { OPENLLM_API_KEY: _omit, ...baseEnv } = process.env;
   // The daemon runs as a background service with a minimal inherited PATH, so
-  // user-installed CLIs the scripts need (`claude` lands in ~/.local/bin; many
-  // tools live under Homebrew) aren't found and a script that relies on one
-  // half-applies or acks `status:error`. Prepend the standard user bin dirs
-  // ONCE, here, so EVERY integration (install + uninstall, all areas) resolves
-  // them. All three are within the OS-sandbox working set (`/opt`, `/usr`,
-  // ~/.local/bin — see sandbox/working-set.ts), so no spawn hits a Landlock
-  // denial; absent dirs are simply ignored by the shell.
+  // user-installed CLIs the scripts need (`claude` lands in ~/.local/bin; `bun`
+  // lands in ~/.bun/bin; many tools live under Homebrew) aren't found and a
+  // script that relies on one half-applies or acks `status:error`. Prepend the
+  // standard user bin dirs ONCE, here, so EVERY integration (install +
+  // uninstall, all areas) resolves them. All are within the OS-sandbox working
+  // set (`/opt`, `/usr`, ~/.local/bin, ~/.bun — see sandbox/working-set.ts), so
+  // no spawn hits a Landlock denial; absent dirs are simply ignored by the shell.
   const pathValue = [...DEFAULT_BIN_DIRS, baseEnv.PATH ?? ""]
     .filter((p) => p.length > 0)
     .join(":");

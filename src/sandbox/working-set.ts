@@ -182,6 +182,14 @@ export const daemonWorkingSet = (): TWorkingSet => {
     //   non-isolated `claude`/`codex` installers drop their launcher + where the
     //   setup fast path copies an adopted CLI binary.
     join(home, ".local", "bin"),
+    //   bun's install dir: the official installer drops `bun` at ~/.bun/bin, and
+    //   the claude-context plugin install runs `bun install` (writing its global
+    //   cache under ~/.bun/install/cache). Read-WRITE, not just read: the spawn
+    //   must EXEC the binary AND let `bun install` populate that cache, or the
+    //   plugin's node_modules never hydrate and its MCP server can't start.
+    //   Absent when bun isn't installed — the install then fails its own
+    //   `command -v bun` check, correctly. Holds no credentials.
+    join(home, ".bun"),
     //   claude's install dir: the `~/.local/bin/claude` launcher resolves to
     //   `~/.local/share/claude/versions/<v>`. The official `claude install`
     //   WRITES versions here, and the daemon's isolated CLI is a SYMLINK to that
