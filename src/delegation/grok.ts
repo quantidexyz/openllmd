@@ -3,7 +3,7 @@
  *
  * Native delegation: use the installed `grok` CLI's OWN bearer + identity.
  * Grok Build is a subscription-OAuth coding agent (SuperGrok / X Premium+);
- * `grok login` runs a browser OAuth (PKCE, `accounts.x.ai`) and caches the
+ * `grok login` runs a browser OAuth (PKCE, issuer `auth.x.ai`) and caches the
  * token locally. We never mint/forge/export it — the daemon reads the CLI's
  * own store and injects the bearer for ONE inference call.
  *
@@ -14,16 +14,21 @@
  * ISOLATED install: the daemon runs its OWN `grok` under
  * `~/.openllm/cli/grok/` with `HOME` pointed inside it (see cli-paths.ts), so
  * it never touches the user's personal `~/.grok`.
- *   - Store: `<HOME>/.grok/auth.json`.
- *   - Login: `grok login` (browser).
- *   - Usage: not yet wired (no confirmed endpoint).
  *
- * ⚠️ RESEARCH-UNVERIFIED — every Grok-specific detail below (auth.json shape,
- * the login subcommand + its authorize-URL output, the token's location, the
- * upstream endpoint, refresh) is inferred from public reverse-engineering
- * (Nous/Hermes `xai-grok-oauth`, `pi-xai-oauth`) and MUST be validated against
- * a real SuperGrok login before this provider is trusted. This mirrors the
- * "research-derived, marked unverified" posture used for codex + kimi.
+ * VERIFIED against grok CLI 0.2.73 (from its bundled
+ * `docs/user-guide/02-authentication.md` + a real login):
+ *   - Store: `<HOME>/.grok/auth.json` — a MAP of session entries keyed by
+ *     `"<issuer>::<session-id>"`; each entry's `key` is the access-token JWT,
+ *     alongside `refresh_token` + `expires_at` (see {@link readToken}).
+ *   - Login: `grok login` (browser OAuth at `auth.x.ai`, default `--oauth`);
+ *     `grok login --device-auth` is the headless/remote device-code flow.
+ *   - Logout: `grok logout` (no flags) clears the cached credentials.
+ *
+ * ⚠️ STILL UNVALIDATED: the upstream INFERENCE endpoint (assumed
+ * `api.x.ai/v1/responses`) and token REFRESH (the CLI refreshes silently only
+ * when IT runs; the daemon injects the token directly, so a token past
+ * `expires_at` 401s and the dashboard prompts a re-sign-in). Usage reporting is
+ * stubbed (no confirmed endpoint).
  */
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -54,30 +59,35 @@ const redactUrls = (s: string): string =>
   s.replace(/(https?:\/\/[^\s?]+)\?\S*/g, "$1?<redacted>");
 
 /**
- * Parse the browser authorize URL `grok login` prints.
- * ⚠️ RESEARCH-UNVERIFIED: Grok Build's OAuth issuer is `accounts.x.ai`; matched
- * leniently (any `accounts.x.ai` URL, then any `/authorize` URL) so an issuer
- * tweak doesn't break it. Confirm the exact stdout/stderr shape live.
+ * Parse the browser authorize URL `grok login` prints. The OAuth issuer is
+ * `auth.x.ai` (verified). Matched leniently (any `auth.x.ai` URL, then any
+ * `/authorize` URL) so an issuer/path tweak doesn't break it.
  */
 const parseAuthUrl = (raw: string): string | null => {
   const clean = stripAnsi(raw);
   return (
-    clean.match(/https?:\/\/accounts\.x\.ai\/\S+/)?.[0] ??
+    clean.match(/https?:\/\/auth\.x\.ai\/\S+/)?.[0] ??
     clean.match(/https?:\/\/\S*\/(?:oauth\/)?authorize\S+/)?.[0] ??
     null
   );
 };
 
-// ⚠️ RESEARCH-UNVERIFIED auth.json shape. We read tolerantly: a flat
-// `{ access_token }` OR a nested `{ tokens: { access_token } }` (the two shapes
-// the vendor CLIs in this repo use), so a minor structural surprise still reads.
-type TGrokTokens = {
-  readonly access_token?: string;
+// auth.json is a MAP of session entries keyed by `"<issuer>::<session-id>"`
+// (verified against grok 0.2.73). The access token is the `key` field of a
+// session (an OIDC JWT); `refresh_token` + `expires_at` sit alongside it. There
+// can be several sessions (one per signed-in account) — we use the newest one
+// carrying a usable token.
+type TGrokSession = {
+  /** The access-token JWT sent as `Authorization: Bearer <key>`. */
+  readonly key?: string;
   readonly refresh_token?: string;
+  /** ISO-8601 expiry of the access token. */
+  readonly expires_at?: string;
+  /** ISO-8601 session creation time — used to pick the newest session. */
+  readonly create_time?: string;
+  readonly auth_mode?: string;
 };
-type TGrokStore = TGrokTokens & {
-  readonly tokens?: TGrokTokens;
-};
+type TGrokStore = Readonly<Record<string, TGrokSession>>;
 
 const authPath = (): string => join(cliConfigDir(PROVIDER), "auth.json");
 
@@ -86,16 +96,27 @@ const loadStore = (): Promise<TGrokStore | null> =>
   readJsonFile<TGrokStore>(authPath());
 
 /**
- * Read the stored access token. ⚠️ NO proactive refresh yet — Grok Build's
- * native refresh trigger is unknown, so an expired token simply 401s upstream
- * and the dashboard prompts a re-sign-in. Wire a CLI-native refresh (mirroring
- * chatgpt's `codex doctor`) once the mechanism is confirmed.
+ * Read the stored access token — the `key` of the newest session entry.
+ * ⚠️ NO proactive refresh: grok refreshes its token silently only when the CLI
+ * itself runs, but the daemon injects the token directly, so a token past
+ * `expires_at` 401s upstream and the dashboard prompts a re-sign-in. A
+ * CLI-native refresh trigger is a follow-up.
  */
 const readToken = async (): Promise<{ accessToken: string } | null> => {
   const store = await loadStore();
-  const accessToken = store?.access_token ?? store?.tokens?.access_token;
-  if (accessToken === undefined || accessToken.length === 0) return null;
-  return { accessToken };
+  if (store === null) return null;
+  const sessions = Object.values(store).filter(
+    (s): s is TGrokSession & { readonly key: string } =>
+      typeof s?.key === "string" && s.key.length > 0,
+  );
+  if (sessions.length === 0) return null;
+  // Newest session first — ISO `create_time` sorts lexicographically.
+  sessions.sort((a, b) =>
+    (b.create_time ?? "").localeCompare(a.create_time ?? ""),
+  );
+  const [best] = sessions;
+  if (best === undefined) return null;
+  return { accessToken: best.key };
 };
 
 // ─── Login wiring ────────────────────────────────────────────────────────
