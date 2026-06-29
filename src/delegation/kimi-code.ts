@@ -88,13 +88,116 @@ type TKimiToken = {
   readonly expires_at?: number;
 };
 
+// kimi's native refresh is a `kimi -p` inference through the MANAGED (OAuth)
+// provider — which the CLI's `ensureFresh` refreshes mid-request. `kimi -p` needs
+// the managed model in config.toml, which kimi's interactive `/login` registers
+// (via `provisionManagedKimiCodeConfig` → `GET /models`). The daemon drives
+// device-code login DIRECTLY, so it never writes that config → `kimi -p` errors
+// "No model configured" and the token never refreshes. We replicate ONLY the
+// data-fetch: the managed model entries are pulled from the SAME `/models`
+// endpoint and written verbatim (never hardcoded). These are the CLI's stable
+// structural constants (ref/kimi-code `managed-kimi-code.ts`).
+const MANAGED_PROVIDER = "managed:kimi-code"; // KIMI_CODE_PROVIDER_NAME
+const MANAGED_OAUTH_KEY = "oauth/kimi-code"; // KIMI_CODE_OAUTH_KEY
+const MANAGED_ALIAS_PREFIX = "kimi-code"; // managedModelKey = `${this}/<id>`
+const configTomlPath = (): string => join(kimiHome(), "config.toml");
+
+// Provisioned once per process; single-flight; back off after a failed fetch.
+let configEnsured = false;
+let provisionInFlight: Promise<void> | null = null;
+let provisionBackoffUntil = 0;
+
 /**
- * Trigger the kimi CLI's OWN native token refresh. kimi has no headless refresh
- * command and refreshes only mid-inference (the managed/OAuth path), so run a
- * minimal `kimi -p` query — `kimi -p` is TTY-gated, so under a PTY. The CLI
- * authenticates with its OAuth credential and refreshes + persists it; the daemon
- * never touches the token. The isolated CLI is subscription-only (no custom
- * models), so this uses its managed subscription model. Output ignored; bounded.
+ * Fetch the vendor's managed model list (`GET /coding/v1/models` — exactly the
+ * call the CLI's `fetchManagedKimiCodeModels` makes after login) and write the
+ * managed provider + those models into the isolated `config.toml`. The MODEL
+ * entries (ids, context sizes) come straight from the API — nothing about them is
+ * hardcoded; `base_url` is derived from the captured upstream host. Returns false
+ * on any failure (non-200 / no models / parse).
+ */
+const provisionModelConfig = async (accessToken: string): Promise<boolean> => {
+  try {
+    const base = await resolveProviderUrl(PROVIDER, "/coding/v1");
+    const resp = await fetch(`${base}/models`, {
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        ...(await identityHeaders()),
+        accept: "application/json",
+      },
+    });
+    if (!resp.ok) return false;
+    const body = (await resp.json()) as {
+      data?: ReadonlyArray<Record<string, unknown>>;
+    };
+    const models = (body.data ?? [])
+      .map((m) => ({
+        id: typeof m.id === "string" ? m.id : "",
+        ctx: Number(m.context_length),
+      }))
+      .filter((m) => m.id.length > 0 && Number.isInteger(m.ctx) && m.ctx > 0);
+    if (models.length === 0) return false;
+    const lines: string[] = [
+      `default_model = "${MANAGED_ALIAS_PREFIX}/${models[0].id}"`,
+      "",
+      `[providers."${MANAGED_PROVIDER}"]`,
+      'type = "kimi"',
+      `base_url = "${base}"`,
+      'api_key = ""',
+      "",
+      `[providers."${MANAGED_PROVIDER}".oauth]`,
+      'storage = "file"',
+      `key = "${MANAGED_OAUTH_KEY}"`,
+    ];
+    for (const m of models) {
+      lines.push(
+        "",
+        `[models."${MANAGED_ALIAS_PREFIX}/${m.id}"]`,
+        `provider = "${MANAGED_PROVIDER}"`,
+        `model = "${m.id}"`,
+        `max_context_size = ${m.ctx}`,
+      );
+    }
+    await Bun.write(configTomlPath(), `${lines.join("\n")}\n`);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Ensure the isolated `config.toml` carries the managed model so `kimi -p` (the
+ * native refresh path) can run. Idempotent + single-flight + backs off after a
+ * failure. Called from `readToken` WHILE THE TOKEN IS VALID (the `/models` fetch
+ * needs a live token), so the config is ready before the near-expiry refresh.
+ */
+const ensureModelConfig = async (accessToken: string): Promise<void> => {
+  if (configEnsured) return;
+  if (provisionInFlight !== null) return provisionInFlight;
+  const existing = await Bun.file(configTomlPath())
+    .text()
+    .catch(() => "");
+  if (existing.includes(MANAGED_PROVIDER)) {
+    configEnsured = true;
+    return;
+  }
+  if (Date.now() < provisionBackoffUntil) return;
+  provisionInFlight = provisionModelConfig(accessToken)
+    .then((ok) => {
+      if (ok) configEnsured = true;
+      else provisionBackoffUntil = Date.now() + 60_000;
+    })
+    .finally(() => {
+      provisionInFlight = null;
+    });
+  return provisionInFlight;
+};
+
+/**
+ * Trigger the kimi CLI's OWN native token refresh: a minimal `kimi -p` inference
+ * through the managed (OAuth) provider. The CLI refreshes its token mid-request
+ * (`ensureFresh`) and persists it; the daemon never touches the token. `kimi -p`
+ * is TTY-gated (so under a PTY); the managed model it runs is provisioned by
+ * `readToken` from the native `/models` list. Output ignored; bounded.
  */
 const triggerRefresh = async (): Promise<void> => {
   await spawnRefresh([bin(), "-p", "ping"], env(), { pty: true });
@@ -122,6 +225,12 @@ const readToken = async (): Promise<{ accessToken: string } | null> => {
     typeof tok.expires_at === "number" && tok.expires_at > 0
       ? tok.expires_at * 1000
       : null;
+  // Provision the managed model config from the native `/models` list WHILE the
+  // token is still valid (the fetch needs a live token), so the near-expiry
+  // `kimi -p` refresh has a model to run. Idempotent — a no-op once configured.
+  if (expiresAtMs === null || expiresAtMs > Date.now()) {
+    await ensureModelConfig(tok.access_token);
+  }
   // Only trigger when the credential CAN be refreshed — an empty/missing refresh
   // token can't (and the CLI can't either), so don't waste a spawn.
   const outcome =
