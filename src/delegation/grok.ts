@@ -53,7 +53,7 @@ import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
 import { makeRefresher, spawnRefresh } from "./refresh";
 import type { TProviderDelegate } from "./types";
-import { readJsonFile, runCapture, stripAnsi } from "./util";
+import { cliVersion, readJsonFile, runCapture, stripAnsi } from "./util";
 
 const PROVIDER = "grok" as const;
 
@@ -142,6 +142,20 @@ const parseExpiryMs = (iso: string | undefined): number | null => {
   if (iso === undefined) return null;
   const t = Date.parse(iso);
   return Number.isNaN(t) ? null : t;
+};
+
+// cli-chat-proxy.grok.com GATES on the CLI version header: a request without
+// `x-grok-client-version` (or with an old one) is rejected 426 "Your Grok CLI
+// version (none) is outdated. Please update to version 0.1.202 or later". We
+// send the INSTALLED binary's real version (the genuine CLI identity), read
+// once + memoized (it only changes on a CLI update); fall back to a known-good
+// floor if `--version` can't be read.
+let cachedVersion: string | null = null;
+const clientVersion = async (): Promise<string> => {
+  if (cachedVersion !== null) return cachedVersion;
+  const v = await cliVersion(bin(), env());
+  cachedVersion = v?.match(/\d+\.\d+\.\d+/)?.[0] ?? "0.2.73";
+  return cachedVersion;
 };
 
 /**
@@ -305,7 +319,8 @@ export const grokDelegate: TProviderDelegate = {
     return {
       kind: "unavailable",
       reason:
-        "Grok does not expose a usage API for the CLI (xAI blocks it: oauth2-auth-forbidden). Check your SuperGrok usage at https://grok.com.",
+        "Grok does not expose a usage API for the CLI (xAI blocks it: oauth2-auth-forbidden).",
+      link: "https://grok.com",
     };
   },
 
@@ -314,11 +329,20 @@ export const grokDelegate: TProviderDelegate = {
     if (token === null) {
       throw new Error("grok: not signed in (no stored credential)");
     }
-    // The request TARGET URL is the captured/default Chat Completions endpoint
-    // (cli-chat-proxy.grok.com); no credential-intrinsic header beyond the
-    // bearer is required. The originator's own headers ride through.
+    // cli-chat-proxy.grok.com gates on the CLI's genuine identity headers — a
+    // request without `x-grok-client-version` is rejected 426. We send the
+    // installed CLI's REAL version + client identifier (the same identity the
+    // official `grok` sends). The Responses TARGET URL is captured/default
+    // per-hop; the originator's other headers ride through.
     const url = await resolveUpstreamUrl(PROVIDER);
-    return { access_token: token.accessToken, headers: {}, url };
+    return {
+      access_token: token.accessToken,
+      headers: {
+        "x-grok-client-version": await clientVersion(),
+        "x-grok-client-identifier": "xai-grok-cli",
+      },
+      url,
+    };
   },
 
   logout: async () => {
