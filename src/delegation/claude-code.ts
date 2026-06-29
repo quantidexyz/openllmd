@@ -38,7 +38,11 @@ import {
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
-import { ensureAuthConfig, resolveUpstreamUrl } from "./auth-config";
+import {
+  ensureAuthConfig,
+  resolveProviderUrl,
+  resolveUpstreamUrl,
+} from "./auth-config";
 import { makePasteBackDevice } from "./login-device";
 import { makeBlockingConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
@@ -57,7 +61,9 @@ import {
 const PROVIDER = "claude_code" as const;
 const KEYCHAIN_SERVICE = "Claude Code-credentials";
 const OAUTH_BETA = "oauth-2025-04-20";
-const OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
+// Usage endpoint LEAF path — the host is derived from the captured inference
+// endpoint (`resolveProviderUrl`), so a vendor host migration is auto-tracked.
+const USAGE_PATH = "/api/oauth/usage";
 
 // The daemon does NOT refresh the token itself. When the access token is within
 // this window of expiry, `readToken` TRIGGERS the `claude` CLI's OWN native
@@ -376,7 +382,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
       return { kind: "unavailable", reason: "not signed in to Claude Code" };
     }
     try {
-      const resp = await fetch(OAUTH_USAGE_URL, {
+      const resp = await fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {
         method: "GET",
         headers: {
           authorization: `Bearer ${token.accessToken}`,

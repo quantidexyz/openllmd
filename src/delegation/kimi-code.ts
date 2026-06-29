@@ -42,7 +42,11 @@ import {
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
-import { ensureAuthConfig, resolveUpstreamUrl } from "./auth-config";
+import {
+  ensureAuthConfig,
+  resolveProviderUrl,
+  resolveUpstreamUrl,
+} from "./auth-config";
 import type { TDeviceAuth, TDevicePoll } from "./login-direct";
 import { makeDeviceCodeConnect } from "./login-direct";
 import { loginSlot, makeCancelConnect } from "./login-flow";
@@ -51,7 +55,9 @@ import type { TProviderDelegate } from "./types";
 import { cliVersion, readJsonFile } from "./util";
 
 const PROVIDER = "kimi_code" as const;
-const USAGE_URL = "https://api.kimi.com/coding/v1/usages";
+// Usage endpoint LEAF path — the host is derived from the captured inference
+// endpoint (`resolveProviderUrl`), so a vendor host migration is auto-tracked.
+const USAGE_PATH = "/coding/v1/usages";
 
 // Device-code OAuth — verbatim from `ref/kimi-code/packages/oauth`
 // (constants.ts + oauth.ts). Same host + public client id the CLI uses,
@@ -489,7 +495,7 @@ export const kimiCodeDelegate: TProviderDelegate = {
       return { kind: "unavailable", reason: "not signed in to Kimi CLI" };
     }
     try {
-      const resp = await fetch(USAGE_URL, {
+      const resp = await fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {
         method: "GET",
         headers: {
           authorization: `Bearer ${token.accessToken}`,

@@ -422,6 +422,23 @@ export const resolveUpstreamUrl = async (
   return url ?? defaultUpstreamUrl(provider);
 };
 
+/**
+ * Build a URL for a sibling endpoint on the SAME host as a provider's captured
+ * inference endpoint — e.g. the vendor usage endpoint. The HOST is taken from
+ * the captured `upstream_url` (falling back to the default origin), so a vendor
+ * host migration — the exact drift that bit the token host — is auto-tracked
+ * with no hardcoded origin; only the stable leaf `path` (e.g. `/api/oauth/usage`)
+ * is a constant. NEVER spawns a capture (`captureIfMissing:false`) — callers
+ * (usage reads) must not trigger a CLI spawn.
+ */
+export const resolveProviderUrl = async (
+  provider: TCliProvider,
+  path: string,
+): Promise<string> => {
+  const base = await resolveUpstreamUrl(provider, { captureIfMissing: false });
+  return new URL(path, new URL(base).origin).toString();
+};
+
 // ─── Combined entry (post-login / -relogin re-capture) ───────────────────────
 
 /**

@@ -28,7 +28,11 @@ import {
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
-import { ensureAuthConfig, resolveUpstreamUrl } from "./auth-config";
+import {
+  ensureAuthConfig,
+  resolveProviderUrl,
+  resolveUpstreamUrl,
+} from "./auth-config";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
@@ -37,7 +41,9 @@ import type { TProviderDelegate } from "./types";
 import { cliVersion, readJsonFile, runCapture, stripAnsi } from "./util";
 
 const PROVIDER = "chatgpt" as const;
-const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+// Usage endpoint LEAF path — the host is derived from the captured inference
+// endpoint (`resolveProviderUrl`), so a vendor host migration is auto-tracked.
+const USAGE_PATH = "/backend-api/wham/usage";
 
 // The daemon does NOT refresh the token itself. When the access-token JWT `exp`
 // is within this window, `readToken` TRIGGERS the codex CLI's OWN native refresh
@@ -307,7 +313,7 @@ export const chatgptDelegate: TProviderDelegate = {
       return { kind: "unavailable", reason: "not signed in to Codex" };
     }
     try {
-      const resp = await fetch(USAGE_URL, {
+      const resp = await fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {
         method: "GET",
         headers: {
           authorization: `Bearer ${token.accessToken}`,
