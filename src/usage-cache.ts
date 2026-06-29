@@ -58,6 +58,14 @@ const FRESH_TTL_MS = 5 * 60_000;
 // After a failed refresh, keep serving the last good snapshot for up to this
 // long rather than showing an error — but don't show stale quota forever.
 const STALE_TTL_MS = 30 * 60_000;
+// When there's NO good snapshot to serve (only a failure, or nothing yet), an
+// on-demand read retries after just this — much shorter than FRESH_TTL_MS — so
+// the UI recovers quickly once a transient failure clears (e.g. a token that was
+// briefly expired and has since refreshed). Safe because `cachedUsage` is only
+// called on-demand (the `refresh` command), NEVER on the 2.5s status push (that
+// reads the cache passively via `peekUsage`), so a short retry can't hammer the
+// rate-limited endpoint the way the old per-push read did.
+const FAILURE_RETRY_MS = 20_000;
 
 type TUsageEntry = {
   // The last USABLE snapshot + when we obtained it (drives the "last known
@@ -195,11 +203,15 @@ export const cachedUsage = async (
     // A refresh is already running — share it (refresh-token rotation and rate
     // limits make parallel fetches actively harmful).
     if (entry.inFlight !== null) return entry.inFlight;
-    // We hit the vendor recently (success or fail). Back off rather than
-    // hammer — the usage endpoint rate-limits independently of inference, and
-    // re-trying every push is exactly what triggers the 429 in the first
-    // place. Serve the best we have meanwhile.
-    if (now - entry.lastAttemptAtMs < FRESH_TTL_MS) {
+    // We hit the vendor recently (success or fail). Back off rather than hammer.
+    // The window depends on what we can serve: with a usable GOOD snapshot, hold
+    // it for the full FRESH_TTL (the figures are fine for minutes). With ONLY a
+    // failure (or nothing fetched yet), back off for just FAILURE_RETRY_MS so an
+    // on-demand refresh recovers fast once a transient failure clears — without
+    // this, a single failed read (e.g. a momentarily-expired token) stuck the UI
+    // on the error for 5 min even after the token refreshed.
+    const backoff = entry.good !== null ? FRESH_TTL_MS : FAILURE_RETRY_MS;
+    if (now - entry.lastAttemptAtMs < backoff) {
       return servable(entry, now);
     }
   }
