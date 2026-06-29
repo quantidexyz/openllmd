@@ -59,11 +59,13 @@ export const computeStatus = async (): Promise<TDaemonStatus> => {
  * On-demand usage read — the ONLY path that hits the vendor usage endpoint.
  * Driven by the `refresh` command (the manual "Refresh usage" button or the
  * providers page mounting for this device, via `control-relay.ts`). Fetches
- * live figures for every CONNECTED provider (or just `slug` when scoped) into
- * the usage cache; the status push that follows the command then carries them
- * back via `peekUsage`. The caller busts the TTL first (`invalidateUsage`) so
- * this read is genuinely live. Best-effort per provider — `cachedUsage` already
- * swallows fetch failures into an `unavailable` snapshot.
+ * figures for every CONNECTED provider (or just `slug` when scoped) into the
+ * usage cache; the status push that follows the command then carries them back
+ * via `peekUsage`. RESPECTS each provider's TTL — `cachedUsage` serves a
+ * still-fresh snapshot from cache (no vendor hit) and only re-fetches a stale or
+ * never-fetched one, so a whole-daemon refresh after one login doesn't re-hit
+ * every vendor. Best-effort per provider — `cachedUsage` already swallows fetch
+ * failures into an `unavailable` snapshot.
  */
 export const refreshUsage = async (slug?: string): Promise<void> => {
   await Promise.all(

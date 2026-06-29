@@ -21,7 +21,6 @@ import { logError } from "./logger";
 import { clearPendingAuth } from "./pending-auth";
 import { maybeSelfUpdate } from "./self-update";
 import { refreshUsage } from "./status";
-import { invalidateUsage } from "./usage-cache";
 
 // Cap how long the post-install/uninstall `-s` re-probe may delay the command
 // ack. The probe only warms the device-state cache for the next status push, so
@@ -219,11 +218,16 @@ export const runCommandInner = async (
       // push only PEEKS the cache; see `status.ts`). `slug` scopes it to one
       // provider; the dashboard's whole-daemon refresh sends none → all.
       case "refresh":
-        // Bust the TTL so this read is genuinely LIVE, then fetch the connected
-        // providers' usage into the cache NOW. The post-command status push
-        // (below, in `control-channel.ts`) then carries the fresh figures via
-        // `peekUsage`. `status` is the passive read and keeps the cache.
-        invalidateUsage(cmd.payload?.slug);
+        // Fetch the connected providers' usage into the cache, RESPECTING each
+        // provider's TTL: `refreshUsage` → `cachedUsage` serves a still-fresh
+        // snapshot from cache (no vendor hit) and only re-fetches a STALE or
+        // never-fetched one. We deliberately do NOT bust the cache first —
+        // invalidating would (a) re-hit EVERY provider when only one was just
+        // connected (the whole-daemon refresh the dashboard fires on login), (b)
+        // ignore a provider's freshness window, and (c) clear the served snapshot
+        // so the card blanks mid-refresh. Leaving the cache intact means the last
+        // figures keep being served (`peekUsage`) while a re-fetch runs. The
+        // post-command status push then carries whatever the cache now holds.
         await refreshUsage(cmd.payload?.slug);
         // NB: a bare `refresh` does NOT re-walk device state — the `-s` walk is
         // heavy (a fetch + bash per registry item) and the dashboard fires
