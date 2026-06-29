@@ -69,7 +69,12 @@ export const FLAGS: readonly TFlag[] = [
   { name: "--version", description: "Print the version" },
 ] as const;
 
-export const PROVIDERS = ["claude_code", "chatgpt", "kimi_code"] as const;
+export const PROVIDERS = [
+  "claude_code",
+  "chatgpt",
+  "kimi_code",
+  "grok",
+] as const;
 
 /** Action choices for the `skill` / `plugin` / `setup` integration groups. */
 export const INTEGRATION_GROUPS = ["skill", "plugin", "setup"] as const;

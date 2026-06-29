@@ -186,6 +186,22 @@ const CAPTURE: Readonly<Record<TCliProvider, TCaptureSpec>> = {
     // `kimi -p` is gated on a real TTY (raw-mode detection) — run under a PTY.
     usePty: true,
   },
+  grok: {
+    // xAI Grok speaks the OpenAI Responses API (same wire as codex), POSTing
+    // to `https://api.x.ai/v1/responses`. ⚠️ RESEARCH-UNVERIFIED endpoint.
+    origin: "https://api.x.ai",
+    path: "/v1/responses",
+    match: (p) => p.endsWith("/responses"),
+    // Shape-only (NEVER run): `liveCapture: false` serves the stable default
+    // URL above instead of spawning a real `grok` inference to capture it.
+    // Grok Build's headless-exec capability + whether a `-p ping`-style probe
+    // rotates its OAuth refresh token are both unverified, so — exactly like
+    // claude_code — we don't risk a live capture. Revisit once the CLI's
+    // headless mode is confirmed and the endpoint is known to drift.
+    argv: (bin) => [bin, "-p", "ping"],
+    env: (base) => ({ XAI_BASE_URL: base }),
+    liveCapture: false,
+  },
 };
 
 /** The default (pre-capture) upstream URL: ORIGIN + default PATH. The delegate

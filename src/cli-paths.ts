@@ -38,6 +38,10 @@ const SPECS: Readonly<Record<TCliProvider, TCliSpec>> = {
   chatgpt: { binRel: "bin/codex" },
   // kimi install.sh with KIMI_INSTALL_DIR=<root> → <root>/bin/kimi.
   kimi_code: { binRel: "bin/kimi" },
+  // ⚠️ RESEARCH-UNVERIFIED: the `grok` (Grok Build) installer is HOME-rooted
+  // like claude — it's assumed to drop the launcher at $HOME/.local/bin/grok.
+  // Confirm against a real `x.ai/cli` install before relying on it.
+  grok: { binRel: "home/.local/bin/grok" },
 };
 
 export const cliRoot = (provider: TCliProvider): string =>
@@ -80,6 +84,10 @@ export const hostCliCandidates = (provider: TCliProvider): string[] => {
         join(home, ".kimi-code", "bin", "kimi"),
         join(home, ".local", "bin", "kimi"),
       ];
+    // ⚠️ RESEARCH-UNVERIFIED: confirm where the official Grok Build installer
+    // places the launcher.
+    case "grok":
+      return [join(home, ".local", "bin", "grok")];
   }
 };
 
@@ -98,6 +106,9 @@ export const cliConfigDir = (provider: TCliProvider): string => {
       return join(home, ".codex");
     case "kimi_code":
       return join(home, ".kimi-code");
+    // grok caches its OAuth token at <home>/.grok/auth.json.
+    case "grok":
+      return join(home, ".grok");
   }
 };
 
@@ -154,6 +165,16 @@ export const cliEnv = (provider: TCliProvider): Record<string, string> => {
         KIMI_INSTALL_DIR: root,
         // Don't edit the user's shell rc files.
         KIMI_NO_MODIFY_PATH: "1",
+      };
+    // grok is HOME-rooted (like claude): it reads/writes its config +
+    // `auth.json` under <home>/.grok, so pinning HOME isolates it from the
+    // user's real ~/.grok. ⚠️ RESEARCH-UNVERIFIED: if the Grok Build installer
+    // exposes an install-dir / home env knob, add it here (mirror codex/kimi)
+    // so the isolated install doesn't touch the user's shell profile.
+    case "grok":
+      return {
+        HOME: home,
+        TMPDIR: tmp,
       };
   }
 };
