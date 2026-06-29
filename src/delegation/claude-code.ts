@@ -26,26 +26,23 @@
  *     2023-06-01`, `User-Agent: claude-cli/<version>`.
  *   - Usage: GET https://api.anthropic.com/api/oauth/usage.
  */
-import { rename, rm } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@quantidexyz/openllmp";
 import { cliInstallState } from "../cli-install";
 import { cliBin, cliConfigDir, cliEnv, cliHome } from "../cli-paths";
-import { logDebug, logWarn } from "../logger";
+import { logWarn } from "../logger";
 import {
   clearPendingAuth,
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
-import {
-  ensureAuthConfig,
-  oauthConfig,
-  resolveUpstreamUrl,
-} from "./auth-config";
+import { ensureAuthConfig, resolveUpstreamUrl } from "./auth-config";
 import { makePasteBackDevice } from "./login-device";
 import { makeBlockingConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
+import { makeRefresher, spawnRefresh } from "./refresh";
 import type { TProviderDelegate } from "./types";
 import {
   cliVersion,
@@ -55,7 +52,6 @@ import {
   readJsonFile,
   runCapture,
   toEpochMs,
-  writeIsolatedKeychain,
 } from "./util";
 
 const PROVIDER = "claude_code" as const;
@@ -63,25 +59,12 @@ const KEYCHAIN_SERVICE = "Claude Code-credentials";
 const OAUTH_BETA = "oauth-2025-04-20";
 const OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 
-// The OAuth token endpoint + public client id used to refresh the access
-// token with the stored refresh token. This is the SAME flow the CLI runs —
-// done here on its behalf, locally, when the daemon needs a token and the CLI
-// hasn't refreshed (the CLI only refreshes mid-inference, which the daemon
-// never triggers; there is no `claude auth refresh` command). The rotated
-// token is written back to the CLI's store so the two stay in sync.
-//
-// Both values are Anthropic's and DRIFT on CLI updates (the token host moved
-// console.anthropic.com → platform.claude.com), so they are NOT hardcoded
-// here — `oauthConfig()` reads them from the installed CLI binary or a valid
-// cache entry; when neither exists, refresh is SKIPPED (no hardcoded fallback).
-// See `auth-config.ts`.
-//
-// Refresh proactively when within this window of expiry (hides clock skew
-// + avoids a guaranteed 401 → refresh → retry on the next call).
+// The daemon does NOT refresh the token itself. When the access token is within
+// this window of expiry, `readToken` TRIGGERS the `claude` CLI's OWN native
+// refresh (a minimal `claude -p` query — the CLI refreshes mid-request and
+// persists the rotated token to its store); there is no `claude auth refresh`
+// command. No token endpoint or client id lives here. See `triggerRefresh`.
 const REFRESH_LEEWAY_MS = 60_000;
-// Hard cap on the token-refresh request so a hung endpoint can't stall the
-// readToken critical path (inference + usage await it).
-const REFRESH_FETCH_TIMEOUT_MS = 10_000;
 
 // Run the isolated `claude` binary with its isolated home/config env.
 const bin = (): string => cliBin(PROVIDER);
@@ -115,166 +98,51 @@ const loadStore = async (): Promise<TClaudeStore | null> => {
   );
 };
 
-// Persist a refreshed blob back to the CLI's store so the isolated CLI
-// reads the same (rotated) token next time. macOS → keychain (in-place
-// update, no ACL change/prompt); Linux/Windows → the credentials file.
-const writeStore = async (store: TClaudeStore): Promise<void> => {
-  const payload = JSON.stringify(store);
-  if (platform() === "darwin") {
-    await writeIsolatedKeychain(cliHome(PROVIDER), KEYCHAIN_SERVICE, payload);
-    return;
-  }
-  // Atomic write (temp + rename) — the isolated `claude` CLI writes the SAME
-  // file via its OWN atomic temp+rename, so a plain overwrite here could be lost
-  // to / interleave with the CLI's write. rename(2) on the same dir is atomic,
-  // so a concurrent reader always sees either the old or the new file whole.
-  const path = join(cliConfigDir(PROVIDER), ".credentials.json");
-  const tmp = `${path}.openllmd.tmp`;
-  await Bun.write(tmp, payload);
-  await rename(tmp, path);
+/**
+ * Trigger the `claude` CLI's OWN native token refresh: a minimal headless
+ * query. The CLI refreshes its OAuth access token mid-request and PERSISTS the
+ * rotated token to its store — the daemon never touches the token. macOS: the
+ * isolated login keychain must be unlocked first so the CLI can READ the
+ * credential to make the call (and WRITE the rotated one back). Output ignored;
+ * bounded. Rotating the refresh token here is fine — this is now the SINGLE
+ * refresher (no race with a daemon-side refresh), which is why claude's URL
+ * capture stays disabled (`liveCapture:false`).
+ */
+const triggerRefresh = async (): Promise<void> => {
+  await ensureIsolatedKeychain(cliHome(PROVIDER));
+  await spawnRefresh([bin(), "-p", "ping"], env());
 };
 
-// Exchange the stored refresh token for a fresh access token (+ possibly
-// rotated refresh token). Returns null on any failure — caller falls back
-// to the existing (stale) token, surfacing the upstream's own 401.
-const refreshOAuth = async (
-  refreshToken: string,
-): Promise<{
-  access: string;
-  refresh: string;
-  expiresAtMs: number | null;
-} | null> => {
-  try {
-    // Read the (drift-prone) endpoint + client id from the CLI binary, not a
-    // hardcoded literal. NULL when extraction failed AND nothing valid is
-    // cached — skip the refresh (no hardcoded fallback to fall back to); the
-    // stale access token then surfaces the vendor's own 401 → re-login.
-    const cfg = await oauthConfig(PROVIDER);
-    if (cfg === null) {
-      // `oauthConfig`/`extractOAuthFromBinary` already WARNed the root cause
-      // (extraction drift). Just note that this refresh is being skipped.
-      logDebug(
-        "claude-code",
-        "token refresh skipped — no OAuth config available",
-      );
-      return null;
-    }
-    const { token_url, client_id } = cfg;
-    const resp = await fetch(token_url, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        accept: "application/json",
-        // CLI meta, used ONLY here (the token endpoint is the one call the
-        // daemon legitimately makes AS the CLI). Derived live from the
-        // installed binary's version.
-        "user-agent": await userAgent(),
-      },
-      body: JSON.stringify({
-        grant_type: "refresh_token",
-        refresh_token: refreshToken,
-        client_id,
-      }),
-      // Bound the refresh so a hung token endpoint can't stall readToken (and
-      // thus every inference/usage call that awaits it) — abort → caught → null.
-      signal: AbortSignal.timeout(REFRESH_FETCH_TIMEOUT_MS),
-    });
-    if (!resp.ok) {
-      // A 400/401 here means the stored REFRESH token was rejected (expired or
-      // already rotated away) — every later refresh fails too, so the access
-      // token stays stale and usage/inference 401/429. Surface it loudly: this
-      // is a re-login situation, not a transient blip.
-      const reLogin = resp.status === 400 || resp.status === 401;
-      logWarn("claude-code", "OAuth token refresh rejected by token endpoint", {
-        status: resp.status,
-        hint: reLogin
-          ? "stored refresh token is invalid — re-sign in via `openllmd connect claude_code` / `claude` login"
-          : "transient token-endpoint error — will retry on the next stale read",
-      });
-      return null;
-    }
-    const d = (await resp.json()) as {
-      access_token?: string;
-      refresh_token?: string;
-      expires_in?: number;
-    };
-    if (typeof d.access_token !== "string" || d.access_token.length === 0) {
-      return null;
-    }
-    return {
-      access: d.access_token,
-      // Anthropic rotates refresh tokens; keep the old one if absent OR empty.
-      // An empty `refresh_token` would otherwise OVERWRITE a working one with
-      // "", permanently stranding the credential (readToken won't refresh a ""),
-      // so treat "" exactly like absent.
-      refresh:
-        typeof d.refresh_token === "string" && d.refresh_token.length > 0
-          ? d.refresh_token
-          : refreshToken,
-      expiresAtMs:
-        typeof d.expires_in === "number"
-          ? Date.now() + d.expires_in * 1000
-          : null,
-    };
-  } catch (err) {
-    // Network error or the REFRESH_FETCH_TIMEOUT abort — transient; the stale
-    // access token surfaces the vendor's own 401 and we retry next stale read.
-    logDebug("claude-code", "OAuth token refresh failed (network/timeout)", {
-      err: err instanceof Error ? err.message : String(err),
-    });
-    return null;
-  }
-};
-
-// Single-flight guard: concurrent callers that all see an expired token
-// share ONE refresh (refresh-token rotation means parallel refreshes
-// would invalidate each other).
-let inFlightRefresh: Promise<void> | null = null;
+// Within the leeway window → fire the CLI refresh in the background (still
+// valid, no stall); hard-expired → await it. Single-flight per provider.
+const refresh = makeRefresher({
+  leewayMs: REFRESH_LEEWAY_MS,
+  trigger: triggerRefresh,
+});
 
 /**
- * The current access token, refreshed + persisted if it's within the
- * leeway of expiry. Used by `credentialForUpstream` (inference) and
- * `usage` so both always carry a live token.
+ * The current access token, triggering the CLI's native refresh if it's within
+ * the leeway of expiry. Used by `credentialForUpstream` (inference) and `usage`
+ * so both carry a live token.
  */
 const readToken = async (): Promise<{
   accessToken: string;
   expiresAtMs: number | null;
 } | null> => {
-  const store = await loadStore();
-  const oauth = store?.claudeAiOauth;
+  const oauth = (await loadStore())?.claudeAiOauth;
   if (oauth?.accessToken === undefined || oauth.accessToken.length === 0) {
     return null;
   }
   const expiresAtMs = toEpochMs(oauth.expiresAt);
-  const stale =
-    expiresAtMs !== null && expiresAtMs - Date.now() < REFRESH_LEEWAY_MS;
-  // An empty refreshToken is as un-refreshable as a missing one — don't waste
-  // a doomed refresh round-trip on "".
-  if (!stale || !oauth.refreshToken) {
+  // Only trigger when the credential CAN be refreshed — an empty/missing refresh
+  // token can't (and the CLI can't either), so don't waste a spawn.
+  const outcome = oauth.refreshToken ? await refresh(expiresAtMs) : "fresh";
+  if (outcome !== "awaited") {
     return { accessToken: oauth.accessToken, expiresAtMs };
   }
-
-  if (inFlightRefresh === null) {
-    const rt = oauth.refreshToken;
-    inFlightRefresh = (async () => {
-      const refreshed = await refreshOAuth(rt);
-      if (refreshed === null) return;
-      await writeStore({
-        claudeAiOauth: {
-          ...oauth,
-          accessToken: refreshed.access,
-          refreshToken: refreshed.refresh,
-          expiresAt: refreshed.expiresAtMs ?? oauth.expiresAt,
-        },
-      });
-    })().finally(() => {
-      inFlightRefresh = null;
-    });
-  }
-  await inFlightRefresh;
-
-  // Re-read the (now-rotated) store. Falls back to the stale token if the
-  // refresh failed — the upstream then 401s and the UI says re-sign-in.
+  // Hard-expired path: the CLI refresh was awaited — re-read the (now-rotated)
+  // store. Falls back to the stale token if it failed (the upstream then 401s
+  // and the UI says re-sign-in).
   const fresh = (await loadStore())?.claudeAiOauth;
   if (fresh?.accessToken !== undefined && fresh.accessToken.length > 0) {
     return {

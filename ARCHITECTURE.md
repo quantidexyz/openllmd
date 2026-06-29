@@ -427,28 +427,26 @@ stores ONLY that URL + the CLI version — never an identity-header set to repla
 `resolveUpstreamUrl` prefers the captured URL and falls back to the retained
 ORIGIN + default path per provider.
 
-**OAuth refresh config is extracted too (`auth-config.ts`).** Refreshing a
-Claude Pro/Max OR Codex/ChatGPT token needs the OAuth `client_id` + token
-endpoint — the vendor's, baked into the CLI binary, and also drift-prone. Rather
-than hand-copy them, `oauthConfig(provider)` scans the installed CLI binary:
-Claude's JS bundle exposes an embedded prod config block
-(`TOKEN_URL:"…/v1/oauth/token" … CLIENT_ID:"<uuid>"`, anchored on the prod host
-so a local/staging dev block can't be picked up); Codex's Rust binary packs
-`REFRESH_TOKEN_URL` + `CLIENT_ID` as separator-less literals (matched at exact
-length + most-frequent pick). A per-provider format guard rejects a
-mis-extracted value. **No hardcoded fallback** (for compliance — a stale literal
-is exactly the drift that bit us): `oauthConfig` serves the freshly-extracted
-value or the last successfully-extracted one cached in `config.ts`, else `null`
-→ the delegate skips refresh (the stale access token then surfaces the vendor's
-own 401 → re-login), never a hardcoded credential. No value is secret (a public
-app id + a published URL) and the binary read stays on-box. The CLI version is
-attached as the `user-agent` on the refresh POST (the one call the daemon
-legitimately makes AS the CLI — CLI meta, used ONLY for refresh).
+**Token refresh is the CLI's own job (`delegation/refresh.ts`).** The daemon
+never refreshes a subscription token itself — no `grant_type=refresh_token`
+calls, no extracted or hardcoded token endpoint / client id. Each delegate's
+`readToken` checks the stored access token's expiry and, when it's within the
+leeway window, TRIGGERS the official CLI's OWN native refresh: a bounded spawn
+whose side effect is the CLI refreshing + persisting its token to its own store.
+claude → a minimal `claude -p` query (the CLI refreshes mid-request); codex →
+`codex doctor` (its websocket-reachability check forces the proactive refresh —
+no inference); kimi → a minimal `kimi -p` query under a PTY (subscription model).
+The refresher (`makeRefresher`) fires in the BACKGROUND while the token is still
+valid — no hot-path stall — and only AWAITS the spawn once the token is
+hard-expired ("no latency unless the refresh is close"); single-flight per
+provider. Being the SINGLE refresher means claude's URL capture stays disabled
+and the old refresh-token rotation race is gone. (kimi's device-code LOGIN —
+which the daemon must drive, the CLI having only an in-TUI `/login` — keeps its
+public OAuth `client_id`/host; that is login infra, not refresh.)
 
-Both the captured URL + the extracted OAuth config (+ `cli_version` and per-part
-TTL timestamps) persist to ONE consolidated per-provider `config.json` sidecar
-(`<cliRoot>/config.json`, plain JSON). Each part is version-keyed with its own
-24h TTL, re-captured / re-extracted on a CLI version bump or after a re-login
+The captured URL (+ `cli_version` and a TTL timestamp) persists to a per-provider
+`config.json` sidecar (`<cliRoot>/config.json`, plain JSON), version-keyed with a
+24h TTL, re-captured on a CLI version bump or after a re-login
 (`ensureAuthConfig({ force })`). See
 [`delegation-exec-fixtures.md`](../../docs/proposals/delegation-exec-fixtures.md)
 (amended).

@@ -46,6 +46,7 @@ import { ensureAuthConfig, resolveUpstreamUrl } from "./auth-config";
 import type { TDeviceAuth, TDevicePoll } from "./login-direct";
 import { makeDeviceCodeConnect } from "./login-direct";
 import { loginSlot, makeCancelConnect } from "./login-flow";
+import { makeRefresher, spawnRefresh } from "./refresh";
 import type { TProviderDelegate } from "./types";
 import { cliVersion, readJsonFile } from "./util";
 
@@ -62,9 +63,11 @@ const OAUTH_HOST = (
 ).replace(/\/$/, "");
 const OAUTH_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
-// Refresh the access token when it's within this of `expires_at` — both
-// on a status/usage read and before serving a request (a small skew
-// avoids a guaranteed 401 → refresh → retry on the next call).
+// When the access token is within this window of `expires_at`, `readToken`
+// TRIGGERS the kimi CLI's OWN native refresh (a minimal `kimi -p` inference — the
+// CLI refreshes mid-request and persists it). No token endpoint or client id is
+// used for REFRESH; the constants above belong to the device-code LOGIN flow,
+// which the daemon must drive itself (kimi's only sign-in is the in-TUI /login).
 const REFRESH_LEEWAY_MS = 60_000;
 
 const bin = (): string => cliBin(PROVIDER);
@@ -80,47 +83,29 @@ type TKimiToken = {
 };
 
 /**
- * Exchange the stored refresh token for a fresh one via the SAME
- * device-code token endpoint with `grant_type=refresh_token` the CLI
- * uses (ref/kimi-code packages/oauth `refreshAccessToken`). Returns the
- * new wire blob on success, null on any failure — the caller then falls
- * back to the stale token and the upstream's own 401 surfaces.
+ * Trigger the kimi CLI's OWN native token refresh. kimi has no headless refresh
+ * command and refreshes only mid-inference (the managed/OAuth path), so run a
+ * minimal `kimi -p` query — `kimi -p` is TTY-gated, so under a PTY. The CLI
+ * authenticates with its OAuth credential and refreshes + persists it; the daemon
+ * never touches the token. The isolated CLI is subscription-only (no custom
+ * models), so this uses its managed subscription model. Output ignored; bounded.
  */
-const refreshOAuth = async (
-  refresh: string,
-  headers: Record<string, string>,
-): Promise<Record<string, unknown> | null> => {
-  try {
-    const { status, data } = await postForm(
-      "/api/oauth/token",
-      {
-        client_id: OAUTH_CLIENT_ID,
-        grant_type: "refresh_token",
-        refresh_token: refresh,
-      },
-      headers,
-    );
-    return status === 200 && typeof data.access_token === "string"
-      ? data
-      : null;
-  } catch {
-    return null;
-  }
+const triggerRefresh = async (): Promise<void> => {
+  await spawnRefresh([bin(), "-p", "ping"], env(), { pty: true });
 };
 
-// Single-flight guard: concurrent callers that all see a stale token
-// share ONE refresh (Kimi rotates the refresh token, so parallel
-// refreshes would invalidate each other).
-let inFlightRefresh: Promise<void> | null = null;
+// Within the leeway window → fire the CLI refresh in the background (still
+// valid, no stall); hard-expired → await it. Single-flight per provider.
+const refresh = makeRefresher({
+  leewayMs: REFRESH_LEEWAY_MS,
+  trigger: triggerRefresh,
+});
 
 /**
  * The current access token from
- * `<KIMI_CODE_HOME>/credentials/kimi-code.json` (storage name resolves to
- * `kimi-code`; see packages/oauth resolveKimiTokenStorageName) —
- * REFRESHED + persisted when it's within the leeway of `expires_at`.
- * Used by `status`, `usage`, and `credentialForUpstream`, so a status
- * check AND a served request both carry a live token (the CLI itself
- * only refreshes mid-its-own-inference, which the daemon never triggers).
+ * `<KIMI_CODE_HOME>/credentials/kimi-code.json`, triggering the CLI's native
+ * refresh when it's within the leeway of `expires_at`. Used by `status`,
+ * `usage`, and `credentialForUpstream` so each carries a live token.
  */
 const readToken = async (): Promise<{ accessToken: string } | null> => {
   const tok = await readJsonFile<TKimiToken>(credentialPath());
@@ -131,39 +116,18 @@ const readToken = async (): Promise<{ accessToken: string } | null> => {
     typeof tok.expires_at === "number" && tok.expires_at > 0
       ? tok.expires_at * 1000
       : null;
-  const stale =
-    expiresAtMs !== null && expiresAtMs - Date.now() < REFRESH_LEEWAY_MS;
-  if (
-    !stale ||
-    tok.refresh_token === undefined ||
-    tok.refresh_token.length === 0
-  ) {
+  // Only trigger when the credential CAN be refreshed — an empty/missing refresh
+  // token can't (and the CLI can't either), so don't waste a spawn.
+  const outcome =
+    tok.refresh_token !== undefined && tok.refresh_token.length > 0
+      ? await refresh(expiresAtMs)
+      : "fresh";
+  if (outcome !== "awaited") {
     return { accessToken: tok.access_token };
   }
-
-  if (inFlightRefresh === null) {
-    const rt = tok.refresh_token;
-    inFlightRefresh = (async () => {
-      const wire = await refreshOAuth(rt, await identityHeaders());
-      if (wire === null) return;
-      // Kimi rotates the refresh token; keep the old one if the response
-      // omits it so we can still refresh next time. `writeCredential`
-      // persists the exact wire shape the CLI's storage uses.
-      if (
-        typeof wire.refresh_token !== "string" ||
-        wire.refresh_token.length === 0
-      ) {
-        wire.refresh_token = rt;
-      }
-      writeCredential(wire);
-    })().finally(() => {
-      inFlightRefresh = null;
-    });
-  }
-  await inFlightRefresh;
-
-  // Re-read the (now-rotated) credential; fall back to the stale token if
-  // the refresh failed — the upstream then 401s and the UI says re-login.
+  // Hard-expired path: the CLI refresh was awaited — re-read the (now-rotated)
+  // credential; fall back to the stale token if it failed (the upstream then
+  // 401s and the UI says re-login).
   const fresh = await readJsonFile<TKimiToken>(credentialPath());
   return {
     accessToken:
