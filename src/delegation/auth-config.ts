@@ -187,19 +187,20 @@ const CAPTURE: Readonly<Record<TCliProvider, TCaptureSpec>> = {
     usePty: true,
   },
   grok: {
-    // xAI Grok speaks the OpenAI Responses API (same wire as codex), POSTing
-    // to `https://api.x.ai/v1/responses`. ⚠️ RESEARCH-UNVERIFIED endpoint.
-    origin: "https://api.x.ai",
+    // Grok Build's chat goes through the CLI chat proxy. Both Grok Build models
+    // report `api_backend: "responses"` (via `/v1/models`), so the daemon POSTs
+    // the OpenAI Responses wire to `cli-chat-proxy.grok.com/v1/responses`
+    // (verified live — `/v1/responses` 405s on GET, i.e. it exists).
+    origin: "https://cli-chat-proxy.grok.com",
     path: "/v1/responses",
     match: (p) => p.endsWith("/responses"),
-    // Shape-only (NEVER run): `liveCapture: false` serves the stable default
-    // URL above instead of spawning a real `grok` inference to capture it.
-    // Grok Build's headless-exec capability + whether a `-p ping`-style probe
-    // rotates its OAuth refresh token are both unverified, so — exactly like
-    // claude_code — we don't risk a live capture. Revisit once the CLI's
-    // headless mode is confirmed and the endpoint is known to drift.
-    argv: (bin) => [bin, "-p", "ping"],
-    env: (base) => ({ XAI_BASE_URL: base }),
+    // Shape-only — NEVER run. Like claude_code, `liveCapture: false`: a live
+    // capture would be a REAL `grok agent` turn that spends SuperGrok quota (and
+    // grok's agent runs over a WS relay, not this HTTP recorder). The chat-proxy
+    // endpoint is the stable CLI default, so we serve it verbatim; the override
+    // env (GROK_CLI_CHAT_PROXY_BASE_URL) is retained for shape only.
+    argv: (bin) => [bin, "agent", "headless", "ping"],
+    env: (base) => ({ GROK_CLI_CHAT_PROXY_BASE_URL: base }),
     liveCapture: false,
   },
 };

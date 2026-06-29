@@ -116,12 +116,13 @@ const UPSTREAM_WIRE: Readonly<Record<string, TUpstreamWire>> = {
   // (URL + headers from the delegate's `credentialForUpstream`, captured from
   // the real `kimi -p ping` request). See `kimi-code.ts`.
   kimi_code: "openai",
-  // xAI Grok ("Grok Build") speaks the OpenAI Responses API (`api.x.ai/v1/
-  // responses`) — identical wire to codex — so we delegate over the chatgpt
-  // (Responses) adapter with the CLI's genuine bearer. ⚠️ RESEARCH-UNVERIFIED:
-  // whether Grok accepts the Codex-flavoured `instructions` preamble that the
-  // shared `toChatGptRequest` injects must be validated live (it may need a
-  // grok-specific request builder if the preamble confuses the model).
+  // xAI Grok ("Grok Build") serves its models via the OpenAI Responses API
+  // (both report `api_backend: "responses"`) at the CLI chat proxy
+  // (`cli-chat-proxy.grok.com/v1/responses`, captured per-hop from the
+  // delegate's auth config) — same wire as codex, so we delegate over the
+  // chatgpt (Responses) adapter with the CLI's genuine bearer. ⚠️ Whether Grok
+  // accepts the Codex-flavoured `instructions` preamble `toChatGptRequest`
+  // injects must be validated live (may need a grok-specific request builder).
   grok: "chatgpt",
 };
 
