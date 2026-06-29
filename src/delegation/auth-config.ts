@@ -435,6 +435,15 @@ export const resolveProviderUrl = async (
   provider: TCliProvider,
   path: string,
 ): Promise<string> => {
+  // Enforce the same-host contract: `path` must be an absolute PATH on the
+  // captured host. An absolute (`https://…`) or protocol-relative (`//host`)
+  // value would let `new URL(path, origin)` OVERRIDE the origin and silently
+  // point off-host — refuse it.
+  if (!path.startsWith("/") || path.startsWith("//")) {
+    throw new Error(
+      `resolveProviderUrl: path must be a same-origin absolute path, got "${path}"`,
+    );
+  }
   const base = await resolveUpstreamUrl(provider, { captureIfMissing: false });
   return new URL(path, new URL(base).origin).toString();
 };

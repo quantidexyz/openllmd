@@ -115,9 +115,11 @@ let provisionBackoffUntil = 0;
  * hardcoded; `base_url` is derived from the captured upstream host. Returns false
  * on any failure (non-200 / no models / parse).
  */
-const provisionModelConfig = async (accessToken: string): Promise<boolean> => {
+const provisionModelConfig = async (
+  accessToken: string,
+  base: string,
+): Promise<boolean> => {
   try {
-    const base = await resolveProviderUrl(PROVIDER, "/coding/v1");
     const resp = await fetch(`${base}/models`, {
       headers: {
         authorization: `Bearer ${accessToken}`,
@@ -173,15 +175,22 @@ const provisionModelConfig = async (accessToken: string): Promise<boolean> => {
 const ensureModelConfig = async (accessToken: string): Promise<void> => {
   if (configEnsured) return;
   if (provisionInFlight !== null) return provisionInFlight;
+  const base = await resolveProviderUrl(PROVIDER, "/coding/v1");
   const existing = await Bun.file(configTomlPath())
     .text()
     .catch(() => "");
-  if (existing.includes(MANAGED_PROVIDER)) {
+  // Configured AND on the CURRENT host. If the captured upstream host migrated,
+  // the stored `base_url` is stale — re-provision instead of returning early, or
+  // `kimi -p` would refresh against the wrong host.
+  if (
+    existing.includes(MANAGED_PROVIDER) &&
+    existing.includes(`base_url = "${base}"`)
+  ) {
     configEnsured = true;
     return;
   }
   if (Date.now() < provisionBackoffUntil) return;
-  provisionInFlight = provisionModelConfig(accessToken)
+  provisionInFlight = provisionModelConfig(accessToken, base)
     .then((ok) => {
       if (ok) configEnsured = true;
       else provisionBackoffUntil = Date.now() + 60_000;

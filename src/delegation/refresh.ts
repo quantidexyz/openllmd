@@ -67,9 +67,17 @@ export const makeRefresher = (opts: {
   let inFlight: Promise<void> | null = null;
   const fire = (): Promise<void> => {
     if (inFlight === null) {
-      inFlight = opts.trigger().finally(() => {
-        inFlight = null;
-      });
+      // SWALLOW a failed trigger (e.g. a spawn error): a refresh is best-effort.
+      // Rejecting would (a) leak an unhandled rejection from the background
+      // `void fire()` path and (b) throw out of the awaited hard-expired path —
+      // both wrong. On failure the store simply isn't refreshed and `readToken`
+      // falls back to the stale token (surfacing the vendor's own 401 → re-login).
+      inFlight = opts
+        .trigger()
+        .catch(() => {})
+        .finally(() => {
+          inFlight = null;
+        });
     }
     return inFlight;
   };

@@ -210,7 +210,13 @@ export const cachedUsage = async (
     // on-demand refresh recovers fast once a transient failure clears — without
     // this, a single failed read (e.g. a momentarily-expired token) stuck the UI
     // on the error for 5 min even after the token refreshed.
-    const backoff = entry.good !== null ? FRESH_TTL_MS : FAILURE_RETRY_MS;
+    // The long back-off applies only while there's a SERVABLE good snapshot to
+    // show meanwhile (within STALE_TTL_MS — what `servable()` actually returns);
+    // once the good has aged out, fall back to the short retry so a failed
+    // refresh recovers sooner instead of sitting on FRESH_TTL.
+    const goodServable =
+      entry.good !== null && now - entry.good.atMs < STALE_TTL_MS;
+    const backoff = goodServable ? FRESH_TTL_MS : FAILURE_RETRY_MS;
     if (now - entry.lastAttemptAtMs < backoff) {
       return servable(entry, now);
     }

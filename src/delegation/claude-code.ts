@@ -286,7 +286,9 @@ const device = makePasteBackDevice({
   slot,
   installed: isInstalled,
   installHint: INSTALL_HINT,
-  connected: async () => (await readToken()) !== null,
+  // Authoritative check: `claude auth status` first, the (fragile, macOS-shape-
+  // sensitive) store read only as fallback — same as `status()`/`connect()`.
+  connected: isConnected,
   connectedDetail: CONNECTED_DETAIL,
   inProgressDetail:
     "Claude sign-in already in progress — finish in your browser, then paste the code.",

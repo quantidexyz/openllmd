@@ -165,12 +165,26 @@ export const finishInBackground = async (opts: {
   readonly alwaysClearPending?: boolean;
 }): Promise<void> => {
   opts.slot.end();
-  const connected = await opts.isConnected();
+  // Both callbacks are BEST-EFFORT: this runs from a `void proc.exited.then(...)`
+  // / `void login.done.then(...)`, so a throw here would be an unhandled
+  // rejection AND could skip `clearPendingAuth`. A failed connection check is
+  // treated as not-connected (so pending still clears); a failed `onConnected`
+  // (e.g. the auth-config refresh) is swallowed.
+  let connected = false;
+  try {
+    connected = await opts.isConnected();
+  } catch {
+    // treat as not-connected — pending clears below, the next status corrects it
+  }
   if (opts.alwaysClearPending === true || !connected) {
     clearPendingAuth(opts.provider);
   }
   if (connected && opts.onConnected !== undefined) {
-    await opts.onConnected();
+    try {
+      await opts.onConnected();
+    } catch {
+      // best-effort — a failed onConnected must not reject the cleanup
+    }
   }
 };
 
@@ -257,7 +271,7 @@ export const spawnStreamLogin = async <T>(
       () => settle(null),
       opts.timeoutMs ?? STREAM_PROMPT_TIMEOUT_MS,
     );
-    void (async () => {
+    void (async (): Promise<void> => {
       const decoder = new TextDecoder();
       try {
         const reader = readable.getReader();

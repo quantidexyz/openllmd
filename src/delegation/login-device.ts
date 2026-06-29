@@ -80,6 +80,13 @@ export const makePasteBackDevice = (
   // The live headless login handle, awaiting the user's pasted code. Single-
   // flight — one in-flight paste-back per provider (the slot also guards it).
   let handle: THeadlessLogin | null = null;
+  // The in-flight code submission, if any. A VALID pasted code exits the CLI —
+  // firing `login.done` (the finalizer) AND resolving `submitLoginCode`, which
+  // grants prompt-free keychain access (`onCodeAccepted`). The finalizer must
+  // wait for that submit so `finishInBackground` runs its connection check +
+  // `onConnected` (the auth-config refresh) AFTER the grant, not racing before
+  // it (where the credential isn't yet readable → a false not-connected).
+  let submitting: Promise<unknown> | null = null;
 
   const connectDeviceCode = (): Promise<TConnectResult> =>
     guard(
@@ -103,8 +110,11 @@ export const makePasteBackDevice = (
         setPendingAuth(cfg.provider, auth);
         // On exit (success, cancel, or expiry) drop the handle + the stale
         // pending URL; on success run onConnected (warn + refresh auth config).
+        // Wait for any in-flight submit FIRST so the keychain grant lands before
+        // the connection check (a valid code triggers both at once).
         void login.done.then(async () => {
           handle = null;
+          if (submitting !== null) await submitting.catch(() => {});
           await finishInBackground({
             provider: cfg.provider,
             slot: cfg.slot,
@@ -124,19 +134,34 @@ export const makePasteBackDevice = (
   const submitLoginCode = async (
     code: string,
   ): Promise<{ readonly ok: boolean; readonly detail?: string }> => {
-    if (handle === null) {
+    const current = handle;
+    if (current === null) {
       return { ok: false, detail: "no Claude sign-in is awaiting a code." };
     }
-    const r = await handle.submitCode(code);
-    if (!r.ok) return { ok: false, detail: r.detail };
-    await cfg.onCodeAccepted?.();
-    if (!(await cfg.verifyAfterSubmit())) {
-      return {
-        ok: false,
-        detail: "code accepted but no credential was stored.",
-      };
+    // Track this submission so the `login.done` finalizer can await it: a valid
+    // code exits the CLI, firing the finalizer concurrently with the keychain
+    // grant + verify below.
+    const work = (async (): Promise<{
+      readonly ok: boolean;
+      readonly detail?: string;
+    }> => {
+      const r = await current.submitCode(code);
+      if (!r.ok) return { ok: false, detail: r.detail };
+      await cfg.onCodeAccepted?.();
+      if (!(await cfg.verifyAfterSubmit())) {
+        return {
+          ok: false,
+          detail: "code accepted but no credential was stored.",
+        };
+      }
+      return { ok: true, detail: await cfg.submitSuccessDetail() };
+    })();
+    submitting = work;
+    try {
+      return await work;
+    } finally {
+      submitting = null;
     }
-    return { ok: true, detail: await cfg.submitSuccessDetail() };
   };
 
   const cancelConnect = makeCancelConnect(cfg.provider, cfg.slot, {

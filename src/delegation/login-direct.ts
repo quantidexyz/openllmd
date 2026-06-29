@@ -209,7 +209,15 @@ const startDeviceCodePoll = (
         if (aborted) return;
         await sleep(delayMs);
         if (aborted) return;
-        const res = await cfg.pollToken(auth.deviceCode);
+        let res: TDevicePoll;
+        try {
+          res = await cfg.pollToken(auth.deviceCode);
+        } catch {
+          // A transient poll failure (network blip / parse error) must NOT end
+          // the whole login — keep polling until success, stop, cancel, or
+          // expiry. The next iteration retries after the same backoff.
+          continue;
+        }
         // Re-check AFTER the awaited poll: a cancel that arrived while the
         // request was in flight must win, or we'd sign in a cancelled login.
         if (aborted) return;
