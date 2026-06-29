@@ -27,21 +27,17 @@ import {
   clearPendingAuth,
   getPendingAuth,
   pendingAuthDetail,
-  setPendingAuth,
 } from "../pending-auth";
 import {
   ensureAuthConfig,
   oauthConfig,
   resolveUpstreamUrl,
 } from "./auth-config";
+import { makeStreamDeviceConnect } from "./login-device";
+import { makeStreamConnect } from "./login-direct";
+import { loginSlot } from "./login-flow";
 import type { TProviderDelegate } from "./types";
-import {
-  cliVersion,
-  openUrl,
-  readJsonFile,
-  runCapture,
-  stripAnsi,
-} from "./util";
+import { cliVersion, readJsonFile, runCapture, stripAnsi } from "./util";
 
 const PROVIDER = "chatgpt" as const;
 const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
@@ -58,17 +54,6 @@ const REFRESH_FETCH_TIMEOUT_MS = 10_000;
 
 const bin = (): string => cliBin(PROVIDER);
 const env = (): Record<string, string> => cliEnv(PROVIDER);
-
-// Keep spawned device-auth processes referenced so they aren't GC'd while
-// they poll in the background (they exit on success / expiry).
-const deviceProcs = new Set<ReturnType<typeof Bun.spawn>>();
-
-// One in-flight codex login at a time (shared by the browser `connect` and the
-// device-code `connectDeviceCode` paths) — each spawns a `codex login` process
-// that binds a localhost callback / polls in the background, so a second
-// concurrent spawn would race for the port + the credential write. Cleared when
-// the spawned process exits (success / expiry / cancel).
-let loginInFlight = false;
 
 /**
  * Strip query strings from any URL in a diagnostic string, so OAuth authorize
@@ -320,8 +305,95 @@ const userAgent = async (): Promise<string> => {
   return `codex_cli_rs/${semver} (${process.platform}; ${process.arch}) openllmd`;
 };
 
+// ─── Login wiring ────────────────────────────────────────────────────────
+//
+// codex's browser `connect` and device-code `connectDeviceCode` share ONE
+// `loginSlot` so only one `codex login` runs at a time (each binds a localhost
+// callback / polls), and `cancelConnect` kills whichever is live.
+
+const INSTALL_HINT = "Install the Codex CLI from the Providers tab first.";
+const CONNECTED_DETAIL = "signed in via Codex";
+const IN_PROGRESS_DETAIL =
+  "Codex sign-in already in progress — finish authorizing in your browser; this updates automatically.";
+
+const isInstalled = async (): Promise<boolean> =>
+  (await cliInstallState(PROVIDER)).installed;
+const isConnected = async (): Promise<boolean> => (await readToken()) !== null;
+// Device-code lands the credential on THIS box; refresh the auth config (a CLI
+// update can rotate the upstream URL / token endpoint / client id), exactly as
+// the browser flow does. Best-effort + non-blocking.
+const refreshConfig = (): void => {
+  void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
+};
+
+const slot = loginSlot(PROVIDER);
+
+// Browser flow: `codex login` prints the authorize URL to STDERR. Its OWN
+// browser-open reaches the user, so we do NOT open a second tab — only surface
+// the URL (so a remote/headless box can click it from the dashboard).
+const connectDirect = makeStreamConnect({
+  provider: PROVIDER,
+  slot,
+  installed: isInstalled,
+  installHint: INSTALL_HINT,
+  connected: isConnected,
+  connectedDetail: CONNECTED_DETAIL,
+  inProgressDetail: IN_PROGRESS_DETAIL,
+  argv: () => [bin(), "login"],
+  env,
+  parse: (buf) => {
+    const url = parseAuthUrl(buf);
+    return url !== null ? { url, code: "" } : null;
+  },
+  onConnected: refreshConfig,
+  onStart: () =>
+    logInfo("chatgpt-connect", "spawning `codex login` (browser flow)"),
+  onParsed: (url) =>
+    logInfo("chatgpt-connect", "parsed authorize URL; surfacing to dashboard", {
+      urlLen: url.length,
+    }),
+  onParseFail: (captured) =>
+    logError("chatgpt-connect", "no authorize URL parsed from codex login", {
+      stderrLen: captured.length,
+      // Redact URL query strings so OAuth params can't land in the local log,
+      // while keeping the sample useful for diagnosing a parse miss.
+      stderrSample: redactUrls(captured.slice(0, 400)),
+    }),
+  pendingDetail: (url) =>
+    `Authorize Codex in the browser window that opened — or open ${url}. This page updates automatically once you're done.`,
+  failDetail:
+    "Couldn't start Codex sign-in. Retry, or run `codex login` on the box.",
+});
+
+// Device-code flow: `codex login --device-auth` prints the verification URL +
+// one-time code to STDOUT; we surface them + open the URL locally.
+const deviceLogin = makeStreamDeviceConnect({
+  provider: PROVIDER,
+  slot,
+  installed: isInstalled,
+  installHint: INSTALL_HINT,
+  connected: isConnected,
+  connectedDetail: CONNECTED_DETAIL,
+  inProgressDetail: IN_PROGRESS_DETAIL,
+  argv: () => [bin(), "login", "--device-auth"],
+  env,
+  parse: parseDevicePrompt,
+  onConnected: refreshConfig,
+  pendingDetail: (found) => pendingAuthDetail(found),
+  failDetail:
+    "Couldn't start Codex device sign-in. Retry, or run `codex login --device-auth` on the box.",
+  cancelMessages: {
+    cancelled: "Codex sign-in cancelled",
+    none: "no sign-in was in progress",
+  },
+});
+
 export const chatgptDelegate: TProviderDelegate = {
   slug: PROVIDER,
+
+  connect: connectDirect,
+  connectDeviceCode: deviceLogin.connectDeviceCode,
+  cancelConnect: deviceLogin.cancelConnect,
 
   status: async () => {
     const { installed, version } = await cliInstallState(PROVIDER);
@@ -346,239 +418,6 @@ export const chatgptDelegate: TProviderDelegate = {
                   : "codex CLI not installed",
           }
         : { last_login_at_ms: null }),
-    };
-  },
-
-  // Device-code login for a REMOTE/headless box: the daemon runs `codex login
-  // --device-auth`, captures the verification URL + one-time code, and
-  // surfaces them (pending-auth → status) so the user authorizes in THEIR
-  // browser. The spawned process keeps polling and writes auth.json on
-  // success; the status watcher flips the card. ⚠️ RESEARCH: device-auth
-  // stdout shape unverified against a live login.
-  connectDeviceCode: async () => {
-    if (!(await cliInstallState(PROVIDER)).installed) {
-      return {
-        connected: false,
-        detail: "Install the Codex CLI from the Providers tab first.",
-      };
-    }
-    if ((await readToken()) !== null) {
-      clearPendingAuth(PROVIDER);
-      return { connected: true, detail: "signed in via Codex" };
-    }
-    if (loginInFlight) {
-      const pending = getPendingAuth(PROVIDER);
-      return {
-        connected: false,
-        pending: true,
-        detail:
-          pending !== null
-            ? pendingAuthDetail(pending)
-            : "Codex sign-in already in progress — finish authorizing in your browser; this updates automatically.",
-      };
-    }
-    const proc = Bun.spawn([bin(), "login", "--device-auth"], {
-      stdin: "ignore",
-      stdout: "pipe",
-      // The process stays alive polling for the whole login; only stdout is
-      // read (for the device prompt). Leaving stderr piped + undrained could
-      // fill its pipe and stall the child, so discard it.
-      stderr: "ignore",
-      env: { ...process.env, ...env() },
-    });
-    // Set only AFTER the spawn succeeds — if Bun.spawn throws, the proc.exited
-    // cleanup below never registers, so an early set would wedge the flag true.
-    loginInFlight = true;
-    deviceProcs.add(proc);
-    void proc.exited.then(async () => {
-      deviceProcs.delete(proc);
-      loginInFlight = false;
-      if ((await readToken()) !== null) {
-        // Device-code lands the credential on THIS box (the user authorized on
-        // another machine, but auth.json is written here) — refresh the auth
-        // config (upstream URL + OAuth refresh config) now, exactly like the
-        // browser `connect` path does. Best-effort + non-blocking.
-        void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
-      } else {
-        // The process stays alive polling until the user authorizes; once it
-        // exits WITHOUT a stored credential the flow expired / was cancelled /
-        // errored — drop the stale code so the card stops showing a dead one.
-        clearPendingAuth(PROVIDER);
-      }
-    });
-
-    // One reader loop: resolves the moment the device prompt appears, then
-    // keeps draining stdout for the process's lifetime so a full pipe can't
-    // block codex's background polling.
-    const found = await new Promise<{ url: string; code: string } | null>(
-      (resolve) => {
-        let settled = false;
-        const settle = (v: { url: string; code: string } | null): void => {
-          if (!settled) {
-            settled = true;
-            resolve(v);
-          }
-        };
-        const timer = setTimeout(() => settle(null), 30_000);
-        void (async () => {
-          const decoder = new TextDecoder();
-          let buf = "";
-          try {
-            const reader = proc.stdout.getReader();
-            for (;;) {
-              const { value, done } = await reader.read();
-              if (done) break;
-              buf += decoder.decode(value, { stream: true });
-              const p = parseDevicePrompt(buf);
-              if (p !== null) settle(p);
-            }
-          } catch {
-            /* ignore — settle(null) in finally */
-          } finally {
-            clearTimeout(timer);
-            settle(null);
-          }
-        })();
-      },
-    );
-
-    if (found === null) {
-      proc.kill();
-      return {
-        connected: false,
-        detail:
-          "Couldn't start Codex device sign-in. Retry, or run `codex login --device-auth` on the box.",
-      };
-    }
-    setPendingAuth(PROVIDER, found);
-    // Open the verification URL locally too (kimi's device flow does the same).
-    // On this machine it brings up the browser; on a remote box it opens
-    // nothing useful but the URL is still surfaced via pending-auth for the
-    // user to open on their own machine. This makes codex open a browser on
-    // BOTH routes, so a mis-detected `thisMachine` can't leave it browser-less.
-    openUrl(found.url);
-    return {
-      connected: false,
-      pending: true,
-      detail: pendingAuthDetail(found),
-    };
-  },
-
-  connect: async () => {
-    if (!(await cliInstallState(PROVIDER)).installed) {
-      return {
-        connected: false,
-        detail: "Install the Codex CLI from the Providers tab first.",
-      };
-    }
-    if ((await readToken()) !== null) {
-      clearPendingAuth(PROVIDER);
-      return { connected: true, detail: "signed in via Codex" };
-    }
-    if (loginInFlight) {
-      const pending = getPendingAuth(PROVIDER);
-      return {
-        connected: false,
-        pending: true,
-        detail:
-          pending !== null
-            ? pendingAuthDetail(pending)
-            : "Codex sign-in already in progress — finish authorizing in your browser; this updates automatically.",
-      };
-    }
-    // `codex login` starts a localhost OAuth callback server and prints the
-    // authorize URL to STDERR. Its OWN webbrowser-open does NOT reach the
-    // user's browser when the daemon spawns it (unlike claude/kimi) — so the
-    // daemon parses the URL, opens it itself, and surfaces it to the dashboard
-    // (pending-auth), exactly like the kimi device-code flow. The process keeps
-    // running the callback server until the browser flow completes + writes
-    // auth.json; the status watcher then flips the card to connected.
-    logInfo("chatgpt-connect", "spawning `codex login` (browser flow)");
-    const proc = Bun.spawn([bin(), "login"], {
-      stdin: "ignore",
-      stdout: "ignore",
-      stderr: "pipe",
-      env: { ...process.env, ...env() },
-    });
-    // Set only AFTER the spawn succeeds — if Bun.spawn throws, the proc.exited
-    // cleanup below never registers, so an early set would wedge the flag true.
-    loginInFlight = true;
-    deviceProcs.add(proc);
-    void proc.exited.then(async () => {
-      deviceProcs.delete(proc);
-      loginInFlight = false;
-      if ((await readToken()) !== null) {
-        // Refresh the auth config now that the identity is established (a CLI
-        // update can rotate the upstream URL, token endpoint, or client id).
-        // Best-effort + non-blocking.
-        void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
-      } else {
-        // Exited without a credential (expired / cancelled / errored) — drop
-        // the stale pending URL so the card stops showing a dead link.
-        clearPendingAuth(PROVIDER);
-      }
-    });
-
-    // Drain stderr: resolve the moment the authorize URL appears, then keep
-    // reading for the process's lifetime so a full pipe can't stall codex.
-    let lastBuf = "";
-    const url = await new Promise<string | null>((resolve) => {
-      let settled = false;
-      const settle = (v: string | null): void => {
-        if (!settled) {
-          settled = true;
-          resolve(v);
-        }
-      };
-      const timer = setTimeout(() => settle(null), 30_000);
-      void (async () => {
-        const decoder = new TextDecoder();
-        let buf = "";
-        try {
-          const reader = proc.stderr.getReader();
-          for (;;) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            buf += decoder.decode(value, { stream: true });
-            lastBuf = buf;
-            const u = parseAuthUrl(buf);
-            if (u !== null) settle(u);
-          }
-        } catch {
-          /* ignore — settle(null) in finally */
-        } finally {
-          clearTimeout(timer);
-          settle(null);
-        }
-      })();
-    });
-
-    if (url === null) {
-      proc.kill();
-      logError("chatgpt-connect", "no authorize URL parsed from codex login", {
-        stderrLen: lastBuf.length,
-        // Redact URL query strings so any OAuth params can't land in the local
-        // log, while keeping the sample useful for diagnosing a parse miss.
-        stderrSample: redactUrls(lastBuf.slice(0, 400)),
-      });
-      return {
-        connected: false,
-        detail:
-          "Couldn't start Codex sign-in. Retry, or run `codex login` on the box.",
-      };
-    }
-    // `codex login` already opens the browser itself in a user session, so we do
-    // NOT open it again here — doing so popped a SECOND tab. We only surface the
-    // URL via pending_auth so a remote/headless box (where codex's open can't
-    // reach the user) still lets them click it from the dashboard.
-    logInfo("chatgpt-connect", "parsed authorize URL; surfacing to dashboard", {
-      urlLen: url.length,
-    });
-    setPendingAuth(PROVIDER, { url, code: "" });
-    return {
-      connected: false,
-      pending: true,
-      detail: `Authorize Codex in the browser window that opened — or open ${url}. This page updates automatically once you're done.`,
     };
   },
 
@@ -675,28 +514,6 @@ export const chatgptDelegate: TProviderDelegate = {
     const headers: Record<string, string> =
       token.accountId !== null ? { "chatgpt-account-id": token.accountId } : {};
     return { access_token: token.accessToken, headers, url };
-  },
-
-  cancelConnect: async () => {
-    // Abort an in-flight `codex login`: kill the spawned process(es) — each
-    // one's `proc.exited` handler flips `loginInFlight` off and (finding no
-    // credential) clears the pending code. Drop the code here too so status
-    // reflects the cancel on the very next push, without waiting on the exit.
-    let killed = 0;
-    for (const proc of deviceProcs) {
-      try {
-        proc.kill();
-        killed += 1;
-      } catch {
-        /* already exited — its handler ran */
-      }
-    }
-    clearPendingAuth(PROVIDER);
-    return {
-      ok: true,
-      detail:
-        killed > 0 ? "Codex sign-in cancelled" : "no sign-in was in progress",
-    };
   },
 
   logout: async () => {

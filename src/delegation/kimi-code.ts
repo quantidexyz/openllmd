@@ -41,11 +41,13 @@ import {
   clearPendingAuth,
   getPendingAuth,
   pendingAuthDetail,
-  setPendingAuth,
 } from "../pending-auth";
 import { ensureAuthConfig, resolveUpstreamUrl } from "./auth-config";
+import type { TDeviceAuth, TDevicePoll } from "./login-direct";
+import { makeDeviceCodeConnect } from "./login-direct";
+import { loginSlot, makeCancelConnect } from "./login-flow";
 import type { TProviderDelegate } from "./types";
-import { cliVersion, openUrl, readJsonFile } from "./util";
+import { cliVersion, readJsonFile } from "./util";
 
 const PROVIDER = "kimi_code" as const;
 const USAGE_URL = "https://api.kimi.com/coding/v1/usages";
@@ -224,14 +226,10 @@ const identityHeaders = async (): Promise<Record<string, string>> =>
   headersFor(await kimiVersion(), await ensureDeviceId());
 
 // ─── Device-code login flow ──────────────────────────────────────────────
-
-type TDeviceAuth = {
-  readonly userCode: string;
-  readonly deviceCode: string;
-  readonly verificationUriComplete: string;
-  readonly intervalMs: number;
-  readonly expiresInMs: number;
-};
+//
+// kimi DRIVES the device-code flow; the direct-login adaptor ORCHESTRATES it
+// (surface URL+code → background poll). The request (`TDeviceAuth`) + poll
+// (`TDevicePoll`) shapes are the adaptor's generic contract, imported above.
 
 const postForm = async (
   path: string,
@@ -259,7 +257,7 @@ const postForm = async (
   return { status: resp.status, data };
 };
 
-const requestDeviceAuth = async (
+const requestDeviceCode = async (
   headers: Record<string, string>,
 ): Promise<TDeviceAuth | null> => {
   try {
@@ -295,15 +293,10 @@ const requestDeviceAuth = async (
   }
 };
 
-type TPoll =
-  | { readonly kind: "success"; readonly wire: Record<string, unknown> }
-  | { readonly kind: "pending"; readonly slowDown: boolean }
-  | { readonly kind: "stop" };
-
-const pollToken = async (
+const pollDeviceToken = async (
   deviceCode: string,
   headers: Record<string, string>,
-): Promise<TPoll> => {
+): Promise<TDevicePoll> => {
   const { status, data } = await postForm(
     "/api/oauth/token",
     {
@@ -345,68 +338,6 @@ const writeCredential = (wire: Record<string, unknown>): void => {
     encoding: "utf-8",
     mode: 0o600,
   });
-};
-
-// One in-flight login per process. The background poll writes the
-// credential on success; the status watcher (~5s) then flips the card to
-// connected — so we don't import the SSE broadcaster here (avoids a
-// delegation→events cycle).
-let loginInFlight = false;
-// Set by `cancelConnect` to abort the background poll mid-flight. Checked each
-// iteration; reset when a fresh login starts so a prior cancel can't kill it.
-let loginAborted = false;
-const sleep = (ms: number): Promise<void> =>
-  new Promise((r) => setTimeout(r, ms));
-
-/** Abort an in-flight Kimi device-code poll. The loop exits on its next tick;
- *  the in-memory code is dropped now so status reflects the cancel at once. */
-const cancelBackgroundLogin = (): void => {
-  if (loginInFlight) loginAborted = true;
-  clearPendingAuth(PROVIDER);
-};
-
-const startBackgroundLogin = (
-  auth: TDeviceAuth,
-  headers: Record<string, string>,
-): void => {
-  if (loginInFlight) return;
-  loginInFlight = true;
-  loginAborted = false;
-  void (async () => {
-    const deadline = Date.now() + auth.expiresInMs;
-    let delayMs = auth.intervalMs;
-    try {
-      while (Date.now() < deadline) {
-        if (loginAborted) return;
-        await sleep(delayMs);
-        if (loginAborted) return;
-        const res = await pollToken(auth.deviceCode, headers);
-        // Re-check AFTER the (awaited) poll: a cancel that arrived while the
-        // request was in flight must win, or we'd write a credential — signing
-        // the user in — for a login they just cancelled.
-        if (loginAborted) return;
-        if (res.kind === "success") {
-          writeCredential(res.wire);
-          // Refresh the auth config (upstream URL) now that the identity is
-          // established. Best-effort + non-blocking.
-          void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
-          return;
-        }
-        if (res.kind === "stop") return;
-        if (res.slowDown) delayMs += 5_000;
-      }
-    } catch {
-      // swallow — the user can retry Connect
-    } finally {
-      loginInFlight = false;
-      // Always drop the in-memory device code when the flow ends. On SUCCESS the
-      // credential is now on disk, so `status()` reports Connected from the token
-      // regardless of pending-auth; on expiry / denial / error / deadline this
-      // stops the card from showing a DEAD code forever (and the dashboard from
-      // fast-polling it indefinitely). Mirrors codex's `proc.exited` cleanup.
-      clearPendingAuth(PROVIDER);
-    }
-  })();
 };
 
 // ─── /usages parsing ─────────────────────────────────────────────────────
@@ -515,8 +446,52 @@ const parseUsageWindows = (payload: unknown): ReadonlyArray<TUsageRow> => {
   return rows;
 };
 
+// ─── Login wiring ────────────────────────────────────────────────────────
+//
+// kimi's only sign-in is the device-code flow, driven via the direct-login
+// adaptor; `cancelConnect` aborts the background poll through the shared slot.
+
+const slot = loginSlot(PROVIDER);
+// Identity headers (UA + device id) computed ONCE per login (single-flight
+// guarantees no overlap) and reused by the device-code request + every poll,
+// matching the pre-refactor flow which captured `headers` once in `connect`.
+let loginHeaders: Record<string, string> = {};
+
+const connectDevice = makeDeviceCodeConnect({
+  provider: PROVIDER,
+  slot,
+  installed: async () => (await cliInstallState(PROVIDER)).installed,
+  installHint: "Install the Kimi CLI from the Providers tab first.",
+  connected: async () => (await readToken()) !== null,
+  connectedDetail: "signed in via Kimi Code",
+  inProgressDetail:
+    "Kimi sign-in already in progress — finish authorizing in your browser; this updates automatically.",
+  requestDeviceAuth: async () => {
+    loginHeaders = await identityHeaders();
+    return requestDeviceCode(loginHeaders);
+  },
+  pollToken: (deviceCode) => pollDeviceToken(deviceCode, loginHeaders),
+  onCredential: (wire) => writeCredential(wire),
+  // Refresh the auth config (upstream URL) now the identity is established.
+  onConnected: () => {
+    void ensureAuthConfig(PROVIDER, { force: true }).catch(() => {});
+  },
+  pendingDetail: (auth) =>
+    `Authorize Kimi in the browser window that just opened (code ${auth.userCode}). This page updates automatically when you're done — or open ${auth.verificationUriComplete}`,
+  startFailDetail:
+    "Couldn't start Kimi sign-in (device authorization failed). Check your connection and retry.",
+});
+
+const cancelConnect = makeCancelConnect(PROVIDER, slot, {
+  cancelled: "Kimi sign-in cancelled",
+  none: "no sign-in was in progress",
+});
+
 export const kimiCodeDelegate: TProviderDelegate = {
   slug: PROVIDER,
+
+  connect: connectDevice,
+  cancelConnect,
 
   status: async () => {
     const { installed, version } = await cliInstallState(PROVIDER);
@@ -541,65 +516,6 @@ export const kimiCodeDelegate: TProviderDelegate = {
                   : "kimi CLI not installed",
           }
         : { last_login_at_ms: null }),
-    };
-  },
-
-  connect: async () => {
-    if (!(await cliInstallState(PROVIDER)).installed) {
-      return {
-        connected: false,
-        detail: "Install the Kimi CLI from the Providers tab first.",
-      };
-    }
-    if ((await readToken()) !== null) {
-      return { connected: true, detail: "signed in via Kimi Code" };
-    }
-    if (loginInFlight) {
-      return {
-        connected: false,
-        detail:
-          "Kimi sign-in already in progress — finish authorizing in your browser; this updates automatically.",
-      };
-    }
-    // Drive Kimi's own device-code OAuth flow (the flow the CLI's in-TUI
-    // `/login` runs). Request a device code, open the pre-filled
-    // verification URL in the browser, and poll in the background; on
-    // success the credential file lands and the status watcher flips the
-    // card to connected (~5s) — no terminal, no TUI.
-    const headers = await identityHeaders();
-    const auth = await requestDeviceAuth(headers);
-    if (auth === null) {
-      return {
-        connected: false,
-        detail:
-          "Couldn't start Kimi sign-in (device authorization failed). Check your connection and retry.",
-      };
-    }
-    // Surface the URL + code to the dashboard (the daemon may be on a
-    // different machine than the user's browser — for a remote box `openUrl`
-    // opens nothing useful, but the dashboard shows these so the user
-    // authorizes from THEIR machine). Cleared when the credential lands.
-    setPendingAuth(PROVIDER, {
-      url: auth.verificationUriComplete,
-      code: auth.userCode,
-    });
-    openUrl(auth.verificationUriComplete);
-    startBackgroundLogin(auth, headers);
-    return {
-      connected: false,
-      pending: true,
-      detail: `Authorize Kimi in the browser window that just opened (code ${auth.userCode}). This page updates automatically when you're done — or open ${auth.verificationUriComplete}`,
-    };
-  },
-
-  cancelConnect: async () => {
-    const wasInFlight = loginInFlight;
-    cancelBackgroundLogin();
-    return {
-      ok: true,
-      detail: wasInFlight
-        ? "Kimi sign-in cancelled"
-        : "no sign-in was in progress",
     };
   },
 
