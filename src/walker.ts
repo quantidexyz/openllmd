@@ -120,11 +120,18 @@ const UPSTREAM_WIRE: Readonly<Record<string, TUpstreamWire>> = {
   // (both report `api_backend: "responses"`) at the CLI chat proxy
   // (`cli-chat-proxy.grok.com/v1/responses`, captured per-hop from the
   // delegate's auth config) — same wire as codex, so we delegate over the
-  // chatgpt (Responses) adapter with the CLI's genuine bearer. ⚠️ Whether Grok
-  // accepts the Codex-flavoured `instructions` preamble `toChatGptRequest`
-  // injects must be validated live (may need a grok-specific request builder).
+  // chatgpt (Responses) adapter with the CLI's genuine bearer. It does NOT get
+  // the Codex preamble (see `wantsCodexPreamble`).
   grok: "chatgpt",
 };
+
+// The Codex system preamble ("You are Codex…") is a Codex IDENTITY the ChatGPT
+// backend requires — but WRONG for other providers that merely share the
+// Responses wire. Inject it ONLY for the real `chatgpt` provider, so xAI Grok
+// (and any future Responses-wire subscription provider) is never told it's
+// Codex. The encode reads this via `toChatGptRequest`'s `codexInstructions`.
+const wantsCodexPreamble = (provider: string): boolean =>
+  provider === "chatgpt";
 
 // The chatgpt Responses API emits freeform JSON events (no strict schema);
 // discrimination happens inside `chatGptEventToChunk`. Mirrors the core
@@ -499,6 +506,7 @@ const serveWithWebSearch = async (
       canonical,
       hop.providerModelId,
       false,
+      wantsCodexPreamble(hop.provider),
     );
     let resp: Response;
     try {
@@ -679,6 +687,7 @@ const serveSubscription = async (
     baseHeaders,
     inboundBeta: inboundBetaOf(args),
     isOAuth: wire === "anthropic",
+    codexInstructions: wantsCodexPreamble(hop.provider),
   });
   let resp: Response;
   try {
