@@ -35,9 +35,9 @@ const INSTALL_SCRIPT: Readonly<Record<TCliProvider, string>> = {
   claude_code: "https://claude.ai/install.sh",
   chatgpt: "https://chatgpt.com/codex/install.sh",
   kimi_code: "https://code.kimi.com/kimi-code/install.sh",
-  // ⚠️ RESEARCH-UNVERIFIED: the official Grok Build (`x.ai/cli`) curl
-  // installer URL. Confirm the canonical script URL (or switch to the npm
-  // install path) before shipping — x.ai/cli is Cloudflare-walled.
+  // The official Grok Build curl installer. Verified live (2026-06-30): the URL
+  // serves the real install script over HTTP 200 — it is NOT Cloudflare-walled,
+  // and grok ships no npm package, so curl is the only install path.
   grok: "https://x.ai/cli/install.sh",
 };
 

@@ -138,6 +138,12 @@ export const daemonWorkingSet = (): TWorkingSet => {
     join(home, ".claude"),
     join(home, ".codex"),
     join(home, ".kimi-code"),
+    // grok (x.ai/cli): the installer writes ~/.grok/{downloads,bin}; pre-create
+    // both so the SCOPED grants below land on real leaves (NOT bare ~/.grok —
+    // `existing()` won't widen to $HOME). The user's real ~/.grok/auth.json
+    // stays out of the working set.
+    join(home, ".grok", "downloads"),
+    join(home, ".grok", "bin"),
     join(home, ".local", "bin"),
     join(home, ".local", "share", "claude"),
     // claude's XDG dirs — its native installer/runtime use the full XDG layout
@@ -178,6 +184,16 @@ export const daemonWorkingSet = (): TWorkingSet => {
     join(home, ".codex"),
     //   kimi-code (non-isolated setup): ~/.kimi-code.
     join(home, ".kimi-code"),
+    //   grok (x.ai/cli): ONLY the install + exec dirs, NOT the whole ~/.grok.
+    //   The installer writes the binary to ~/.grok/downloads and links
+    //   ~/.grok/bin/grok → it (the launcher `hostCliCandidates` finds), and the
+    //   isolated grok CLI is a symlink that EXECUTES through both — so both must
+    //   be read-write/exec-granted. Unlike codex/kimi above, grok has NO
+    //   in-place setup script, and the daemon's grok delegate reads creds from
+    //   its ISOLATED home (`cliConfigDir`), so the user's real ~/.grok/auth.json
+    //   is deliberately left UNgranted (the file's tight-grant security note).
+    join(home, ".grok", "bin"),
+    join(home, ".grok", "downloads"),
     //   the user-level bin dir: the `openllmd` PATH symlink AND where the
     //   non-isolated `claude`/`codex` installers drop their launcher + where the
     //   setup fast path copies an adopted CLI binary.
