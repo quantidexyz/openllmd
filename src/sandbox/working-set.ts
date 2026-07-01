@@ -144,6 +144,12 @@ export const daemonWorkingSet = (): TWorkingSet => {
     // stays out of the working set.
     join(home, ".grok", "downloads"),
     join(home, ".grok", "bin"),
+    // raycast (non-isolated setup): the setup writes ~/.config/raycast/ai/
+    // providers.yaml (+ its .openllm-bak backup). Pre-create the `ai` leaf so
+    // the SCOPED grant below lands on a real path (NOT bare ~/.config —
+    // `existing()` won't widen to it, and ~/.config holds gcloud/gh secrets the
+    // deny-default must keep out).
+    join(home, ".config", "raycast", "ai"),
     join(home, ".local", "bin"),
     join(home, ".local", "share", "claude"),
     // claude's XDG dirs — its native installer/runtime use the full XDG layout
@@ -184,6 +190,13 @@ export const daemonWorkingSet = (): TWorkingSet => {
     join(home, ".codex"),
     //   kimi-code (non-isolated setup): ~/.kimi-code.
     join(home, ".kimi-code"),
+    //   raycast (non-isolated setup): ONLY ~/.config/raycast/ai — the sole dir
+    //   the setup writes (providers.yaml + its .openllm-bak). NOT the whole
+    //   ~/.config (which holds gcloud/gh tokens the deny-default keeps out), nor
+    //   even all of ~/.config/raycast (the user's extensions/state) — scoped to
+    //   the `ai` leaf so the config write is granted and every other secret
+    //   stays denied.
+    join(home, ".config", "raycast", "ai"),
     //   grok (x.ai/cli): ONLY the install + exec dirs, NOT the whole ~/.grok.
     //   The installer writes the binary to ~/.grok/downloads and links
     //   ~/.grok/bin/grok → it (the launcher `hostCliCandidates` finds), and the
