@@ -19,7 +19,7 @@ import { sandboxState } from "./sandbox/landlock";
 import { cachedUsage, peekUsage } from "./usage-cache";
 import { DAEMON_VERSION } from "./version";
 
-export const computeStatus = async (): Promise<TDaemonStatus> => {
+const computeStatusFresh = async (): Promise<TDaemonStatus> => {
   const connections = await Promise.all(
     Object.values(DELEGATES).map(async (d) => {
       try {
@@ -71,6 +71,17 @@ export const computeStatus = async (): Promise<TDaemonStatus> => {
     // too heavy to run on every status push.
     integrations: getInstalledIntegrations(),
   };
+};
+
+let inFlightStatus: Promise<TDaemonStatus> | null = null;
+
+export const computeStatus = async (): Promise<TDaemonStatus> => {
+  if (inFlightStatus === null) {
+    inFlightStatus = computeStatusFresh().finally(() => {
+      inFlightStatus = null;
+    });
+  }
+  return inFlightStatus;
 };
 
 /**

@@ -184,7 +184,8 @@ export type TStreamDeviceConfig = {
   readonly inProgressDetail: string;
   readonly argv: () => ReadonlyArray<string>;
   readonly env: () => Record<string, string>;
-  /** Parse the device prompt off stdout → `{ url, code }`. */
+  /** Which fd carries the device prompt. Codex uses stdout; Grok uses stderr. */
+  readonly stream?: "stdout" | "stderr";
   readonly parse: (buf: string) => { url: string; code: string } | null;
   readonly onConnected?: () => void | Promise<void>;
   readonly pendingDetail: (found: { url: string; code: string }) => string;
@@ -226,7 +227,7 @@ export const makeStreamDeviceConnect = (
           slot: cfg.slot,
           argv: cfg.argv(),
           env: cfg.env(),
-          stream: "stdout",
+          stream: cfg.stream ?? "stdout",
           parse: cfg.parse,
           isConnected: cfg.connected,
           onConnected: cfg.onConnected,

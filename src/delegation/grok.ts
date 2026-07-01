@@ -252,7 +252,8 @@ const connectDirect = makeStreamConnect({
 });
 
 // Device-code flow: `grok login --device-auth` prints the verification URL +
-// one-time code to stdout; we surface them + open the URL locally.
+// one-time code to stderr (verified against x.ai/cli v0.2.77); we surface them
+// + open the URL locally.
 const deviceLogin = makeStreamDeviceConnect({
   provider: PROVIDER,
   slot,
@@ -263,6 +264,7 @@ const deviceLogin = makeStreamDeviceConnect({
   inProgressDetail: IN_PROGRESS_DETAIL,
   argv: () => [bin(), "login", "--device-auth"],
   env,
+  stream: "stderr",
   parse: parseDevicePrompt,
   onConnected: refreshConfig,
   pendingDetail: (found) => pendingAuthDetail(found),
