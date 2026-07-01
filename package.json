@@ -1,6 +1,6 @@
 {
   "name": "@quantidexyz/openllmd",
-  "version": "0.0.0-dev",
+  "version": "1.4.24",
   "private": false,
   "type": "module",
   "exports": {
@@ -16,8 +16,7 @@
     "verify": "bun scripts/verify.ts"
   },
   "dependencies": {
-    "@quantidexyz/openllmp": "workspace:*",
-    "@quantidexyz/openllmw": "workspace:*",
+    "@quantidexyz/openllmw": "github:quantidexyz/openllmw#v1.4.24",
     "effect": ">=3.20.0",
     "partysocket": "^1.1.19"
   },
