@@ -108,6 +108,11 @@ export const ensureHostCli = async (
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
+    // Run in the daemon-owned temp dir, never the daemon's inherited cwd `/`:
+    // a vendor installer launched at `/` walks the filesystem root (tripping
+    // macOS's TCC network-volume prompt on `/Volumes/*`). The dir is granted
+    // read-write by the sandbox working set.
+    cwd: daemonTempDir(),
     env: { ...process.env, TMPDIR: daemonTempDir() },
   });
   // Bound the installer so a stalled download/install can't wedge the

@@ -26,6 +26,32 @@ const spawnEnv = (
   env === undefined ? undefined : { ...process.env, ...env };
 
 /**
+ * The working directory for a spawned isolated CLI. SECURITY: the daemon runs
+ * with cwd `/` (launchd/systemd start it with no `WorkingDirectory`), and a
+ * child inherits it. A vendor CLI launched at `/` enumerates project context
+ * from the filesystem ROOT — statting `/Volumes/*`, which on macOS trips the
+ * TCC "wants to access files on a network volume" consent prompt (attributed to
+ * the daemon as the responsible parent) and needlessly walks the whole disk.
+ *
+ * So pin the cwd to the child's OWN isolated home (`env.HOME`, e.g.
+ * `~/.openllm/cli/claude_code/home` for claude) — which `cliEnv` always sets and
+ * the sandbox working set grants read-write — so the CLI's project scan is
+ * confined to its empty isolated home, NEVER `/`. Falls back to the daemon-owned
+ * temp dir (always created + granted) when no isolated HOME is present or the
+ * home dir doesn't yet exist (a not-yet-created cwd would make `Bun.spawn`
+ * `ENOENT`). Never returns `/`.
+ */
+export const spawnCwd = (env: Record<string, string> | undefined): string => {
+  const home = env?.HOME;
+  // Reject `/` explicitly: it "exists", so an env with `HOME=/` (or a daemon
+  // whose HOME wasn't isolated) would otherwise pass the existsSync check and
+  // re-introduce the exact root-cwd bug this helper exists to prevent.
+  if (home !== undefined && home.length > 0 && home !== "/" && existsSync(home))
+    return home;
+  return daemonTempDir();
+};
+
+/**
  * Surface a child that was KILLED BY A SIGNAL (`signalCode` set) — the silent
  * failure mode behind "the flow doesn't trigger, no errors". The OS sandbox
  * SIGKILLs/SIGABRTs a child that hits a denied operation, and a plain exit-code
@@ -67,6 +93,7 @@ export const runCapture = async (
       stdin: "ignore",
       stdout: "pipe",
       stderr: "ignore",
+      cwd: spawnCwd(env),
       ...(spawnEnv(env) !== undefined ? { env: spawnEnv(env) } : {}),
     });
     const out = await new Response(proc.stdout).text();
@@ -140,6 +167,7 @@ export const spawnLogin = async (
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
+    cwd: spawnCwd(env),
     ...(spawnEnv(env) !== undefined ? { env: spawnEnv(env) } : {}),
   });
   const dec = new TextDecoder();
@@ -302,6 +330,7 @@ export const spawnHeadlessLogin = async (
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
+    cwd: spawnCwd(env),
     env: childEnv,
   });
 
@@ -513,6 +542,7 @@ export const spawnLoginPty = async (
     stdin: "ignore",
     stdout: "ignore",
     stderr: "ignore",
+    cwd: spawnCwd(env),
     ...(spawnEnv(env) !== undefined ? { env: spawnEnv(env) } : {}),
   });
 
@@ -572,6 +602,7 @@ export const openUrl = (url: string): void => {
       stdin: "ignore",
       stdout: "ignore",
       stderr: "ignore",
+      cwd: spawnCwd(undefined),
     });
   } catch {
     // best-effort — the user can copy the URL from the card detail
@@ -619,6 +650,7 @@ const runSecurity = async (
       stdin: "ignore",
       stdout: "ignore",
       stderr: "ignore",
+      cwd: spawnCwd({ HOME: home }),
       env: { ...process.env, HOME: home },
     });
     const code = await proc.exited;
@@ -786,7 +818,12 @@ const findKeychainServices = async (
   try {
     const proc = Bun.spawn(
       ["security", "dump-keychain", loginKeychainPath(home)],
-      { stdout: "pipe", stderr: "ignore", env: { ...process.env, HOME: home } },
+      {
+        stdout: "pipe",
+        stderr: "ignore",
+        cwd: spawnCwd({ HOME: home }),
+        env: { ...process.env, HOME: home },
+      },
     );
     const out = await new Response(proc.stdout).text();
     await proc.exited;
@@ -817,7 +854,12 @@ const readKeychainSecret = async (
         "-w",
         loginKeychainPath(home),
       ],
-      { stdout: "pipe", stderr: "ignore", env: { ...process.env, HOME: home } },
+      {
+        stdout: "pipe",
+        stderr: "ignore",
+        cwd: spawnCwd({ HOME: home }),
+        env: { ...process.env, HOME: home },
+      },
     );
     const out = await new Response(proc.stdout).text();
     if ((await proc.exited) !== 0) return null;

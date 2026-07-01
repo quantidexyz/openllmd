@@ -24,6 +24,7 @@ import {
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
+import { spawnCwd } from "./util";
 
 /** The shared return shape of `connect()` / `connectDeviceCode()`. */
 export type TConnectResult = {
@@ -235,6 +236,7 @@ export const spawnStreamLogin = async <T>(
       // The unread fd is discarded (not piped) so an undrained pipe can't stall
       // the child — only the prompt-carrying fd is read.
       stderr: opts.stream === "stderr" ? "pipe" : "ignore",
+      cwd: spawnCwd(opts.env),
       env: { ...process.env, ...opts.env },
     });
   } catch {

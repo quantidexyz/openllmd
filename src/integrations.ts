@@ -23,6 +23,7 @@ import type { TDaemonIntegrationKind } from "@quantidexyz/openllmp";
 import { daemonEnv } from "./env";
 import { logDebug, logError, logInfo } from "./logger";
 import { DEFAULT_BIN_DIRS } from "./path-utils";
+import { daemonTempDir } from "./sandbox/working-set";
 
 /** Aliased to the closed `DaemonIntegrationKind` control-schema enum so the
  *  executor's vocabulary can't drift from the wire's. */
@@ -161,6 +162,11 @@ export const runIntegration = async (
   const proc = Bun.spawn(["bash", "-s"], {
     stdin: new TextEncoder().encode(script),
     env,
+    // Run in the daemon-owned temp dir, never the daemon's inherited cwd `/`:
+    // a script launched at `/` that globs/walks relative paths would scan the
+    // filesystem root (tripping macOS's TCC network-volume prompt on
+    // `/Volumes/*`). The dir is granted read-write by the sandbox working set.
+    cwd: daemonTempDir(),
     stdout: "pipe",
     stderr: "pipe",
     timeout: SCRIPT_TIMEOUT_MS,
