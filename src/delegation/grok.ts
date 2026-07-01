@@ -24,11 +24,17 @@
  *   - Logout: `grok logout`.
  *   - Refresh: the CLI refreshes its own token on any authenticated run; the
  *     daemon TRIGGERS that (a bounded `grok models`) when near `expires_at`.
- *   - Usage: NOT available to the daemon. xAI FORBIDS the CLI's OAuth token
- *     from the usage API — `grok.com/rest/rate-limits` returns
- *     `oauth2-auth-forbidden`, and cli-chat-proxy exposes no usage/rate-limit
- *     endpoint or headers (all probed live). `usage()` reports unavailable and
- *     points the user to grok.com.
+ *   - Usage: available at `cli-chat-proxy.grok.com/v1/billing` (the CLI chat
+ *     proxy's OWN billing route — SAME host as inference — which the CLI's
+ *     `billing.rs` reads for "View credit usage"). Bearer-authed with the CLI
+ *     OAuth token (401 on a bad/absent token; the extra `x-grok-client-*`
+ *     headers aren't required but are sent for parity). Returns
+ *     `{ config: { monthlyLimit:{val}, used:{val}, billingPeriodStart/End, … } }`
+ *     — we surface the included-quota window as one bar (see
+ *     {@link parseGrokBilling}). Verified live against a SuperGrok / X Premium+
+ *     session. (An earlier probe wrongly concluded usage was forbidden — it hit
+ *     `grok.com/rest/rate-limits`, a DIFFERENT grpc gateway that 404/501s these
+ *     routes regardless of token; that was a wrong host, not a tier limit.)
  *
  * ⚠️ STILL UNVALIDATED LIVE: the `grok login --device-auth` prompt shape
  * ({@link parseDevicePrompt}); that `grok models` actually rotates+persists the
@@ -47,7 +53,11 @@ import {
   getPendingAuth,
   pendingAuthDetail,
 } from "../pending-auth";
-import { ensureAuthConfig, resolveUpstreamUrl } from "./auth-config";
+import {
+  ensureAuthConfig,
+  resolveProviderUrl,
+  resolveUpstreamUrl,
+} from "./auth-config";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
 import { loginSlot } from "./login-flow";
@@ -56,6 +66,13 @@ import type { TProviderDelegate } from "./types";
 import { cliVersion, readJsonFile, runCapture, stripAnsi } from "./util";
 
 const PROVIDER = "grok" as const;
+
+// Usage endpoint LEAF path — the host is derived from the captured inference
+// endpoint (`resolveProviderUrl`), so a vendor host migration is auto-tracked.
+// This is the CLI chat-proxy's own billing route (same host as inference), which
+// the CLI's `billing.rs` reads to render "View credit usage" — verified live
+// against a SuperGrok / X Premium+ session (see the header block above).
+const USAGE_PATH = "/v1/billing";
 
 // Trigger the CLI's OWN refresh when the access token is within this window of
 // `expires_at`. Mirrors codex's leeway.
@@ -276,6 +293,67 @@ const deviceLogin = makeStreamDeviceConnect({
   },
 });
 
+// ─── /v1/billing parsing ───────────────────────────────────────────────────
+//
+// The CLI chat-proxy's billing route returns a `config` object whose numeric
+// fields are `{ val: number }` wrappers (verified live + cross-checked against
+// the CLI binary's own `billing.rs` struct):
+//   { config: { monthlyLimit:{val}, used:{val}, onDemandCap:{val},
+//               billingPeriodStart, billingPeriodEnd, history:[…] } }
+// We surface the INCLUDED-quota window (`used` / `monthlyLimit`) as one bar; the
+// period end is the reset. `?format=credits` returns a different (weekly
+// on-demand/prepaid) view we don't use.
+
+type TGrokBillingVal = { readonly val?: number };
+type TGrokBillingConfig = {
+  readonly monthlyLimit?: TGrokBillingVal;
+  readonly used?: TGrokBillingVal;
+  readonly billingPeriodEnd?: string;
+};
+type TGrokBilling = { readonly config?: TGrokBillingConfig };
+
+/** Map a `/v1/billing` body into a usage snapshot. Pure (no network) so it can
+ *  be unit-tested. Returns `unavailable` when there is no included-quota window
+ *  (a plan that only reports on-demand credit), so the UI points to grok.com. */
+export const parseGrokBilling = (body: unknown): TProviderUsageSnapshot => {
+  const config =
+    body !== null && typeof body === "object" && "config" in body
+      ? ((body as TGrokBilling).config ?? {})
+      : {};
+  const limit =
+    typeof config.monthlyLimit?.val === "number" ? config.monthlyLimit.val : 0;
+  if (limit <= 0) {
+    return {
+      kind: "unavailable",
+      reason: "Grok reported no included-quota window for this plan.",
+      link: "https://grok.com",
+    };
+  }
+  const used = typeof config.used?.val === "number" ? config.used.val : 0;
+  const percentUsed = Math.max(0, Math.min(100, (used / limit) * 100));
+  const resetMs =
+    typeof config.billingPeriodEnd === "string"
+      ? Date.parse(config.billingPeriodEnd)
+      : Number.NaN;
+  return {
+    kind: "quota",
+    status:
+      percentUsed >= 100
+        ? "rejected"
+        : percentUsed >= 80
+          ? "allowed_warning"
+          : "allowed",
+    windows: [
+      {
+        label: "Monthly",
+        percent_used: percentUsed,
+        reset_at_ms: Number.isNaN(resetMs) ? null : resetMs,
+      },
+    ],
+    note: "Grok — read locally via Grok CLI",
+  };
+};
+
 export const grokDelegate: TProviderDelegate = {
   slug: PROVIDER,
 
@@ -314,16 +392,36 @@ export const grokDelegate: TProviderDelegate = {
     if (token === null) {
       return { kind: "unavailable", reason: "not signed in to Grok" };
     }
-    // xAI FORBIDS usage queries from the CLI's OAuth token: grok.com's
-    // rate-limits endpoint returns `oauth2-auth-forbidden`, and the CLI chat
-    // proxy exposes no usage endpoint or rate-limit headers (probed live). So
-    // there is nothing the daemon can read — point the user to grok.com.
-    return {
-      kind: "unavailable",
-      reason:
-        "Grok does not expose a usage API for the CLI (xAI blocks it: oauth2-auth-forbidden).",
-      link: "https://grok.com",
-    };
+    try {
+      // Same host as inference (`resolveProviderUrl` derives it from the captured
+      // upstream, never spawning the CLI). The plain OAuth bearer is accepted;
+      // we send the CLI's genuine identity headers too, mirroring
+      // `credentialForUpstream`.
+      const resp = await fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${token.accessToken}`,
+          "x-grok-client-version": await clientVersion(),
+          "x-grok-client-identifier": "xai-grok-cli",
+          accept: "application/json",
+        },
+      });
+      if (!resp.ok) {
+        const reason =
+          resp.status === 401
+            ? "Grok authorization was rejected — re-sign in via `grok login`."
+            : resp.status === 403
+              ? "No active SuperGrok / X Premium+ subscription on this account."
+              : `Grok couldn't report usage (HTTP ${resp.status}).`;
+        return { kind: "unavailable", reason, link: "https://grok.com" };
+      }
+      return parseGrokBilling(await resp.json());
+    } catch (err) {
+      return {
+        kind: "unavailable",
+        reason: err instanceof Error ? err.message : "usage fetch failed",
+      };
+    }
   },
 
   credentialForUpstream: async () => {

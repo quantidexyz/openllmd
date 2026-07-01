@@ -587,6 +587,10 @@ export const spawnLoginPty = async (
  * URL from the card.
  */
 export const openUrl = (url: string): void => {
+  // Never launch a real browser under the test runner (`bun test` sets
+  // NODE_ENV=test) — a device/browser login test that reaches this line would
+  // otherwise pop a tab on the developer's machine. Production is unaffected.
+  if (process.env.NODE_ENV === "test") return;
   const os = platform();
   // Windows: `start` is a cmd builtin, so it must run via `cmd /c`; the empty
   // "" is the (required) window-title arg, and the URL is quoted so `cmd.exe`
