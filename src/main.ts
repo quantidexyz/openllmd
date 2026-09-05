@@ -70,7 +70,7 @@ import {
 import { buildHealth } from "./health";
 import { handleInference } from "./listener";
 import { logError, logInfo } from "./logger";
-import { maybeReportModels } from "./model-report";
+import { observeLoginModelReports } from "./model-report";
 import { ptySessionsEnabled } from "./pty-sessions-pref";
 import { probeSandboxCapability } from "./sandbox/exec";
 import { recordSandboxState, sandboxState } from "./sandbox/landlock";
@@ -192,6 +192,7 @@ const main = async (): Promise<void> => {
   // the post-restart usage read is rate-limited (rather than showing an error
   // with nothing to fall back to). See `usage-cache.ts`.
   enableUsagePersistence(stateDir());
+  observeLoginModelReports();
 
   // Pull the catalog + routing config. This NEVER throws — when there's
   // no API key yet (the daemon installs keyless; the dashboard sets the
@@ -211,9 +212,6 @@ const main = async (): Promise<void> => {
       void refreshCliState()
         .then(() => pushStatusIfChanged())
         .catch((err) => logError("main", err));
-      // First model-list report — connected delegates' live lists reach
-      // the cloud's model cache at boot instead of on the first 5-min tick.
-      void maybeReportModels().catch((err) => logError("main", err));
     }
   };
   const scheduleBootstrap = (): void => {
@@ -245,13 +243,6 @@ const main = async (): Promise<void> => {
         void maybeUpdateCli(latestCliVersion()).catch((err) =>
           logError("main", err),
         );
-        // Report connected delegates' live model lists to the cloud's
-        // model cache (throttled internally to the cache TTL, so this
-        // 5-min tick costs at most one vendor list call per provider
-        // per hour). Cloud-gated: keyless/unreachable ticks are skipped.
-        if (getCloudState() === "ok") {
-          void maybeReportModels().catch((err) => logError("main", err));
-        }
       } catch (err) {
         // setTimeout doesn't observe the async callback's promise, so an
         // unguarded throw here is an unhandled rejection AND skips the reschedule

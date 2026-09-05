@@ -178,8 +178,9 @@ const loadStore = (): Promise<TStoreRead<TGrokStore>> =>
   readJsonStore<TGrokStore>(authPath());
 
 /** The newest session entry carrying a usable access token, or null. */
-const newestSession = async (): Promise<TGrokSession | null> => {
-  const store = storeReadValue(await loadStore());
+const newestSessionFromStore = (
+  store: TGrokStore | null,
+): TGrokSession | null => {
   if (store === null) return null;
   const sessions = Object.values(store).filter(
     (s): s is TGrokSession & { readonly key: string } =>
@@ -192,6 +193,9 @@ const newestSession = async (): Promise<TGrokSession | null> => {
   );
   return sessions[0] ?? null;
 };
+
+const newestSession = async (): Promise<TGrokSession | null> =>
+  newestSessionFromStore(storeReadValue(await loadStore()));
 
 const parseExpiryMs = (iso: string | undefined): number | null => {
   if (iso === undefined) return null;
@@ -683,9 +687,12 @@ export const grokDelegate: TProviderDelegate = {
   connectDeviceCode: deviceLogin.connectDeviceCode,
   cancelConnect: deviceLogin.cancelConnect,
 
+  // Passive observation from ONE typed `auth.json` snapshot. Do not call
+  // `readToken()` here — that native-refreshes via `grok models`.
   status: async () => {
     const { installed, version } = await cliInstallState(PROVIDER);
-    if (installed && (await loadStore()).kind === "indeterminate") {
+    const store = installed ? await loadStore() : null;
+    if (store?.kind === "indeterminate") {
       return {
         provider: PROVIDER,
         status: "disconnected",
@@ -695,13 +702,17 @@ export const grokDelegate: TProviderDelegate = {
         detail: STATUS_CHECK_FAILED_DETAIL,
       };
     }
-    const token = installed ? await readToken() : null;
-    if (token !== null) clearPendingAuth(PROVIDER);
-    const pending = token === null ? getPendingAuth(PROVIDER) : null;
+    const session = newestSessionFromStore(
+      store?.kind === "present" ? store.value : null,
+    );
+    const accessToken =
+      session?.key !== undefined && session.key.length > 0 ? session.key : null;
+    if (accessToken !== null) clearPendingAuth(PROVIDER);
+    const pending = accessToken === null ? getPendingAuth(PROVIDER) : null;
     return {
       provider: PROVIDER,
-      status: token !== null ? "connected" : "disconnected",
-      ...(token !== null
+      status: accessToken !== null ? "connected" : "disconnected",
+      ...(accessToken !== null
         ? connectedObservation()
         : pending !== null
           ? {}
@@ -722,7 +733,7 @@ export const grokDelegate: TProviderDelegate = {
             },
           }
         : {}),
-      ...(token === null
+      ...(accessToken === null
         ? {
             detail:
               pending !== null
@@ -734,9 +745,8 @@ export const grokDelegate: TProviderDelegate = {
         : {
             last_login_at_ms: null,
             // Stable xAI account identity, hashed (`account-id.ts`) — the
-            // `user_id` (= `principal_id`) of the session `readToken`
-            // resolved, reused so the store isn't read twice.
-            ...accountHashField(PROVIDER, token.session.user_id),
+            // `user_id` (= `principal_id`) of the stored session snapshot.
+            ...accountHashField(PROVIDER, session?.user_id),
           }),
     };
   },

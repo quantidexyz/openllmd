@@ -479,8 +479,14 @@ const runSecurity = async (
 // After the capped delay, exactly one keyed owner may re-probe; success
 // clears the entry immediately. There is no permanent unusable latch.
 const inFlightKeychains = new Map<string, Promise<TStoreRead<void>>>();
+const inFlightObserveKeychains = new Map<string, Promise<TStoreRead<void>>>();
 const TRANSIENT_RETRY_CAP_MS = 60_000;
 const transientTimeouts = new Map<
+  string,
+  { readonly count: number; readonly nextAtMs: number }
+>();
+/** Passive observe backoff — must not suppress active ensure/login/inference. */
+const observeTransientTimeouts = new Map<
   string,
   { readonly count: number; readonly nextAtMs: number }
 >();
@@ -769,6 +775,55 @@ const keychainMetadata = (kc: string): TKeychainMetadata => {
   }
 };
 
+/**
+ * Cheap identity for idle observation reuse. Includes replacement identity
+ * (`ino`) plus mtime/size. `skipEligible` is the existing unlock-skip seam —
+ * true only after we unlocked this chain, auto-lock is off, and metadata still
+ * matches. Never treat this as proof the chain is unlocked if skip is false.
+ */
+export type TKeychainStoreIdentity = {
+  readonly path: string;
+  readonly present: boolean;
+  readonly mtimeMs: number | null;
+  readonly size: number | null;
+  readonly ino: number | null;
+  readonly skipEligible: boolean;
+};
+
+export const keychainStoreIdentity = (home: string): TKeychainStoreIdentity => {
+  const path = loginKeychainPath(home);
+  if (!MAC) {
+    return {
+      path,
+      present: false,
+      mtimeMs: null,
+      size: null,
+      ino: null,
+      skipEligible: true,
+    };
+  }
+  try {
+    const st = statSync(path);
+    return {
+      path,
+      present: true,
+      mtimeMs: st.mtimeMs,
+      size: st.size,
+      ino: Number(st.ino),
+      skipEligible: skipEligible(path),
+    };
+  } catch {
+    return {
+      path,
+      present: false,
+      mtimeMs: null,
+      size: null,
+      ino: null,
+      skipEligible: false,
+    };
+  }
+};
+
 const brokenKeychainCount = async (kc: string): Promise<number> => {
   try {
     const prefix = `${basename(kc)}.broken-`;
@@ -966,6 +1021,20 @@ const noteTransientFailure = (kc: string, cause: string): TStoreRead<void> => {
   return { kind: "indeterminate", cause };
 };
 
+const noteObserveTransientFailure = (
+  kc: string,
+  cause: string,
+): TStoreRead<void> => {
+  const prev = observeTransientTimeouts.get(kc);
+  const count = (prev?.count ?? 0) + 1;
+  const delayMs = Math.min(TRANSIENT_RETRY_CAP_MS, 2_500 * 2 ** (count - 1));
+  observeTransientTimeouts.set(kc, {
+    count,
+    nextAtMs: Date.now() + delayMs,
+  });
+  return { kind: "indeterminate", cause };
+};
+
 const ensureKeychainNow = async (
   home: string,
   kc: string,
@@ -1075,13 +1144,81 @@ export const ensureKeychainReady = async (
   return awaitSharedStoreRead(op, signal, "keychain_wait_aborted");
 };
 
+/**
+ * Passive idle readiness: unlock an EXISTING isolated keychain or report
+ * unknown. Never create, recreate, rename-aside, or grant ACLs. Classified
+ * empty-password drift is indeterminate — repair stays on login / inference /
+ * `readToken` via {@link ensureKeychainReady}.
+ */
+const observeKeychainNow = async (
+  home: string,
+  kc: string,
+  signal?: AbortSignal,
+): Promise<TStoreRead<void>> => {
+  if (!existsSync(kc)) {
+    return { kind: "indeterminate", cause: "keychain_absent" };
+  }
+  const res = await spawnSecurity(["unlock-keychain", "-p", "", kc], home, {
+    stdout: "ignore",
+    stderr: "pipe",
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  if (res.code === 0) {
+    observeTransientTimeouts.delete(kc);
+    return noteUnlockSuccess(kc);
+  }
+  noteKeychainIoResult(kc, res);
+  if (res.aborted) {
+    return { kind: "indeterminate", cause: "keychain_unlock_transient" };
+  }
+  invalidateUnlockSkip(kc);
+  return noteObserveTransientFailure(kc, "keychain_unlock_transient");
+};
+
+export const observeKeychainReady = async (
+  home: string,
+  signal?: AbortSignal,
+): Promise<TStoreRead<void>> => {
+  if (!MAC) return READY;
+  const kc = loginKeychainPath(home);
+  const backoff = observeTransientTimeouts.get(kc);
+  if (backoff !== undefined && backoff.nextAtMs > Date.now()) {
+    return { kind: "indeterminate", cause: "keychain_unlock_transient" };
+  }
+  let op = inFlightObserveKeychains.get(kc);
+  if (op === undefined) {
+    if (signal?.aborted === true) {
+      return { kind: "indeterminate", cause: "keychain_wait_aborted" };
+    }
+    if (skipEligible(kc)) {
+      keychainCounters.skipped++;
+      return READY;
+    }
+    op = (async (): Promise<TStoreRead<void>> => {
+      if (await tryPromoteUnlockSkip(home, kc)) {
+        keychainCounters.skipped++;
+        return READY;
+      }
+      return observeKeychainNow(home, kc);
+    })().finally(() => {
+      if (inFlightObserveKeychains.get(kc) === op) {
+        inFlightObserveKeychains.delete(kc);
+      }
+    });
+    inFlightObserveKeychains.set(kc, op);
+  }
+  return awaitSharedStoreRead(op, signal, "keychain_wait_aborted");
+};
+
 /** Test-only: process-global keychain caches leak across suites. */
 export const resetKeychainStateForTests = (): void => {
   inFlightKeychains.clear();
+  inFlightObserveKeychains.clear();
   healedKeychains.clear();
   initialExistingKeychainUnlocks.clear();
   lastKeychainFailureLogMs.clear();
   transientTimeouts.clear();
+  observeTransientTimeouts.clear();
   unlockSkip.clear();
   pendingUnlockSkip.clear();
   autoLockOffByKc.clear();
@@ -1236,8 +1373,11 @@ const readKeychainSecret = async (
 const readIsolatedKeychainNow = async (
   home: string,
   servicePrefix: string,
+  observeOnly: boolean,
 ): Promise<TStoreRead<TKeychainPayloads>> => {
-  const ready = await ensureKeychainReady(home);
+  const ready = observeOnly
+    ? await observeKeychainReady(home)
+    : await ensureKeychainReady(home);
   if (ready.kind !== "present") return ready;
   const services = await findKeychainServices(home, servicePrefix);
   if (services.kind !== "present") return services;
@@ -1267,19 +1407,22 @@ export const readIsolatedKeychain = async (
   servicePrefix: string,
   validate?: (payload: string) => boolean,
   signal?: AbortSignal,
+  observeOnly = false,
 ): Promise<TStoreRead<string>> => {
   if (!MAC) return { kind: "absent" };
-  const key = `${loginKeychainPath(home)}\0${servicePrefix}`;
+  const key = `${loginKeychainPath(home)}\0${servicePrefix}\0${observeOnly ? "observe" : "mutate"}`;
   let op = inFlightKeychainReads.get(key);
   if (op === undefined) {
     if (signal?.aborted === true) {
       return { kind: "indeterminate", cause: "keychain_read_aborted" };
     }
-    op = readIsolatedKeychainNow(home, servicePrefix).finally(() => {
-      if (inFlightKeychainReads.get(key) === op) {
-        inFlightKeychainReads.delete(key);
-      }
-    });
+    op = readIsolatedKeychainNow(home, servicePrefix, observeOnly).finally(
+      () => {
+        if (inFlightKeychainReads.get(key) === op) {
+          inFlightKeychainReads.delete(key);
+        }
+      },
+    );
     inFlightKeychainReads.set(key, op);
   }
 

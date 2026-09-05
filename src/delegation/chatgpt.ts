@@ -360,9 +360,12 @@ export const chatgptDelegate: TProviderDelegate = {
   connectDeviceCode: deviceLogin.connectDeviceCode,
   cancelConnect: deviceLogin.cancelConnect,
 
+  // Passive observation from ONE typed `auth.json` snapshot. Do not call
+  // `readToken()` here — that native-refreshes via `codex doctor`.
   status: async () => {
     const { installed, version } = await cliInstallState(PROVIDER);
-    if (installed && (await loadStore()).kind === "indeterminate") {
+    const store = installed ? await loadStore() : null;
+    if (store?.kind === "indeterminate") {
       return {
         provider: PROVIDER,
         status: "disconnected",
@@ -372,15 +375,20 @@ export const chatgptDelegate: TProviderDelegate = {
         detail: STATUS_CHECK_FAILED_DETAIL,
       };
     }
-    const token = installed ? await readToken() : null;
-    if (token !== null) clearPendingAuth(PROVIDER);
+    const tokens = store?.kind === "present" ? store.value.tokens : undefined;
+    const accessToken =
+      tokens?.access_token !== undefined && tokens.access_token.length > 0
+        ? tokens.access_token
+        : null;
+    const accountId = tokens?.account_id ?? null;
+    if (accessToken !== null) clearPendingAuth(PROVIDER);
     const connectedDetail =
-      token !== null ? chatgptRefreshDetail(token.accessToken) : null;
-    const pending = token === null ? getPendingAuth(PROVIDER) : null;
+      accessToken !== null ? chatgptRefreshDetail(accessToken) : null;
+    const pending = accessToken === null ? getPendingAuth(PROVIDER) : null;
     return {
       provider: PROVIDER,
-      status: token !== null ? "connected" : "disconnected",
-      ...(token !== null
+      status: accessToken !== null ? "connected" : "disconnected",
+      ...(accessToken !== null
         ? connectedObservation()
         : pending !== null
           ? {}
@@ -401,7 +409,7 @@ export const chatgptDelegate: TProviderDelegate = {
             },
           }
         : {}),
-      ...(token === null
+      ...(accessToken === null
         ? {
             detail:
               pending !== null
@@ -416,8 +424,8 @@ export const chatgptDelegate: TProviderDelegate = {
             // Stable ChatGPT account identity, hashed (`account-id.ts`) —
             // `tokens.account_id` in auth.json (the same uuid as the
             // id_token's `chatgpt_account_id` claim; survives refresh).
-            ...(token.accountId !== null
-              ? { account_hash: accountHash(PROVIDER, token.accountId) }
+            ...(accountId !== null
+              ? { account_hash: accountHash(PROVIDER, accountId) }
               : {}),
           }),
     };

@@ -75,9 +75,10 @@ export const runCommandInner = async (
         if (r.connected) {
           clearProviderSignedOut(cmd.payload.slug);
           invalidateUsage(cmd.payload.slug);
-          resetModelReportThrottle(cmd.payload.slug);
-          void maybeReportModels().catch(() => {});
         }
+        // Model catalog: `auth.login.succeeded` (observeLoginModelReports),
+        // not this ack — pending logins land later; r.connected can race a
+        // stale unknown probe. Duplicate immediate report is avoided there.
         // A connect that neither landed a credential NOR opened a pending flow
         // is a FAILURE (e.g. cursor's `cursor-agent login` printed no auth URL
         // on a remote box). Ack `error` — mirroring `connect_device_code` — so

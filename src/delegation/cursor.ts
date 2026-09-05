@@ -31,6 +31,12 @@ import { jwtExpiryMs, jwtSubject } from "./jwt";
 import { makeStreamConnect } from "./login-direct";
 import { makeCancelConnect } from "./login-flow";
 import {
+  createPassiveObservationCache,
+  fileStoreIdentity,
+  fingerprintStoreIdentity,
+  rememberIfFingerprintStable,
+} from "./observation-cache";
+import {
   credentialUnrefreshable,
   isStaleRefresh,
   keychainRefreshSpawnAllowed,
@@ -46,6 +52,7 @@ import {
   ensureIsolatedKeychain,
   ensureKeychainReady,
   grantKeychainToolAccess,
+  keychainStoreIdentity,
   readIsolatedKeychain,
   readJsonStore,
   runCapture,
@@ -182,8 +189,15 @@ export const parseCursorUsage = (
 const readMacKeychainSecret = (
   service: string,
   signal?: AbortSignal,
+  observeOnly = false,
 ): Promise<TStoreRead<string>> =>
-  readIsolatedKeychain(cliHome(PROVIDER), service, undefined, signal);
+  readIsolatedKeychain(
+    cliHome(PROVIDER),
+    service,
+    undefined,
+    signal,
+    observeOnly,
+  );
 
 type TCursorFileStore = {
   readonly access_token?: string;
@@ -254,28 +268,19 @@ const readStatusAccessToken = async (
   signal?: AbortSignal,
 ): Promise<TStoreRead<string>> => {
   if (platform() === "darwin") {
-    return readMacKeychainSecret("cursor-access-token", signal);
+    return readMacKeychainSecret("cursor-access-token", signal, true);
   }
   const stored = await readFileTokens();
   if (stored.kind !== "present") return stored;
   return { kind: "present", value: stored.value.accessToken };
 };
 
-/** Modest TTL for NONSECRET status presence — not credentials. Mirrors
- *  Claude `AUTH_STATUS_TTL_MS` / `CLI_INSTALL_STATE_TTL_MS` (30s). The 15s
- *  watcher otherwise re-reads the access-token item every tick. */
-const STATUS_ACCESS_TTL_MS = 30_000;
-
 type TStatusAccessObservation =
   | { readonly kind: "absent" }
   | { readonly kind: "present"; readonly accountHint: string | undefined };
 
-let statusAccessCache: {
-  readonly observation: TStatusAccessObservation;
-  readonly expiresAt: number;
-} | null = null;
-
-let statusAccessGeneration = 0;
+const cursorStatusCache =
+  createPassiveObservationCache<TStatusAccessObservation>();
 
 let statusAccessInFlight: {
   readonly generation: number;
@@ -285,8 +290,27 @@ let statusAccessInFlight: {
 /** Drop cached Cursor status presence. Login/logout/native refresh/auth
  *  mutations call this so the next status tick re-reads the store. */
 export const clearCursorStatusObservationCache = (): void => {
-  statusAccessCache = null;
-  statusAccessGeneration++;
+  cursorStatusCache.invalidate();
+};
+
+const cursorPassiveReuseAllowed = (): {
+  readonly fingerprint: string;
+  readonly reuse: boolean;
+} => {
+  if (platform() !== "darwin") {
+    const identity = fileStoreIdentity(
+      join(cliConfigDir(PROVIDER), "auth.json"),
+    );
+    return {
+      fingerprint: fingerprintStoreIdentity(identity),
+      reuse: true,
+    };
+  }
+  const id = keychainStoreIdentity(cliHome(PROVIDER));
+  return {
+    fingerprint: fingerprintStoreIdentity(id),
+    reuse: id.skipEligible || !id.present,
+  };
 };
 
 const awaitStatusAccessRead = async (
@@ -322,20 +346,34 @@ const observationFromAccessRead = (
   };
 };
 
+const mappedObservation = (
+  observation: TStatusAccessObservation,
+): TStoreRead<{ readonly accountHint: string | undefined }> =>
+  observation.kind === "present"
+    ? {
+        kind: "present",
+        value: { accountHint: observation.accountHint },
+      }
+    : { kind: "absent" };
+
 const readCachedStatusAccess = async (
   signal?: AbortSignal,
 ): Promise<TStoreRead<{ readonly accountHint: string | undefined }>> => {
-  const cached = statusAccessCache;
-  if (cached !== null && cached.expiresAt > Date.now()) {
-    return cached.observation.kind === "present"
-      ? {
-          kind: "present",
-          value: { accountHint: cached.observation.accountHint },
-        }
-      : { kind: "absent" };
+  const { fingerprint, reuse } = cursorPassiveReuseAllowed();
+  const startFingerprint = fingerprint;
+  const generation = cursorStatusCache.generation();
+  if (reuse) {
+    const cached = cursorStatusCache.get(fingerprint);
+    if (cached !== undefined) return mappedObservation(cached);
+    if (
+      platform() === "darwin" &&
+      !keychainStoreIdentity(cliHome(PROVIDER)).present
+    ) {
+      cursorStatusCache.set(fingerprint, { kind: "absent" }, generation);
+      return { kind: "absent" };
+    }
   }
 
-  const generation = statusAccessGeneration;
   let flight = statusAccessInFlight;
   if (flight === null || flight.generation !== generation) {
     if (signal?.aborted === true) {
@@ -357,7 +395,7 @@ const readCachedStatusAccess = async (
   // Logout/refresh bumped generation while this producer was in flight —
   // do not hand a stale determinate presence to the waiter. Last-known
   // overlay treats unknown as probe failure until the next tick re-reads.
-  if (generation !== statusAccessGeneration) {
+  if (generation !== cursorStatusCache.generation()) {
     return {
       kind: "indeterminate",
       cause: "status_observation_invalidated",
@@ -365,13 +403,21 @@ const readCachedStatusAccess = async (
   }
   const mapped = observationFromAccessRead(read);
   if (mapped.kind === "indeterminate") return mapped;
-  statusAccessCache = {
-    observation:
-      mapped.kind === "present"
-        ? { kind: "present", accountHint: mapped.value.accountHint }
-        : { kind: "absent" },
-    expiresAt: Date.now() + STATUS_ACCESS_TTL_MS,
-  };
+  const observation: TStatusAccessObservation =
+    mapped.kind === "present"
+      ? { kind: "present", accountHint: mapped.value.accountHint }
+      : { kind: "absent" };
+  rememberIfFingerprintStable(
+    cursorStatusCache,
+    startFingerprint,
+    fingerprintStoreIdentity(
+      platform() === "darwin"
+        ? keychainStoreIdentity(cliHome(PROVIDER))
+        : fileStoreIdentity(join(cliConfigDir(PROVIDER), "auth.json")),
+    ),
+    observation,
+    generation,
+  );
   return mapped;
 };
 

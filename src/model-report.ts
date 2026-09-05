@@ -2,34 +2,40 @@
  * Daemon writer for the cloud's per-user model cache
  * (live-provider-model-catalog proposal §4).
  *
- * On each tick, ask every CONNECTED delegate that implements
- * `listModels()` for the vendor's live model list and POST the batch to
- * `POST /api/daemon/models`. The cloud upserts one `(user_id, provider)`
- * row per entry with `source: 'daemon'` — provider-granular, so two
- * daemons with disjoint provider setups merge instead of clobbering
- * (each only reports providers it can see).
+ * Demand-driven: live vendor `listModels()` runs only on
+ * `auth.login.succeeded` (scoped to that provider) or a `refresh_models`
+ * command. Idle bootstrap ticks must not acquire catalogs or refresh
+ * tokens. Previously reported daemon rows stay until a later successful
+ * report replaces them — skipping an idle pass never POSTs an empty list
+ * and never wipes the cache.
  *
- * Cadence: piggybacks on the bootstrap tick in `main.ts`, throttled here
- * to the cloud's cache TTL — a fresh row makes re-reporting pointless,
- * so re-reporting on the same period keeps the row perpetually fresh
- * with the minimum number of vendor calls. Per-provider throttle: one
- * delegate's failure (returns null) doesn't block another's cadence.
- * A vendor CLI version change bypasses the TTL because some providers
- * gate model visibility by client version (Codex does this today).
- * Metadata only — model ids + optional display/context data; failures
- * are silently dropped (the cloud falls back to the static catalog).
+ * Per-provider throttle: one delegate's failure (returns null) doesn't
+ * block another's cadence. A vendor CLI version change bypasses the TTL
+ * because some providers gate model visibility by client version (Codex
+ * does this today). Unscoped refresh joins the bounded snapshot producer
+ * (`computeStatus`) — never a raw background `delegate.status()`. A
+ * scoped login report uses the login-succeeded barrier and last-known
+ * CLI version; it must not join an in-flight unknown/pending status
+ * probe that would skip the list.
  */
-import type { TDaemonModelReportEntry } from "@openllmsh/protocol";
+import type {
+  TAuthEvent,
+  TDaemonModelReportEntry,
+  TDaemonProviderConnection,
+} from "@openllmsh/protocol";
+import { normalizeProviderConnection } from "@openllmsh/protocol";
+import { addAuthObserver } from "./auth-events";
 import { reportModels } from "./cloud-client";
-import { DELEGATES } from "./delegation";
+import type { TProviderDelegate } from "./delegation";
+import { DELEGATES, getDelegate } from "./delegation";
+import { computeStatus, peekLastKnownConnection } from "./status";
 
-/** Mirrors the cloud's `MODEL_CACHE_TTL_MS` (30m, enforced on read). */
+/** Local demand throttle — cloud read TTL is independent (stale-while-revalidate). */
 const REPORT_TTL_MS = 30 * 60 * 1000;
 /**
  * A null/empty fetch (signed out, vendor error) retries on THIS slower
- * cadence instead of every 5-min bootstrap tick — a persistently failing
- * provider must not burn a vendor call per tick forever. Reset per slug
- * on a successful connect so a fresh login reports immediately.
+ * cadence. Reset per slug on a successful login so a fresh credential
+ * reports immediately.
  */
 const FAILURE_RETRY_MS = 15 * 60 * 1000;
 
@@ -37,6 +43,12 @@ type TAttempt = {
   readonly at: number;
   readonly ok: boolean;
   readonly cliVersion?: string;
+};
+
+type TDueModelReport = {
+  readonly slug: string;
+  readonly delegate: TProviderDelegate;
+  readonly cliVersion: string | undefined;
 };
 
 /** The result of collecting and attempting one due model-list report. */
@@ -70,33 +82,59 @@ const isDue = (
   return now - prev.at >= (prev.ok ? REPORT_TTL_MS : FAILURE_RETRY_MS);
 };
 
+const dueFromConnections = (
+  now: number,
+  connections: ReadonlyArray<TDaemonProviderConnection>,
+  slugFilter: string | undefined,
+): ReadonlyArray<TDueModelReport> => {
+  const byProvider = new Map(
+    connections.map((conn) => [conn.provider, conn] as const),
+  );
+  const due: TDueModelReport[] = [];
+  for (const [slug, delegate] of Object.entries(DELEGATES)) {
+    if (delegate.listModels === undefined) continue;
+    if (slugFilter !== undefined && slug !== slugFilter) continue;
+    const conn = byProvider.get(slug);
+    if (conn === undefined || !normalizeProviderConnection(conn).serviceable) {
+      continue;
+    }
+    const cliVersion = conn.cli_version;
+    if (!isDue(slug, now, cliVersion)) continue;
+    due.push({ slug, delegate, cliVersion });
+  }
+  return due;
+};
+
+const dueForSucceededLogin = (
+  now: number,
+  slug: string,
+): ReadonlyArray<TDueModelReport> => {
+  const delegate = getDelegate(slug);
+  if (delegate === null || delegate.listModels === undefined) return [];
+  const cliVersion = peekLastKnownConnection(slug)?.cli_version;
+  if (!isDue(slug, now, cliVersion)) return [];
+  return [{ slug, delegate, cliVersion }];
+};
+
 /**
  * Collect + report due model lists without throwing. The returned outcome lets
- * explicit callers surface a cloud-report failure, while background callers
- * simply ignore it and remain best-effort.
+ * explicit callers surface a cloud-report failure. Idle / skipped reports are
+ * `attempted: false` without `failed` — they must not look like a failed
+ * request. Pass `slug` after `auth.login.succeeded` so the other four
+ * delegates are not probed or listed.
  */
 export const maybeReportModels = async (
   now: number = Date.now(),
+  slug?: string,
 ): Promise<TMaybeModelReportResult> => {
-  const candidates = await Promise.all(
-    Object.entries(DELEGATES)
-      .filter(([, delegate]) => delegate.listModels !== undefined)
-      .map(async ([slug, delegate]) => {
-        const conn = await delegate.status().catch(() => null);
-        const cliVersion = conn?.cli_version;
-        return isDue(slug, now, cliVersion)
-          ? { slug, delegate, cliVersion }
-          : null;
-      }),
-  );
-  const due = candidates.filter((c) => c !== null);
+  const due =
+    slug === undefined
+      ? dueFromConnections(now, (await computeStatus()).connections, undefined)
+      : dueForSucceededLogin(now, slug);
 
-  // Fetch concurrently — each delegate's call is individually bounded
-  // (`fetchModelList`), but sequential awaits would still let one slow
-  // vendor delay every other provider's report.
   const results = await Promise.all(
-    due.map(async ({ slug, delegate, cliVersion }) => ({
-      slug,
+    due.map(async ({ slug: dueSlug, delegate, cliVersion }) => ({
+      slug: dueSlug,
       cliVersion,
       models: await (delegate.listModels?.().catch(() => null) ??
         Promise.resolve(null)),
@@ -104,28 +142,20 @@ export const maybeReportModels = async (
   );
   const entries: TDaemonModelReportEntry[] = [];
   const failedProviders: string[] = [];
-  for (const { slug, cliVersion, models } of results) {
-    // EVERY attempt stamps — a failed/empty fetch backs off on
-    // FAILURE_RETRY_MS rather than re-firing each bootstrap tick.
+  for (const { slug: dueSlug, cliVersion, models } of results) {
     const ok = models !== null && models.length > 0;
-    // Stamp on FETCH, not successful report — if the report POST fails
-    // the next TTL tick retries (the cloud row just goes stale → catalog
-    // fallback, not corruption).
-    lastAttempt.set(slug, {
+    lastAttempt.set(dueSlug, {
       at: now,
       ok,
       ...(cliVersion ? { cliVersion } : {}),
     });
     if (models === null) {
-      failedProviders.push(slug);
+      failedProviders.push(dueSlug);
       continue;
     }
-    // `cli_version` rides along so the cloud can refuse a write from a
-    // device whose CLI is OLDER than the one that produced the current
-    // row (version-gated model lists must not shrink cross-device).
     if (models.length > 0) {
       entries.push({
-        provider: slug,
+        provider: dueSlug,
         models,
         ...(cliVersion ? { cli_version: cliVersion } : {}),
       });
@@ -156,7 +186,6 @@ export const maybeReportModels = async (
 
   return {
     attempted: true,
-    // Cloud rejected / could not accept the POST — nothing was reported.
     reported: 0,
     failed: true,
     error:
@@ -164,4 +193,24 @@ export const maybeReportModels = async (
         ? result.error
         : `${listingError}; ${result.error}`,
   };
+};
+
+let loginObserverInstalled = false;
+
+const onAuthEvent = (event: TAuthEvent): void => {
+  if (event.event !== "auth.login.succeeded") return;
+  resetModelReportThrottle(event.slug);
+  void maybeReportModels(Date.now(), event.slug).catch(() => {});
+};
+
+/**
+ * Subscribe once to `auth.login.succeeded` so pending device-code / paste-back
+ * logins report models when the credential actually lands — not when the
+ * connect command acked `pending`, and not on failed/cancelled terminals.
+ * Idempotent. Tests that must not fan out to real vendors should not call this.
+ */
+export const observeLoginModelReports = (): void => {
+  if (loginObserverInstalled) return;
+  loginObserverInstalled = true;
+  addAuthObserver(onAuthEvent);
 };

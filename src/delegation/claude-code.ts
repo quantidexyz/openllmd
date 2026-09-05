@@ -54,6 +54,12 @@ import { fetchModelList } from "./fetch-model-list";
 import { makePasteBackDevice } from "./login-device";
 import { makeBlockingConnect } from "./login-direct";
 import {
+  createPassiveObservationCache,
+  fileStoreIdentity,
+  fingerprintStoreIdentity,
+  rememberIfFingerprintStable,
+} from "./observation-cache";
+import {
   credentialUnrefreshable,
   isStaleRefresh,
   keychainRefreshSpawnAllowed,
@@ -70,6 +76,8 @@ import {
   ensureIsolatedKeychain,
   ensureKeychainReady,
   grantKeychainToolAccess,
+  keychainStoreIdentity,
+  observeKeychainReady,
   readIsolatedKeychain,
   readJsonStore,
   runCapture,
@@ -143,6 +151,7 @@ type TClaudeStore = { readonly claudeAiOauth?: TClaudeOAuth };
 
 const loadStore = async (
   signal?: AbortSignal,
+  observeOnly = false,
 ): Promise<TStoreRead<TClaudeStore>> => {
   if (platform() === "darwin") {
     // macOS stores the blob in the isolated login keychain (not a file).
@@ -151,6 +160,7 @@ const loadStore = async (
       KEYCHAIN_SERVICE,
       (p) => p.includes("claudeAiOauth"),
       signal,
+      observeOnly,
     );
     if (raw.kind !== "present") return raw;
     try {
@@ -196,6 +206,7 @@ const triggerRefresh = async (): Promise<void> => {
   // refresh a credential it can't read). Skip when not ready.
   const keychain = await ensureKeychainReady(cliHome(PROVIDER));
   if (!keychainRefreshSpawnAllowed(PROVIDER, keychain)) return;
+  clearAuthStatusCache();
   // The refresh persists the rotated token into the macOS keychain via
   // securityd, which refuses a Seatbelt-confined caller; unconfined on macOS,
   // confined on Linux (file-backed store) — `sandbox/policy.ts`.
@@ -203,6 +214,7 @@ const triggerRefresh = async (): Promise<void> => {
     probe: unwrapKeychainSpawn(PROVIDER),
     timeoutMs: 10_000,
   });
+  clearAuthStatusCache();
 };
 
 // THE single refresher. Within the leeway window → fire the CLI refresh in the
@@ -277,18 +289,12 @@ const userAgent = async (): Promise<string> => {
   return semver !== undefined ? `claude-cli/${semver}` : "claude-cli/2.0.0";
 };
 
-/**
- * Cache TTL for `claude auth status`. The spawn costs ~200 ms (measured), and
- * the quota gate on the INFERENCE path hits it once per walk with a cold
- * `accountHashByProvider` — so an uncached probe taxes every request. Auth
- * state only changes on login / logout / token expiry, and both mutations
- * invalidate explicitly below, so a short TTL is safe for status accuracy.
- * Mirrors `CLI_INSTALL_STATE_TTL_MS` in `../cli-install`.
- */
-const AUTH_STATUS_TTL_MS = 30_000;
+type TClaudeStatusObservation = {
+  readonly connected: boolean;
+};
 
-let authStatusCache: { result: boolean | null; expiresAt: number } | null =
-  null;
+const claudeStatusCache =
+  createPassiveObservationCache<TClaudeStatusObservation>();
 
 let authStatusInFlight: {
   readonly generation: number;
@@ -296,19 +302,12 @@ let authStatusInFlight: {
 } | null = null;
 
 /**
- * Generation token guarding against stale writes: a probe that started before
- * an invalidation must not install its now-outdated result.
- */
-let authStatusGeneration = 0;
-
-/**
- * Drop the cached `claude auth status`. Called on every auth MUTATION (login
- * success, logout) so a state change is visible immediately rather than after
- * the TTL. Exported for tests that drive login/logout out of band.
+ * Drop cached idle status. Called on every auth MUTATION (login, logout,
+ * native refresh) so a state change is visible immediately. Exported for tests
+ * that drive login/logout out of band.
  */
 export const clearAuthStatusCache = (): void => {
-  authStatusCache = null;
-  authStatusGeneration++;
+  claudeStatusCache.invalidate();
 };
 
 /**
@@ -319,22 +318,31 @@ export const clearAuthStatusCache = (): void => {
  * null when the CLI is absent or the JSON is unparseable, so the caller
  * falls back to the credential-store read.
  *
- * Result cached for `AUTH_STATUS_TTL_MS` (see above).
+ * Idle reuse is the metadata-keyed cache on `status()`, not this probe.
  */
+type TAuthStatusWait =
+  | { readonly kind: "aborted" }
+  | { readonly kind: "invalidated" }
+  | { readonly kind: "value"; readonly result: boolean | null };
+
 const awaitAuthStatus = async (
   work: Promise<boolean | null>,
   signal?: AbortSignal,
-): Promise<boolean | null> => {
-  if (signal === undefined) return work;
-  if (signal.aborted) return null;
+): Promise<TAuthStatusWait> => {
+  if (signal === undefined) return { kind: "value", result: await work };
+  if (signal.aborted) return { kind: "aborted" };
 
   let onAbort = (): void => {};
-  const aborted = new Promise<null>((resolve) => {
-    onAbort = () => resolve(null);
+  const aborted = new Promise<TAuthStatusWait>((resolve) => {
+    onAbort = () => resolve({ kind: "aborted" });
     signal.addEventListener("abort", onAbort, { once: true });
   });
   try {
-    return await Promise.race([work, aborted]);
+    const raced = await Promise.race([
+      work.then((result): TAuthStatusWait => ({ kind: "value", result })),
+      aborted,
+    ]);
+    return raced;
   } finally {
     signal.removeEventListener("abort", onAbort);
   }
@@ -342,14 +350,11 @@ const awaitAuthStatus = async (
 
 const authStatusLoggedIn = async (
   signal?: AbortSignal,
-): Promise<boolean | null> => {
-  const cached = authStatusCache;
-  if (cached !== null && cached.expiresAt > Date.now()) return cached.result;
-
-  const generation = authStatusGeneration;
+): Promise<TAuthStatusWait> => {
+  const generation = claudeStatusCache.generation();
   let flight = authStatusInFlight;
   if (flight === null || flight.generation !== generation) {
-    if (signal?.aborted === true) return null;
+    if (signal?.aborted === true) return { kind: "aborted" };
     const work = (async (): Promise<boolean | null> => {
       // macOS securityd refuses keychain reads for a Seatbelt-confined caller,
       // so this shared producer is unconfined on macOS and bounded internally by
@@ -379,13 +384,43 @@ const authStatusLoggedIn = async (
   }
 
   const result = await awaitAuthStatus(flight.work, signal);
-  // A `null` is an INCONCLUSIVE probe (CLI absent / unparseable JSON), not a
-  // known state — caching it would pin the caller to the fragile store-read
-  // fallback for the whole TTL. Only cache a definite answer.
-  if (result !== null && generation === authStatusGeneration) {
-    authStatusCache = { result, expiresAt: Date.now() + AUTH_STATUS_TTL_MS };
+  if (generation !== claudeStatusCache.generation()) {
+    return { kind: "invalidated" };
   }
   return result;
+};
+
+const claudePassiveStoreIdentity = (): ReturnType<typeof fileStoreIdentity> => {
+  if (platform() === "darwin") {
+    const id = keychainStoreIdentity(cliHome(PROVIDER));
+    return {
+      path: id.path,
+      present: id.present,
+      mtimeMs: id.mtimeMs,
+      size: id.size,
+      ino: id.ino,
+    };
+  }
+  return fileStoreIdentity(join(cliConfigDir(PROVIDER), ".credentials.json"));
+};
+
+const claudePassiveReuseAllowed = (): {
+  readonly fingerprint: string;
+  readonly reuse: boolean;
+} => {
+  if (platform() !== "darwin") {
+    const identity = claudePassiveStoreIdentity();
+    return {
+      fingerprint: fingerprintStoreIdentity(identity),
+      reuse: true,
+    };
+  }
+  const id = keychainStoreIdentity(cliHome(PROVIDER));
+  const fingerprint = fingerprintStoreIdentity(id);
+  return {
+    fingerprint,
+    reuse: id.skipEligible || !id.present,
+  };
 };
 
 /**
@@ -444,7 +479,10 @@ const {
   readToken,
   isConnected: async (): Promise<boolean> => {
     const viaAuth = await authStatusLoggedIn();
-    return viaAuth !== null ? viaAuth : (await readToken()) !== null;
+    if (viaAuth.kind !== "value") return (await readToken()) !== null;
+    return viaAuth.result !== null
+      ? viaAuth.result
+      : (await readToken()) !== null;
   },
 });
 // The success `detail`: a credential with no refresh token works now but can't
@@ -519,8 +557,10 @@ const device = makePasteBackDevice({
   // answer cached by the pre-login `connected` probe.
   verifyAfterSubmit: async () => {
     clearAuthStatusCache();
+    const viaAuth = await authStatusLoggedIn();
     return (
-      (await authStatusLoggedIn()) === true || (await readToken()) !== null
+      (viaAuth.kind === "value" && viaAuth.result === true) ||
+      (await readToken()) !== null
     );
   },
   submitSuccessDetail: () =>
@@ -532,6 +572,7 @@ const device = makePasteBackDevice({
 export const claudeCodeDelegate: TProviderDelegate = {
   slug: "claude_code",
   statusCancellable: true,
+  invalidateStatusObservation: clearAuthStatusCache,
 
   connect: connectDirect,
   connectDeviceCode: device.connectDeviceCode,
@@ -549,14 +590,87 @@ export const claudeCodeDelegate: TProviderDelegate = {
         detail: "claude CLI not installed",
       };
     }
-    // macOS: the isolated login keychain must be unlocked so `claude auth
-    // status` can read the credential it stored there. If it is NOT ready
-    // (locked / drifted / unusable), the vendor CLI would open a locked chain
-    // and pop the SecurityAgent dialog on every periodic observation — so stop here and
-    // report a status-check failure (NOT signed-out). No-op `present`
-    // elsewhere.
+    const observedGeneration = claudeStatusCache.generation();
+    let { fingerprint, reuse } = claudePassiveReuseAllowed();
+    if (reuse) {
+      const cached = claudeStatusCache.get(fingerprint);
+      if (cached !== undefined) {
+        const connected = cached.connected;
+        if (connected) clearPendingAuth(PROVIDER);
+        const pending = connected ? null : getPendingAuth(PROVIDER);
+        const acct = connected ? await readAccountHash() : null;
+        return {
+          provider: PROVIDER,
+          status: connected ? "connected" : "disconnected",
+          ...(connected
+            ? connectedObservation()
+            : pending !== null
+              ? {}
+              : disconnectedObservation()),
+          cli_installed: true,
+          ...(version !== null ? { cli_version: version } : {}),
+          ...(connected
+            ? {
+                last_login_at_ms: null,
+                ...(acct !== null ? { account_hash: acct } : {}),
+              }
+            : pending !== null
+              ? {
+                  pending_auth: {
+                    url: pending.url,
+                    code: pending.code,
+                    ...(pending.mode !== undefined
+                      ? { mode: pending.mode }
+                      : {}),
+                    started_at_ms: pending.startedAt,
+                    ...(pending.flowId !== undefined
+                      ? { flow_id: pending.flowId }
+                      : {}),
+                  },
+                  detail: pendingAuthDetail(pending),
+                }
+              : { detail: "claude CLI installed but not signed in" }),
+        };
+      }
+      if (
+        platform() === "darwin" &&
+        !keychainStoreIdentity(cliHome(PROVIDER)).present
+      ) {
+        claudeStatusCache.set(
+          fingerprint,
+          { connected: false },
+          observedGeneration,
+        );
+        const pending = getPendingAuth(PROVIDER);
+        return {
+          provider: PROVIDER,
+          status: "disconnected",
+          ...(pending !== null ? {} : disconnectedObservation()),
+          cli_installed: true,
+          ...(version !== null ? { cli_version: version } : {}),
+          ...(pending !== null
+            ? {
+                pending_auth: {
+                  url: pending.url,
+                  code: pending.code,
+                  ...(pending.mode !== undefined ? { mode: pending.mode } : {}),
+                  started_at_ms: pending.startedAt,
+                  ...(pending.flowId !== undefined
+                    ? { flow_id: pending.flowId }
+                    : {}),
+                },
+                detail: pendingAuthDetail(pending),
+              }
+            : { detail: "claude CLI installed but not signed in" }),
+        };
+      }
+    }
+    // macOS: unlock an EXISTING isolated chain so `claude auth status` can
+    // read it. Observe-only — no create/recreate/ACL. Locked/drifted/missing
+    // is a status-check failure (NOT signed-out). Repair stays on login /
+    // inference. Skip-ineligible present stores keep this guarded unlock.
     if (
-      (await ensureKeychainReady(cliHome(PROVIDER), signal)).kind !== "present"
+      (await observeKeychainReady(cliHome(PROVIDER), signal)).kind !== "present"
     ) {
       return {
         provider: PROVIDER,
@@ -567,17 +681,67 @@ export const claudeCodeDelegate: TProviderDelegate = {
         detail: STATUS_CHECK_FAILED_DETAIL,
       };
     }
+    ({ fingerprint, reuse } = claudePassiveReuseAllowed());
+    const reusedAfterReady = claudeStatusCache.get(fingerprint);
+    if (reuse && reusedAfterReady !== undefined) {
+      const connected = reusedAfterReady.connected;
+      if (connected) clearPendingAuth(PROVIDER);
+      const pending = connected ? null : getPendingAuth(PROVIDER);
+      const acct = connected ? await readAccountHash() : null;
+      return {
+        provider: PROVIDER,
+        status: connected ? "connected" : "disconnected",
+        ...(connected
+          ? connectedObservation()
+          : pending !== null
+            ? {}
+            : disconnectedObservation()),
+        cli_installed: true,
+        ...(version !== null ? { cli_version: version } : {}),
+        ...(connected
+          ? {
+              last_login_at_ms: null,
+              ...(acct !== null ? { account_hash: acct } : {}),
+            }
+          : pending !== null
+            ? {
+                pending_auth: {
+                  url: pending.url,
+                  code: pending.code,
+                  ...(pending.mode !== undefined ? { mode: pending.mode } : {}),
+                  started_at_ms: pending.startedAt,
+                  ...(pending.flowId !== undefined
+                    ? { flow_id: pending.flowId }
+                    : {}),
+                },
+                detail: pendingAuthDetail(pending),
+              }
+            : { detail: "claude CLI installed but not signed in" }),
+      };
+    }
     // Prefer the CLI's own `auth status`; fall back to the store read
     // when it's unavailable / unparseable. A definite `loggedIn: false` on
     // a still-present store (bad unwrap / confined spawn) is inconclusive —
     // never overwrite last-known with "not signed in".
-    const viaAuth = await authStatusLoggedIn(signal);
+    const viaWait = await authStatusLoggedIn(signal);
+    if (viaWait.kind === "aborted" || viaWait.kind === "invalidated") {
+      return {
+        provider: PROVIDER,
+        status: "disconnected",
+        ...unknownObservation("probe_failed"),
+        cli_installed: true,
+        ...(version !== null ? { cli_version: version } : {}),
+        detail: STATUS_CHECK_FAILED_DETAIL,
+      };
+    }
+    const viaAuth = viaWait.result;
     let connected = viaAuth === true;
+    let determinate = viaAuth === true;
     if (!connected) {
       // A conclusive positive CLI result is sufficient for the passive watcher.
       // Only consult the secret store as a null/false fallback; refreshability,
       // account identity, and token refresh belong to explicit/inference paths.
-      const store = await loadStore(signal);
+      const store = await loadStore(signal, true);
       if (store.kind === "indeterminate") {
         return {
           provider: PROVIDER,
@@ -600,6 +764,16 @@ export const claudeCodeDelegate: TProviderDelegate = {
       }
       const accessToken = storeReadValue(store)?.claudeAiOauth?.accessToken;
       connected = viaAuth === null && nonEmpty(accessToken) !== null;
+      determinate = viaAuth === false || store.kind === "absent" || connected;
+    }
+    if (determinate) {
+      rememberIfFingerprintStable(
+        claudeStatusCache,
+        fingerprint,
+        fingerprintStoreIdentity(claudePassiveStoreIdentity()),
+        { connected },
+        observedGeneration,
+      );
     }
     // A live headless paste-back login (remote box) awaiting the user's code:
     // surface the authorize URL + paste mode so the dashboard renders the

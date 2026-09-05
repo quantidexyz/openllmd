@@ -2,9 +2,10 @@
  * The daemon's status snapshot, computed in one place so the `/status`
  * one-shot endpoint and the `/events` SSE push share identical logic.
  *
- * Computing it spawns each delegate's `status()` (a CLI `--version` + an
- * auth/store read), so callers should not hammer it — the SSE watcher
- * recomputes on a gentle interval and only while a client is listening.
+ * Computing it probes each delegate's `status()` (cheap CLI `--version` + a
+ * local store/metadata read — not token refresh). Callers should not hammer
+ * it; the relay status watcher also recomputes on a gentle interval while the
+ * daemon is connected, even with no dashboard SSE client.
  */
 import { accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -160,10 +161,15 @@ export const setLateProbeStatusPushForTests = (
   requestLateProbePush = fn ?? defaultLateProbePush;
 };
 
+/** Last complete observation for `slug`, if any. Read-only — no probe. */
+export const peekLastKnownConnection = (
+  slug: string,
+): TDaemonProviderConnection | undefined => lastKnownConnections.get(slug);
+
 /** Test-only: last-known is process-global and otherwise unreadable. */
 export const lastKnownConnectionForTests = (
   slug: string,
-): TDaemonProviderConnection | undefined => lastKnownConnections.get(slug);
+): TDaemonProviderConnection | undefined => peekLastKnownConnection(slug);
 
 /** Test-only: the last-known map is process-global and leaks across suites. */
 export const resetLastKnownConnectionsForTests = (): void => {

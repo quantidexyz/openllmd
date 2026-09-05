@@ -85,8 +85,9 @@ daemon/
                             deliverJsonResponse; sseResponseForClient for pre-metered turns)
     control.ts              localhost control surface (/status,/events,/connect,/usage,/config)
     control-channel.ts      outbound relay WebSocket (partysocket) — hello/status/ack frames, heartbeat, and migrateIfRelayMoved (bootstrap-tick channel re-fetch: reconnect when a deploy moved the relay to a new content-addressed box)
-    status.ts               computeStatus() — shared snapshot for /status + /events
+    status.ts               computeStatus() — shared snapshot for relay status_push (cheap local store/metadata; not token refresh)
     usage-cache.ts          per-provider TTL cache over delegate.usage() (rate-limit safe)
+    model-report.ts         demand-driven live catalog POST: login-succeeded (scoped) or refresh_models — never idle bootstrap
     events.ts               /events SSE: push status on change (replaces polling)
     cors.ts                 shared CORS + PNA preflight for both surfaces
     cli-paths.ts            isolated-CLI paths + per-provider run env
@@ -111,7 +112,9 @@ daemon/
                             exec request's upstream URL (drift-safe) + CLI meta. Feeds
                             the request TARGET — NOT inference identity (the originator's
                             headers do that)
-      claude-code.ts chatgpt.ts kimi-code.ts grok.ts cursor.ts util.ts index.ts
+      claude-code.ts chatgpt.ts kimi-code.ts grok.ts cursor.ts
+      observation-cache.ts  metadata-keyed determinate idle status for Claude/Cursor
+      util.ts index.ts
 ```
 
 ## Integration triggers (skill / plugin / setup install + uninstall)
@@ -663,6 +666,63 @@ minute-level staleness is irrelevant — shared in-flight fetch, last-good
 fallback stamped `stale` when a refresh fails) so rapid refreshes or several
 dashboards can't hammer the endpoint either.
 
+**Passive status does not refresh tokens or provision vendor config.** File-backed
+delegates (`chatgpt`, `kimi_code`, `grok`) derive `status()` from **one** typed
+store snapshot (`present` / `absent` / `indeterminate`). They never call
+`readToken()` on that path, so a status tick cannot native-refresh, spawn
+`codex doctor` / `kimi -p` / `grok models`, fetch `/models`, or write Kimi's
+managed `config.toml`. Expired-but-stored credentials stay `connected`; a
+read error stays `unknown` (`store_unreadable`) and is not collapsed to
+`credential_absent`. `readToken()` remains the demand path for inference,
+on-demand usage, and requested `listModels()`.
+
+**Claude / Cursor idle observations are reused while store identity is stable
+(`delegation/observation-cache.ts`).** Reuse is keyed by path + inode + mtime +
+size (and on macOS, keychain replacement identity), not a clock TTL. Determinate
+connected/absent answers may be reused; unknown/indeterminate, aborted, and
+invalidated results are never cached. A producer started before `invalidate`
+must not overwrite a newer generation; reuse also requires the store fingerprint
+to match from start to end of the probe. Passive macOS reads go through
+`observeKeychainReady` / `observeOnly`: an existing chain may be unlocked, but
+status must not create, recreate, rename, or mutate ACL/settings/partition-list.
+Active `ensureKeychainReady` on login / `readToken` / refresh still repairs.
+mtime is not proof the chain is unlocked, and a locked store is not dumped.
+Cold, changed, or unknown stores keep bounded guarded probes. Connect/logout,
+successful refresh, and credential mutations invalidate the cache. This is
+presence metadata, not vendor-validity proof, and does not replace request-time
+`readToken`.
+
+**Live model catalogs are demand-driven (`model-report.ts`).** Healthy cloud
+bootstrap and the 5-minute (or unhealthy-retry) tick in `main.ts` MUST NOT call
+`maybeReportModels` / `listModels` / a vendor catalog fetch. Boot only
+`observeLoginModelReports()` once (subscribe to auth events — zero vendor I/O).
+The local 30m success / 15m failure throttle applies to demand callers; it is
+not a background timer.
+
+Discovery still runs:
+- **Unscoped:** control command `refresh_models` (dashboard “Available models”).
+  Awaits `maybeReportModels()`, which uses `computeStatus()` (bounded snapshot
+  producer) and lists only serviceable providers. Not cron, not
+  `model-lists-sweep`, not `GET /v1/models`, not a cache-read auto-enqueue.
+- **Scoped:** `auth.login.succeeded` only. One slug; `listModels` for that
+  provider; last-known CLI version via `peekLastKnownConnection` — does not join
+  an in-flight unknown/pending status probe. Covers immediate connect **and**
+  pending device-code / paste-back when `finishInBackground` /
+  `finalizeLoginTerminal` actually land a credential. Connect /
+  `connect_device_code` / `submit_login_code` acks do **not** report (pending is
+  not success; `submit_login_code` `r.ok` may only be paste acceptance).
+  Failed/cancelled terminals do not report. Do not also fire on `r.connected`
+  (duplicate). `refresh` (usage) is unrelated; status usage stays peek-only.
+
+Cloud cache: `MODEL_CACHE_TTL_MS` (30m) is freshness for cloud/BYOK writers
+(`scheduleModelListRefresh` skips fresh rows). `MODEL_CACHE_MAX_AGE_MS` (24h)
+still drops `source=cloud` rows to catalog fallback. `source=daemon` rows stay
+servable past 24h as last-known fallback (`liveCacheRowIsServable`). An idle
+skip never POSTs an empty list. An older CLI must not overwrite a newer
+parseable daemon row even after 24h (`shouldSkipDaemonModelWrite` + upsert
+`setWhere`; the old 24h write escape hatch is gone). Per-provider failure
+isolation and CLI-version invalidation on demand reports are unchanged.
+
 **Originator passthrough (the compliance core, `auth-config.ts`).** The daemon
 is a transparent, credential-injecting reverse proxy: each inference request
 carries the **originator's own headers** to the vendor (denylist passthrough —
@@ -703,12 +763,15 @@ stores ONLY that URL + the CLI version — never an identity-header set to repla
 `resolveUpstreamUrl` prefers the captured URL and falls back to the retained
 ORIGIN + default path per provider.
 
-**Token refresh is the CLI's own job (`delegation/refresh.ts`).** The daemon
-never refreshes a subscription token itself — no `grant_type=refresh_token`
-calls, no extracted or hardcoded token endpoint / client id. Each delegate's
-`readToken` checks the stored access token's expiry and, when it's within the
-leeway window, TRIGGERS the official CLI's OWN native refresh: a bounded spawn
-whose side effect is the CLI refreshing + persisting its token to its own store.
+**Token refresh is the CLI's own job (`delegation/refresh.ts`), on demand.** The
+daemon never refreshes a subscription token itself — no `grant_type=refresh_token`
+calls, no extracted or hardcoded token endpoint / client id. When a demand path
+(`credentialForUpstream`, usage, requested `listModels`) calls `readToken`, it
+checks the stored access token's expiry and, when it's within the leeway window,
+TRIGGERS the official CLI's OWN native refresh: a bounded spawn whose side
+effect is the CLI refreshing + persisting its token to its own store. Passive
+`status()` must not take this path. Shared refresh producers are not cancelled
+because a status observer timed out.
 claude → a minimal `claude -p` query (the CLI refreshes mid-request); codex →
 `codex doctor` (its websocket-reachability check forces the proactive refresh —
 no inference); kimi → a minimal `kimi -p` query under a PTY (subscription model).
@@ -747,9 +810,13 @@ connected/failed directly — the dashboard's Connect button stays in its
   touch `security default-keychain`/`list-keychains` (those mutate the
   live securityd session, polluting the user's real keychain); reads name
   the isolated keychain by explicit path (`readIsolatedKeychain`), and
-  `set-key-partition-list` after login keeps reads prompt-free. See
-  `delegation/util.ts`.
-- **chatgpt** — `codex login`; token at `<CODEX_HOME>/auth.json`.
+  `set-key-partition-list` after login keeps reads prompt-free. Passive
+  `status()` reuses a determinate observation while keychain/file identity
+  is unchanged (`observation-cache.ts`); it uses `observeKeychainReady`
+  (unlock-only, no create/repair) and does not call `readToken`. See
+  `delegation/util.ts` and `delegation/keychain.ts`.
+- **chatgpt** — `codex login`; token at `<CODEX_HOME>/auth.json`. Passive
+  `status()` reads that file once and does not run `codex doctor`.
 - **kimi_code** — the Kimi CLI has NO spawnable login (sign-in is the
   in-TUI `/login`, which needs a raw-mode TTY), so the daemon drives
   Kimi's OWN device-code OAuth flow directly — the exact flow the CLI runs
@@ -760,14 +827,16 @@ connected/failed directly — the dashboard's Connect button stays in its
   `<KIMI_CODE_HOME>/credentials/kimi-code.json` in the CLI's exact wire
   shape (+ persist `device_id`). The status watcher then flips the card to
   connected (~5s). `connect` returns immediately with the device code /
-  URL; no terminal, no TUI.
+  URL; no terminal, no TUI. Passive `status()` reads the credential file
+  once and does not refresh or provision `config.toml`.
 - **grok** — `grok login` (or `grok login --device-auth` for a headless
-  device-code flow); when a refresh is needed, the daemon attempts a bounded
-  `grok models` run so the CLI can perform its own refresh. The isolated
-  run-view points to the user's `grok` executable.
+  device-code flow). Demand-path `readToken` may spawn a bounded `grok models`
+  so the CLI can refresh; passive `status()` only reads `auth.json`. The
+  isolated run-view points to the user's `grok` executable.
 - **cursor** — `cursor-agent login`; its local credential store is checked for
-  status/usage and its ACP bridge supplies model discovery and the walker's
-  native-runtime inference transport.
+  status/usage (idle status reuses a determinate observation while store
+  identity is unchanged) and its ACP bridge supplies model discovery and the
+  walker's native-runtime inference transport.
 
 The dashboard's `/providers` OAuth tab drives a flow off `/status`'s
 per-provider `cli_installed` + `connected`: CLI missing (prompt to re-run

@@ -234,11 +234,17 @@ const refresh = nativeRefresher({
   trigger: triggerRefresh,
 });
 
+const storedAccessToken = (tok: TKimiToken | null): string | null =>
+  tok?.access_token !== undefined && tok.access_token.length > 0
+    ? tok.access_token
+    : null;
+
 /**
  * The current access token from
  * `<KIMI_CODE_HOME>/credentials/kimi-code.json`, triggering the CLI's native
- * refresh when it's within the leeway of `expires_at`. Used by `status`,
- * `usage`, and `credentialForUpstream` so each carries a live token.
+ * refresh when it's within the leeway of `expires_at`. Used by `usage` and
+ * `credentialForUpstream` so each carries a live token. Passive `status()`
+ * must not call this — it would refresh and provision model config.
  */
 const readToken = async (): Promise<{ accessToken: string } | null> => {
   const tok = storeReadValue(await readJsonStore<TKimiToken>(credentialPath()));
@@ -675,13 +681,14 @@ export const kimiCodeDelegate: TProviderDelegate = {
   connect: connectDevice,
   cancelConnect,
 
+  // Passive observation from ONE typed credential snapshot. Do not call
+  // `readToken()` here — that refreshes via `kimi -p` and may provision config.
   status: async () => {
     const { installed, version } = await cliInstallState(PROVIDER);
-    if (
-      installed &&
-      (await readJsonStore<TKimiToken>(credentialPath())).kind ===
-        "indeterminate"
-    ) {
+    const store = installed
+      ? await readJsonStore<TKimiToken>(credentialPath())
+      : null;
+    if (store?.kind === "indeterminate") {
       return {
         provider: PROVIDER,
         status: "disconnected",
@@ -691,13 +698,15 @@ export const kimiCodeDelegate: TProviderDelegate = {
         detail: STATUS_CHECK_FAILED_DETAIL,
       };
     }
-    const token = installed ? await readToken() : null;
-    if (token !== null) clearPendingAuth(PROVIDER);
-    const pending = token === null ? getPendingAuth(PROVIDER) : null;
+    const accessToken = storedAccessToken(
+      store?.kind === "present" ? store.value : null,
+    );
+    if (accessToken !== null) clearPendingAuth(PROVIDER);
+    const pending = accessToken === null ? getPendingAuth(PROVIDER) : null;
     return {
       provider: PROVIDER,
-      status: token !== null ? "connected" : "disconnected",
-      ...(token !== null
+      status: accessToken !== null ? "connected" : "disconnected",
+      ...(accessToken !== null
         ? connectedObservation()
         : pending !== null
           ? {}
@@ -718,7 +727,7 @@ export const kimiCodeDelegate: TProviderDelegate = {
             },
           }
         : {}),
-      ...(token === null
+      ...(accessToken === null
         ? {
             detail:
               pending !== null
@@ -732,10 +741,7 @@ export const kimiCodeDelegate: TProviderDelegate = {
             // Stable Kimi account identity, hashed (`account-id.ts`) — the
             // `user_id` (= `sub`) claim of the stored access-token JWT. NOT
             // `device_id` (per-device) or `token_id`/`jti` (per-token).
-            ...accountHashField(
-              PROVIDER,
-              jwtClaims(token.accessToken)?.user_id,
-            ),
+            ...accountHashField(PROVIDER, jwtClaims(accessToken)?.user_id),
           }),
     };
   },
