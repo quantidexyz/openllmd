@@ -15,6 +15,16 @@ export type TFileStoreIdentity = {
   readonly mtimeMs: number | null;
   readonly size: number | null;
   readonly ino: number | null;
+  /** False when stat failed for a reason other than ENOENT (EACCES/EIO). */
+  readonly statOk: boolean;
+};
+
+export const classifyStatError = (err: unknown): "absent" | "unreadable" => {
+  if (err !== null && typeof err === "object" && "code" in err) {
+    const code = (err as { readonly code?: unknown }).code;
+    if (code === "ENOENT") return "absent";
+  }
+  return "unreadable";
 };
 
 export const fileStoreIdentity = (path: string): TFileStoreIdentity => {
@@ -26,19 +36,23 @@ export const fileStoreIdentity = (path: string): TFileStoreIdentity => {
       mtimeMs: st.mtimeMs,
       size: st.size,
       ino: Number(st.ino),
+      statOk: true,
     };
-  } catch {
+  } catch (err) {
+    const absent = classifyStatError(err) === "absent";
     return {
       path,
       present: false,
       mtimeMs: null,
       size: null,
       ino: null,
+      statOk: absent,
     };
   }
 };
 
 export const fingerprintStoreIdentity = (id: TFileStoreIdentity): string => {
+  if (!id.statOk) return `${id.path}\0unreadable`;
   if (
     !id.present ||
     id.mtimeMs === null ||

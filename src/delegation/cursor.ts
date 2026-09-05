@@ -296,6 +296,7 @@ export const clearCursorStatusObservationCache = (): void => {
 const cursorPassiveReuseAllowed = (): {
   readonly fingerprint: string;
   readonly reuse: boolean;
+  readonly absentStore: boolean;
 } => {
   if (platform() !== "darwin") {
     const identity = fileStoreIdentity(
@@ -303,13 +304,15 @@ const cursorPassiveReuseAllowed = (): {
     );
     return {
       fingerprint: fingerprintStoreIdentity(identity),
-      reuse: true,
+      reuse: identity.statOk,
+      absentStore: identity.statOk && !identity.present,
     };
   }
   const id = keychainStoreIdentity(cliHome(PROVIDER));
   return {
     fingerprint: fingerprintStoreIdentity(id),
-    reuse: id.skipEligible || !id.present,
+    reuse: id.statOk && (id.skipEligible || !id.present),
+    absentStore: id.statOk && !id.present,
   };
 };
 
@@ -359,16 +362,13 @@ const mappedObservation = (
 const readCachedStatusAccess = async (
   signal?: AbortSignal,
 ): Promise<TStoreRead<{ readonly accountHint: string | undefined }>> => {
-  const { fingerprint, reuse } = cursorPassiveReuseAllowed();
+  const { fingerprint, reuse, absentStore } = cursorPassiveReuseAllowed();
   const startFingerprint = fingerprint;
   const generation = cursorStatusCache.generation();
   if (reuse) {
     const cached = cursorStatusCache.get(fingerprint);
     if (cached !== undefined) return mappedObservation(cached);
-    if (
-      platform() === "darwin" &&
-      !keychainStoreIdentity(cliHome(PROVIDER)).present
-    ) {
+    if (absentStore) {
       cursorStatusCache.set(fingerprint, { kind: "absent" }, generation);
       return { kind: "absent" };
     }

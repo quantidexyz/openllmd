@@ -399,6 +399,7 @@ const claudePassiveStoreIdentity = (): ReturnType<typeof fileStoreIdentity> => {
       mtimeMs: id.mtimeMs,
       size: id.size,
       ino: id.ino,
+      statOk: id.statOk,
     };
   }
   return fileStoreIdentity(join(cliConfigDir(PROVIDER), ".credentials.json"));
@@ -407,19 +408,60 @@ const claudePassiveStoreIdentity = (): ReturnType<typeof fileStoreIdentity> => {
 const claudePassiveReuseAllowed = (): {
   readonly fingerprint: string;
   readonly reuse: boolean;
+  readonly absentStore: boolean;
 } => {
-  if (platform() !== "darwin") {
-    const identity = claudePassiveStoreIdentity();
+  if (platform() === "darwin") {
+    const id = keychainStoreIdentity(cliHome(PROVIDER));
     return {
-      fingerprint: fingerprintStoreIdentity(identity),
-      reuse: true,
+      fingerprint: fingerprintStoreIdentity(id),
+      reuse: id.statOk && (id.skipEligible || !id.present),
+      absentStore: id.statOk && !id.present,
     };
   }
-  const id = keychainStoreIdentity(cliHome(PROVIDER));
-  const fingerprint = fingerprintStoreIdentity(id);
+  const identity = claudePassiveStoreIdentity();
   return {
-    fingerprint,
-    reuse: id.skipEligible || !id.present,
+    fingerprint: fingerprintStoreIdentity(identity),
+    reuse: identity.statOk,
+    absentStore: identity.statOk && !identity.present,
+  };
+};
+
+const claudeStatusPayload = async (
+  connected: boolean,
+  version: string | null,
+): Promise<TDaemonProviderConnection> => {
+  if (connected) clearPendingAuth(PROVIDER);
+  const pending = connected ? null : getPendingAuth(PROVIDER);
+  const acct = connected ? await readAccountHash() : null;
+  return {
+    provider: PROVIDER,
+    status: connected ? "connected" : "disconnected",
+    ...(connected
+      ? connectedObservation()
+      : pending !== null
+        ? {}
+        : disconnectedObservation()),
+    cli_installed: true,
+    ...(version !== null ? { cli_version: version } : {}),
+    ...(connected
+      ? {
+          last_login_at_ms: null,
+          ...(acct !== null ? { account_hash: acct } : {}),
+        }
+      : pending !== null
+        ? {
+            pending_auth: {
+              url: pending.url,
+              code: pending.code,
+              ...(pending.mode !== undefined ? { mode: pending.mode } : {}),
+              started_at_ms: pending.startedAt,
+              ...(pending.flowId !== undefined
+                ? { flow_id: pending.flowId }
+                : {}),
+            },
+            detail: pendingAuthDetail(pending),
+          }
+        : { detail: "claude CLI installed but not signed in" }),
   };
 };
 
@@ -591,78 +633,19 @@ export const claudeCodeDelegate: TProviderDelegate = {
       };
     }
     const observedGeneration = claudeStatusCache.generation();
-    let { fingerprint, reuse } = claudePassiveReuseAllowed();
+    let { fingerprint, reuse, absentStore } = claudePassiveReuseAllowed();
     if (reuse) {
       const cached = claudeStatusCache.get(fingerprint);
       if (cached !== undefined) {
-        const connected = cached.connected;
-        if (connected) clearPendingAuth(PROVIDER);
-        const pending = connected ? null : getPendingAuth(PROVIDER);
-        const acct = connected ? await readAccountHash() : null;
-        return {
-          provider: PROVIDER,
-          status: connected ? "connected" : "disconnected",
-          ...(connected
-            ? connectedObservation()
-            : pending !== null
-              ? {}
-              : disconnectedObservation()),
-          cli_installed: true,
-          ...(version !== null ? { cli_version: version } : {}),
-          ...(connected
-            ? {
-                last_login_at_ms: null,
-                ...(acct !== null ? { account_hash: acct } : {}),
-              }
-            : pending !== null
-              ? {
-                  pending_auth: {
-                    url: pending.url,
-                    code: pending.code,
-                    ...(pending.mode !== undefined
-                      ? { mode: pending.mode }
-                      : {}),
-                    started_at_ms: pending.startedAt,
-                    ...(pending.flowId !== undefined
-                      ? { flow_id: pending.flowId }
-                      : {}),
-                  },
-                  detail: pendingAuthDetail(pending),
-                }
-              : { detail: "claude CLI installed but not signed in" }),
-        };
+        return claudeStatusPayload(cached.connected, version);
       }
-      if (
-        platform() === "darwin" &&
-        !keychainStoreIdentity(cliHome(PROVIDER)).present
-      ) {
+      if (absentStore) {
         claudeStatusCache.set(
           fingerprint,
           { connected: false },
           observedGeneration,
         );
-        const pending = getPendingAuth(PROVIDER);
-        return {
-          provider: PROVIDER,
-          status: "disconnected",
-          ...(pending !== null ? {} : disconnectedObservation()),
-          cli_installed: true,
-          ...(version !== null ? { cli_version: version } : {}),
-          ...(pending !== null
-            ? {
-                pending_auth: {
-                  url: pending.url,
-                  code: pending.code,
-                  ...(pending.mode !== undefined ? { mode: pending.mode } : {}),
-                  started_at_ms: pending.startedAt,
-                  ...(pending.flowId !== undefined
-                    ? { flow_id: pending.flowId }
-                    : {}),
-                },
-                detail: pendingAuthDetail(pending),
-              }
-            : { detail: "claude CLI installed but not signed in" }),
-        };
+        return claudeStatusPayload(false, version);
       }
     }
     // macOS: unlock an EXISTING isolated chain so `claude auth status` can
@@ -684,40 +667,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
     ({ fingerprint, reuse } = claudePassiveReuseAllowed());
     const reusedAfterReady = claudeStatusCache.get(fingerprint);
     if (reuse && reusedAfterReady !== undefined) {
-      const connected = reusedAfterReady.connected;
-      if (connected) clearPendingAuth(PROVIDER);
-      const pending = connected ? null : getPendingAuth(PROVIDER);
-      const acct = connected ? await readAccountHash() : null;
-      return {
-        provider: PROVIDER,
-        status: connected ? "connected" : "disconnected",
-        ...(connected
-          ? connectedObservation()
-          : pending !== null
-            ? {}
-            : disconnectedObservation()),
-        cli_installed: true,
-        ...(version !== null ? { cli_version: version } : {}),
-        ...(connected
-          ? {
-              last_login_at_ms: null,
-              ...(acct !== null ? { account_hash: acct } : {}),
-            }
-          : pending !== null
-            ? {
-                pending_auth: {
-                  url: pending.url,
-                  code: pending.code,
-                  ...(pending.mode !== undefined ? { mode: pending.mode } : {}),
-                  started_at_ms: pending.startedAt,
-                  ...(pending.flowId !== undefined
-                    ? { flow_id: pending.flowId }
-                    : {}),
-                },
-                detail: pendingAuthDetail(pending),
-              }
-            : { detail: "claude CLI installed but not signed in" }),
-      };
+      return claudeStatusPayload(reusedAfterReady.connected, version);
     }
     // Prefer the CLI's own `auth status`; fall back to the store read
     // when it's unavailable / unparseable. A definite `loggedIn: false` on
@@ -775,44 +725,7 @@ export const claudeCodeDelegate: TProviderDelegate = {
         observedGeneration,
       );
     }
-    // A live headless paste-back login (remote box) awaiting the user's code:
-    // surface the authorize URL + paste mode so the dashboard renders the
-    // paste panel; drop it the moment the credential lands.
-    if (connected) clearPendingAuth(PROVIDER);
-    const pending = connected ? null : getPendingAuth(PROVIDER);
-    // Stable identity is file-backed (`.claude.json`), so retaining it does not
-    // add securityd pressure and keeps usage snapshots on the account series.
-    const acct = connected ? await readAccountHash() : null;
-    return {
-      provider: PROVIDER,
-      status: connected ? "connected" : "disconnected",
-      ...(connected
-        ? connectedObservation()
-        : pending !== null
-          ? {}
-          : disconnectedObservation()),
-      cli_installed: true,
-      ...(version !== null ? { cli_version: version } : {}),
-      ...(connected
-        ? {
-            last_login_at_ms: null,
-            ...(acct !== null ? { account_hash: acct } : {}),
-          }
-        : pending !== null
-          ? {
-              pending_auth: {
-                url: pending.url,
-                code: pending.code,
-                ...(pending.mode !== undefined ? { mode: pending.mode } : {}),
-                started_at_ms: pending.startedAt,
-                ...(pending.flowId !== undefined
-                  ? { flow_id: pending.flowId }
-                  : {}),
-              },
-              detail: pendingAuthDetail(pending),
-            }
-          : { detail: "claude CLI installed but not signed in" }),
-    };
+    return claudeStatusPayload(connected, version);
   },
 
   usage: async (): Promise<TProviderUsageSnapshot> => {

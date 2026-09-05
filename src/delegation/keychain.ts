@@ -47,6 +47,7 @@ import { logDebug, logError, logInfo, logWarn } from "../logger";
 import { currentTickId } from "../op-context";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
+import { classifyStatError } from "./observation-cache";
 import { redactSensitiveArgv } from "./redact-sensitive-argv";
 import { bindAbort, logIfKilled, spawnCwd } from "./spawn";
 import type { TStoreRead } from "./util";
@@ -788,6 +789,7 @@ export type TKeychainStoreIdentity = {
   readonly size: number | null;
   readonly ino: number | null;
   readonly skipEligible: boolean;
+  readonly statOk: boolean;
 };
 
 export const keychainStoreIdentity = (home: string): TKeychainStoreIdentity => {
@@ -800,6 +802,7 @@ export const keychainStoreIdentity = (home: string): TKeychainStoreIdentity => {
       size: null,
       ino: null,
       skipEligible: true,
+      statOk: true,
     };
   }
   try {
@@ -811,8 +814,10 @@ export const keychainStoreIdentity = (home: string): TKeychainStoreIdentity => {
       size: st.size,
       ino: Number(st.ino),
       skipEligible: skipEligible(path),
+      statOk: true,
     };
-  } catch {
+  } catch (err) {
+    const absent = classifyStatError(err) === "absent";
     return {
       path,
       present: false,
@@ -820,6 +825,7 @@ export const keychainStoreIdentity = (home: string): TKeychainStoreIdentity => {
       size: null,
       ino: null,
       skipEligible: false,
+      statOk: absent,
     };
   }
 };
@@ -1009,6 +1015,7 @@ const recreateIsolatedKeychain = async (
  *  macOS. */
 const noteUnlockSuccess = (kc: string): TStoreRead<void> => {
   transientTimeouts.delete(kc);
+  observeTransientTimeouts.delete(kc);
   recordUnlockSuccessForSkip(kc);
   return READY;
 };
