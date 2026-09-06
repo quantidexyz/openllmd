@@ -254,6 +254,28 @@ const refresh = nativeRefresher({
   trigger: triggerRefresh,
 });
 
+type TStoredGrokToken =
+  | {
+      readonly kind: "live";
+      readonly accessToken: string;
+      readonly session: TGrokSession;
+    }
+  | { readonly kind: "expired" }
+  | { readonly kind: "missing" };
+
+/** Stored access token only — never native-refreshes. Usage reads this. */
+const readStoredToken = async (): Promise<TStoredGrokToken> => {
+  const session = await newestSession();
+  if (session?.key === undefined || session.key.length === 0) {
+    return { kind: "missing" };
+  }
+  const expiresAtMs = parseExpiryMs(session.expires_at);
+  if (expiresAtMs !== null && expiresAtMs <= Date.now()) {
+    return { kind: "expired" };
+  }
+  return { kind: "live", accessToken: session.key, session };
+};
+
 /** Read the stored access token, triggering the CLI's native refresh near
  *  expiry (the CLI owns the store; we just re-read after a hard-expired await).
  *  Also returns the session the token came from, so callers (e.g. `status`'s
@@ -765,9 +787,12 @@ export const grokDelegate: TProviderDelegate = {
   },
 
   usage: async (): Promise<TProviderUsageSnapshot> => {
-    const token = await readToken();
-    if (token === null) {
+    const token = await readStoredToken();
+    if (token.kind === "missing") {
       return { kind: "unavailable", reason: "not signed in to Grok" };
+    }
+    if (token.kind === "expired") {
+      return { kind: "unavailable", reason: "credential_expired" };
     }
     // Same host as inference (`resolveProviderUrl` derives it from the captured
     // upstream, never spawning the CLI). The plain OAuth bearer is accepted; we

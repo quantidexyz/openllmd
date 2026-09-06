@@ -2055,6 +2055,7 @@ export const usageForActiveAccount = async (
   if (accountHash === null) return null;
   const delegate = getDelegate(provider);
   if (delegate === null) return null;
+  // `usage()` is a stored-credential read — it must not native-refresh.
   return peekUsageForQuotaGate(provider, accountHash, () => delegate.usage());
 };
 

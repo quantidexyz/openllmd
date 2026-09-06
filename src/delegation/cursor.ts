@@ -470,6 +470,24 @@ const readStoredTokens = async (
   };
 };
 
+type TStoredCursorToken =
+  | { readonly kind: "live"; readonly stored: TCursorStoredTokens }
+  | { readonly kind: "expired" }
+  | { readonly kind: "missing" };
+
+/** Stored access token only — never native-refreshes. Usage reads this. */
+const readStoredToken = async (
+  signal?: AbortSignal,
+): Promise<TStoredCursorToken> => {
+  const stored = storeReadValue(await readStoredTokens(signal));
+  if (stored === null) return { kind: "missing" };
+  const expiresAtMs = jwtExpiryMs(stored.accessToken);
+  if (expiresAtMs !== null && expiresAtMs <= Date.now()) {
+    return { kind: "expired" };
+  }
+  return { kind: "live", stored };
+};
+
 const readToken = async (
   signal?: AbortSignal,
   storedRead?: TStoreRead<TCursorStoredTokens>,
@@ -642,20 +660,23 @@ export const cursorDelegate: TProviderDelegate = {
   },
 
   usage: async (): Promise<TProviderUsageSnapshot> => {
-    const token = await readToken();
-    if (token === null)
+    const token = await readStoredToken();
+    if (token.kind === "missing")
       return { kind: "unavailable", reason: "not signed in to Cursor" };
+    if (token.kind === "expired")
+      return { kind: "unavailable", reason: "credential_expired" };
+    const stored = token.stored;
     try {
       const [usage, plan] = await Promise.all([
         fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {
           method: "POST",
-          headers: dashboardHeaders(token.accessToken),
+          headers: dashboardHeaders(stored.accessToken),
           body: "{}",
           signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
         }),
         fetch(await resolveProviderUrl(PROVIDER, PLAN_PATH), {
           method: "POST",
-          headers: dashboardHeaders(token.accessToken),
+          headers: dashboardHeaders(stored.accessToken),
           body: "{}",
           signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
         }),

@@ -250,22 +250,55 @@ const storedAccessToken = (tok: TKimiToken | null): string | null =>
     ? tok.access_token
     : null;
 
-/**
- * The current access token from
- * `<KIMI_CODE_HOME>/credentials/kimi-code.json`, triggering the CLI's native
- * refresh when it's within the leeway of `expires_at`. Used by `usage` and
- * `credentialForUpstream` so each carries a live token. Passive `status()`
- * must not call this — it would refresh and provision model config.
- */
-const readToken = async (): Promise<{ accessToken: string } | null> => {
+type TStoredKimiToken =
+  | {
+      readonly kind: "live";
+      readonly tok: TKimiToken;
+      readonly accessToken: string;
+      readonly expiresAtMs: number | null;
+    }
+  | { readonly kind: "expired" }
+  | { readonly kind: "missing" };
+
+/** Stored access token only — never native-refreshes. Usage reads this. */
+const readStoredToken = async (): Promise<TStoredKimiToken> => {
   const tok = storeReadValue(await readJsonStore<TKimiToken>(credentialPath()));
   if (tok?.access_token === undefined || tok.access_token.length === 0) {
-    return null;
+    return { kind: "missing" };
   }
   const expiresAtMs =
     typeof tok.expires_at === "number" && tok.expires_at > 0
       ? tok.expires_at * 1000
       : null;
+  if (expiresAtMs !== null && expiresAtMs <= Date.now()) {
+    return { kind: "expired" };
+  }
+  return { kind: "live", tok, accessToken: tok.access_token, expiresAtMs };
+};
+
+/**
+ * The current access token from
+ * `<KIMI_CODE_HOME>/credentials/kimi-code.json`, triggering the CLI's native
+ * refresh when it's within the leeway of `expires_at`. Used by
+ * `credentialForUpstream` so inference carries a live token. Passive `status()`
+ * and `usage()` must not call this — they would refresh and provision model config.
+ */
+const readToken = async (): Promise<{ accessToken: string } | null> => {
+  const stored = await readStoredToken();
+  if (stored.kind === "missing") return null;
+  const tok =
+    stored.kind === "live"
+      ? stored.tok
+      : storeReadValue(await readJsonStore<TKimiToken>(credentialPath()));
+  if (tok?.access_token === undefined || tok.access_token.length === 0) {
+    return null;
+  }
+  const expiresAtMs =
+    stored.kind === "live"
+      ? stored.expiresAtMs
+      : typeof tok.expires_at === "number" && tok.expires_at > 0
+        ? tok.expires_at * 1000
+        : null;
   // Provision the managed model config from the native `/models` list WHILE the
   // token is still valid (the fetch needs a live token), so the near-expiry
   // `kimi -p` refresh has a model to run. Idempotent — a no-op once configured.
@@ -763,9 +796,12 @@ export const kimiCodeDelegate: TProviderDelegate = {
   },
 
   usage: async (): Promise<TProviderUsageSnapshot> => {
-    const token = await readToken();
-    if (token === null) {
+    const token = await readStoredToken();
+    if (token.kind === "missing") {
       return { kind: "unavailable", reason: "not signed in to Kimi CLI" };
+    }
+    if (token.kind === "expired") {
+      return { kind: "unavailable", reason: "credential_expired" };
     }
     try {
       const resp = await fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {

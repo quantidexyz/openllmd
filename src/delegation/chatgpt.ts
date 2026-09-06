@@ -182,6 +182,32 @@ export const resolveChatgptAccountId = (
   prior: Pick<TCodexTokens, "account_id">,
 ): string | null => resolved.account_id ?? prior.account_id ?? null;
 
+type TStoredChatgptToken =
+  | {
+      readonly kind: "live";
+      readonly accessToken: string;
+      readonly accountId: string | null;
+    }
+  | { readonly kind: "expired" }
+  | { readonly kind: "missing" };
+
+/** Stored access token only — never native-refreshes. Usage reads this. */
+const readStoredToken = async (): Promise<TStoredChatgptToken> => {
+  const tokens = storeReadValue(await loadStore())?.tokens;
+  if (tokens?.access_token === undefined || tokens.access_token.length === 0) {
+    return { kind: "missing" };
+  }
+  const expiresAtMs = jwtExpiryMs(tokens.access_token);
+  if (expiresAtMs !== null && expiresAtMs <= Date.now()) {
+    return { kind: "expired" };
+  }
+  return {
+    kind: "live",
+    accessToken: tokens.access_token,
+    accountId: tokens.account_id ?? null,
+  };
+};
+
 const readToken = async (): Promise<{
   accessToken: string;
   accountId: string | null;
@@ -444,9 +470,12 @@ export const chatgptDelegate: TProviderDelegate = {
   },
 
   usage: async (): Promise<TProviderUsageSnapshot> => {
-    const token = await readToken();
-    if (token === null) {
+    const token = await readStoredToken();
+    if (token.kind === "missing") {
       return { kind: "unavailable", reason: "not signed in to Codex" };
+    }
+    if (token.kind === "expired") {
+      return { kind: "unavailable", reason: "credential_expired" };
     }
     try {
       const resp = await fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {

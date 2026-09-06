@@ -242,10 +242,34 @@ const refresh = nativeRefresher({
   trigger: triggerRefresh,
 });
 
+type TStoredClaudeToken =
+  | {
+      readonly kind: "live";
+      readonly accessToken: string;
+      readonly expiresAtMs: number | null;
+    }
+  | { readonly kind: "expired" }
+  | { readonly kind: "missing" };
+
+/** Stored access token only — never native-refreshes. Usage reads this. */
+const readStoredToken = async (
+  signal?: AbortSignal,
+): Promise<TStoredClaudeToken> => {
+  const oauth = storeReadValue(await loadStore(signal))?.claudeAiOauth;
+  if (oauth?.accessToken === undefined || oauth.accessToken.length === 0) {
+    return { kind: "missing" };
+  }
+  const expiresAtMs = toEpochMs(oauth.expiresAt);
+  if (expiresAtMs !== null && expiresAtMs <= Date.now()) {
+    return { kind: "expired" };
+  }
+  return { kind: "live", accessToken: oauth.accessToken, expiresAtMs };
+};
+
 /**
  * The current access token, triggering the CLI's native refresh if it's within
- * the leeway of expiry. Used by `credentialForUpstream` (inference) and `usage`
- * so both carry a live token.
+ * the leeway of expiry. Used by `credentialForUpstream` (inference) so the
+ * request carries a live token. `usage()` uses {@link readStoredToken} instead.
  */
 const readToken = async (
   signal?: AbortSignal,
@@ -740,9 +764,12 @@ export const claudeCodeDelegate: TProviderDelegate = {
   },
 
   usage: async (): Promise<TProviderUsageSnapshot> => {
-    const token = await readToken();
-    if (token === null) {
+    const token = await readStoredToken();
+    if (token.kind === "missing") {
       return { kind: "unavailable", reason: "not signed in to Claude Code" };
+    }
+    if (token.kind === "expired") {
+      return { kind: "unavailable", reason: "credential_expired" };
     }
     try {
       const headers = {

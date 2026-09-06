@@ -659,7 +659,10 @@ the ~2.5s flow watcher, post-command) — only **peeks** the cache (`peekUsage`,
 never a vendor call); it attaches whatever was last fetched, or nothing. The
 **only** path that hits the vendor is the `refresh` command (`control-relay.ts`
 → `refreshUsage` in `status.ts`), and its two demand signals are the manual
-**"Refresh usage"** button and the **providers page mounting** for that device.
+**"Refresh usage"** button and a **one-shot providers-page mount** for that
+device when a connected provider still has no snapshot. Age-out of a cached
+snapshot is not a demand signal — `peekUsage` keeps serving the last good
+figures stamped `stale`.
 `cachedUsage(slug, () => delegate.usage())` still wraps that on-demand read in a
 TTL + back-off (at most once per few minutes — the quota windows are 5h/7d, so
 minute-level staleness is irrelevant — shared in-flight fetch, last-good
@@ -673,10 +676,12 @@ store snapshot (`present` / `absent` / `indeterminate`). They never call
 `codex doctor` / `kimi -p` / `grok models`, fetch `/models`, or write Kimi's
 managed `config.toml`. Expired-but-stored credentials stay `connected`; a
 read error stays `unknown` (`store_unreadable`) and is not collapsed to
-`credential_absent`. `readToken()` remains the demand path for inference,
-on-demand usage, and requested (refresh-capable) `listModels()`. Automatic
-catalog observation uses `discoverModels` instead and must not call
-`readToken()`.
+`credential_absent`. `readToken()` remains the demand path for inference and requested
+(refresh-capable) `listModels()`. `usage()` is a stored-credential read
+(`readStoredToken`) — an expired token yields `unavailable` /
+`credential_expired` and does not spawn a native refresh; the next real
+request refreshes. Automatic catalog observation uses `discoverModels`
+instead and must not call `readToken()`.
 
 **Claude / Cursor idle observations are reused while store identity is stable
 (`delegation/observation-cache.ts`).** Reuse is keyed by path + inode + mtime +
@@ -788,11 +793,12 @@ ORIGIN + default path per provider.
 **Token refresh is the CLI's own job (`delegation/refresh.ts`), on demand.** The
 daemon never refreshes a subscription token itself — no `grant_type=refresh_token`
 calls, no extracted or hardcoded token endpoint / client id. When a demand path
-(`credentialForUpstream`, usage, requested `listModels`) calls `readToken`, it
+(`credentialForUpstream`, requested `listModels`, login) calls `readToken`, it
 checks the stored access token's expiry and, when it's within the leeway window,
 TRIGGERS the official CLI's OWN native refresh: a bounded spawn whose side
 effect is the CLI refreshing + persisting its token to its own store. Passive
-`status()` must not take this path. Shared refresh producers are not cancelled
+`status()` and on-demand `usage()` must not take this path — usage reads the
+stored token only. Shared refresh producers are not cancelled
 because a status observer timed out.
 claude → a minimal `claude -p` query (the CLI refreshes mid-request); codex →
 `codex doctor` (its websocket-reachability check forces the proactive refresh —

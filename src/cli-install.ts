@@ -220,10 +220,29 @@ interface CliInstallCacheEntry {
   /** Wall-clock ms of the last real `--version` spawn (not a cache renewal) —
    *  gates the {@link CLI_VERSION_HARD_MAX_MS} forced re-probe. */
   readonly probedAt: number;
+  /**
+   * Internal only — not on {@link TCliInstallState}. True when the last spawn
+   * returned no parseable version (`runCapture` null / no semver match). Such
+   * an entry is still reusable while the binary signature is unchanged, so a
+   * timed-out `--version` does not re-spawn on every status tick.
+   */
+  readonly inconclusive: boolean;
+  /**
+   * TTL used for this entry. After a consecutive inconclusive probe this
+   * doubles (capped at {@link CLI_VERSION_HARD_MAX_MS}); a successful parse
+   * resets it to {@link CLI_INSTALL_STATE_TTL_MS}.
+   */
+  readonly ttlMs: number;
 }
 
 /** Per-provider cache of `cliInstallState` results. */
 const cliInstallStateCache = new Map<TCliProvider, CliInstallCacheEntry>();
+
+/** In-flight `cliInstallState` probes — overlapping callers share one spawn. */
+const cliInstallStateInFlight = new Map<
+  TCliProvider,
+  Promise<TCliInstallState>
+>();
 
 /**
  * Generation token to invalidate in-flight probes. Incremented on each clear
@@ -231,17 +250,37 @@ const cliInstallStateCache = new Map<TCliProvider, CliInstallCacheEntry>();
  */
 let cacheGeneration = 0;
 
+const writeCacheEntry = (
+  provider: TCliProvider,
+  generation: number,
+  entry: CliInstallCacheEntry,
+): void => {
+  if (generation === cacheGeneration) {
+    cliInstallStateCache.set(provider, entry);
+  }
+};
+
 /**
  * Clear the `cliInstallState` cache — used by tests that change
  * `OPENLLM_DAEMON_STATE_DIR` between calls, and after the isolated link is
  * re-pointed at a moved host binary (so the next read re-probes `--version`).
+ * Drops in-flight joiners so a post-clear caller does not share a pre-clear
+ * probe (the generation guard still discards that probe's cache write).
  */
 export const clearCliInstallStateCache = (): void => {
   cliInstallStateCache.clear();
+  cliInstallStateInFlight.clear();
   cacheGeneration++;
 };
 
-export const cliInstallState = async (
+const nextInconclusiveTtlMs = (
+  cached: CliInstallCacheEntry | undefined,
+): number => {
+  if (cached?.inconclusive !== true) return CLI_INSTALL_STATE_TTL_MS;
+  return Math.min(cached.ttlMs * 2, CLI_VERSION_HARD_MAX_MS);
+};
+
+const probeCliInstallState = async (
   provider: TCliProvider,
 ): Promise<TCliInstallState> => {
   const cached = cliInstallStateCache.get(provider);
@@ -256,15 +295,14 @@ export const cliInstallState = async (
     const host = hostCliCandidates(provider).find((c) => existsSync(c));
     if (host === undefined) {
       const result: TCliInstallState = { installed: false, version: null };
-      // Only write to cache if generation hasn't changed (cache not cleared).
-      if (generation === cacheGeneration) {
-        cliInstallStateCache.set(provider, {
-          result,
-          expiresAt: now + CLI_INSTALL_STATE_TTL_MS,
-          signature: null,
-          probedAt: now,
-        });
-      }
+      writeCacheEntry(provider, generation, {
+        result,
+        expiresAt: now + CLI_INSTALL_STATE_TTL_MS,
+        signature: null,
+        probedAt: now,
+        inconclusive: false,
+        ttlMs: CLI_INSTALL_STATE_TTL_MS,
+      });
       return result;
     }
     await linkIsolatedCli(provider, host);
@@ -279,15 +317,14 @@ export const cliInstallState = async (
   }
   const notInstalled: TCliInstallState = { installed: false, version: null };
   if (!existsSync(bin)) {
-    // Only write to cache if generation hasn't changed (cache not cleared).
-    if (generation === cacheGeneration) {
-      cliInstallStateCache.set(provider, {
-        result: notInstalled,
-        expiresAt: now + CLI_INSTALL_STATE_TTL_MS,
-        signature: null,
-        probedAt: now,
-      });
-    }
+    writeCacheEntry(provider, generation, {
+      result: notInstalled,
+      expiresAt: now + CLI_INSTALL_STATE_TTL_MS,
+      signature: null,
+      probedAt: now,
+      inconclusive: false,
+      ttlMs: CLI_INSTALL_STATE_TTL_MS,
+    });
     return notInstalled;
   }
 
@@ -297,20 +334,22 @@ export const cliInstallState = async (
   const signature = binarySignature(bin);
   const reusable =
     cached?.result.installed === true &&
-    cached.result.version !== null &&
+    (cached.result.version !== null || cached.inconclusive) &&
     signature !== null &&
     cached.signature === signature &&
     generation === cacheGeneration;
 
-  // TTL-fresh AND the binary hasn't changed AND we're within the hard-max
-  // staleness ceiling → serve the cached version untouched (the hot path).
-  if (
-    cached !== undefined &&
-    cached.expiresAt > now &&
-    reusable &&
-    now - cached.probedAt < CLI_VERSION_HARD_MAX_MS
-  ) {
-    return cached.result;
+  // TTL-fresh AND the binary hasn't changed. Successful versions also stay
+  // inside the hard-max staleness ceiling; inconclusive entries honour only
+  // their (backing-off) TTL — the hard-max is the cap on that TTL, not a
+  // second forced re-probe clock.
+  if (cached !== undefined && cached.expiresAt > now && reusable) {
+    if (
+      cached.inconclusive ||
+      now - cached.probedAt < CLI_VERSION_HARD_MAX_MS
+    ) {
+      return cached.result;
+    }
   }
 
   // Self-heal SIDECARS for installs whose main link predates sidecar linking
@@ -319,14 +358,22 @@ export const cliInstallState = async (
   linkSidecars(bin);
 
   // Past the TTL but the binary is unchanged AND still inside the hard-max
-  // window → reuse the version without re-spawning `--version`, just renewing
-  // the TTL. Keeps the probe CONFINED (sandbox-wrapped) off the hot path.
-  if (reusable && now - (cached?.probedAt ?? 0) < CLI_VERSION_HARD_MAX_MS) {
-    cliInstallStateCache.set(provider, {
+  // window → reuse a SUCCESSFUL version without re-spawning `--version`, just
+  // renewing the TTL. Inconclusive entries must re-spawn when their TTL
+  // expires (that is the backoff clock).
+  if (
+    reusable &&
+    cached !== undefined &&
+    !cached.inconclusive &&
+    now - cached.probedAt < CLI_VERSION_HARD_MAX_MS
+  ) {
+    writeCacheEntry(provider, generation, {
       result: cached.result,
       expiresAt: now + CLI_INSTALL_STATE_TTL_MS,
       signature,
       probedAt: cached.probedAt,
+      inconclusive: false,
+      ttlMs: CLI_INSTALL_STATE_TTL_MS,
     });
     return cached.result;
   }
@@ -340,15 +387,32 @@ export const cliInstallState = async (
     timeoutMs: cliVersionProbeTimeoutMs(),
   });
   const version = out?.match(/\d+\.\d+\.\d+/)?.[0] ?? null;
+  const inconclusive = version === null;
+  const ttlMs = inconclusive
+    ? nextInconclusiveTtlMs(cached)
+    : CLI_INSTALL_STATE_TTL_MS;
   const result: TCliInstallState = { installed: true, version };
-  // Only write to cache if generation hasn't changed (cache not cleared).
-  if (generation === cacheGeneration) {
-    cliInstallStateCache.set(provider, {
-      result,
-      expiresAt: now + CLI_INSTALL_STATE_TTL_MS,
-      signature,
-      probedAt: now,
-    });
-  }
+  writeCacheEntry(provider, generation, {
+    result,
+    expiresAt: now + ttlMs,
+    signature,
+    probedAt: now,
+    inconclusive,
+    ttlMs,
+  });
   return result;
+};
+
+export const cliInstallState = async (
+  provider: TCliProvider,
+): Promise<TCliInstallState> => {
+  const existing = cliInstallStateInFlight.get(provider);
+  if (existing !== undefined) return existing;
+  const pending = probeCliInstallState(provider).finally(() => {
+    if (cliInstallStateInFlight.get(provider) === pending) {
+      cliInstallStateInFlight.delete(provider);
+    }
+  });
+  cliInstallStateInFlight.set(provider, pending);
+  return pending;
 };

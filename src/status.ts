@@ -488,8 +488,9 @@ export const computeStatus = async (): Promise<TDaemonStatus> => {
 
 /**
  * On-demand usage read — the ONLY path that hits the vendor usage endpoint.
- * Driven by the `refresh` command (the manual "Refresh usage" button or the
- * providers page mounting for this device, via `control-relay.ts`). Fetches
+ * Driven by the `refresh` command (the manual "Refresh usage" button or a
+ * one-shot providers-page mount when usage is still missing, via
+ * `control-relay.ts`). Fetches
  * figures for every CONNECTED provider (or just `slug` when scoped) into the
  * usage cache; the status push that follows the command then carries them back
  * via `peekUsage`. RESPECTS each provider's TTL — `cachedUsage` serves a

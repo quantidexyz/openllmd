@@ -341,11 +341,12 @@ export const cachedUsage = async (
  * PASSIVE read — return this provider's cached usage snapshot WITHOUT ever
  * calling the vendor. `computeStatus()` uses this on every background status
  * push so a push never triggers a usage read (usage is on-demand only — see the
- * module header). Returns the last good figures (stamped `stale` past the
- * freshness window) while they're within {@link STALE_TTL_MS}, else the last
- * failure, else `null` when nothing has ever been fetched for this provider
- * (the daemon booted but no one has demanded usage yet) — the card then simply
- * shows no quota until a `refresh` populates it.
+ * module header). Returns the last good figures stamped `stale` once past the
+ * freshness window, including past {@link STALE_TTL_MS} (the card stays filled
+ * and honestly aged). With no good snapshot, returns the last failure, else
+ * `null` when nothing has ever been fetched for this provider (the daemon
+ * booted but no one has demanded usage yet) — the card then simply shows no
+ * quota until a `refresh` populates it.
  */
 export const peekUsage = (
   slug: string,
@@ -354,7 +355,7 @@ export const peekUsage = (
   const entry = cache.get(usageCacheKey(slug, accountHash));
   if (entry === undefined) return null;
   const now = Date.now();
-  if (entry.good !== null && now - entry.good.atMs < STALE_TTL_MS) {
+  if (entry.good !== null) {
     return stampStale(entry.good.snapshot, entry.good.atMs, now);
   }
   return entry.failure;
