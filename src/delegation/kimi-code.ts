@@ -99,7 +99,10 @@ const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 // CLI refreshes mid-request and persists it). No token endpoint or client id is
 // used for REFRESH; the constants above belong to the device-code LOGIN flow,
 // which the daemon must drive itself (kimi's only sign-in is the in-TUI /login).
-const REFRESH_LEEWAY_MS = 60_000;
+// Kimi access tokens live ~15 min; 5 min matches grok/chatgpt/cursor so the
+// background `kicked` window is a real share of that lifetime. Must stay
+// strictly above `REFRESH_COOLDOWN_MS` (30 s).
+const REFRESH_LEEWAY_MS = 5 * 60_000;
 
 const { bin, env } = cliLaunch(PROVIDER);
 const kimiHome = (): string => cliConfigDir(PROVIDER);
@@ -818,9 +821,14 @@ export const kimiCodeDelegate: TProviderDelegate = {
         // likely run out / is inactive, or the session needs a re-login.
         // 403 = the coding feature isn't available to this account.
         // 404 = the usage endpoint isn't enabled for this plan.
+        const hasRefreshToken =
+          token.tok.refresh_token !== undefined &&
+          token.tok.refresh_token.length > 0;
         const reason =
           resp.status === 401
-            ? "Kimi Code authorization was rejected — your subscription may be inactive or expired. Re-sign in via the Kimi CLI (/login)."
+            ? hasRefreshToken
+              ? "Kimi Code authorization was rejected — this machine could not refresh the sign-in. Try again."
+              : "Kimi Code authorization was rejected — your subscription may be inactive or expired. Re-sign in via the Kimi CLI (/login)."
             : resp.status === 403
               ? "No active Kimi Code subscription — your coding plan has run out or isn't enabled for this account."
               : resp.status === 404

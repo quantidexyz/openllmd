@@ -1,4 +1,7 @@
-import type { TCooldownReason } from "@openllmsh/protocol";
+import type {
+  TAuthRefreshCooldownReason,
+  TCooldownReason,
+} from "@openllmsh/protocol";
 import { cooldownPolicyFor } from "@openllmsh/protocol";
 
 /**
@@ -40,6 +43,8 @@ export type THopCooldownEntry = {
   readonly setterSessionKey: string | undefined;
   readonly setAtMs: number;
   readonly recoverAtMs: number | undefined;
+  /** Set when reason is `auth` and the mark came from a native-refresh miss. */
+  readonly authReasonCode?: TAuthRefreshCooldownReason;
 };
 
 const marks = new Map<string, THopCooldownEntry>();
@@ -90,12 +95,15 @@ export const markHopCooldown = (
   setterSessionKey?: string,
   recoverAtMs?: number,
   now: number = Date.now(),
+  authReasonCode?: TAuthRefreshCooldownReason,
 ): boolean => {
   const policy = cooldownPolicyFor(reason);
   if (policy.action !== "cool_and_advance") return false;
   const k = key(provider, modelId);
   const until = now + policy.ttlMs;
   const existing = marks.get(k);
+  const storedAuthReason =
+    reason === "auth" ? authReasonCode : existing?.authReasonCode;
   if (existing !== undefined && existing.untilMs > until) {
     // The existing mark expires later — never shorten it. But if the incoming
     // reason is non-transient and the stored one is transient, upgrade the
@@ -110,6 +118,9 @@ export const markHopCooldown = (
         setterSessionKey,
         setAtMs: now,
         recoverAtMs: mergeRecoverAt(existing.recoverAtMs, recoverAtMs, now),
+        ...(storedAuthReason !== undefined
+          ? { authReasonCode: storedAuthReason }
+          : {}),
       });
       return true;
     }
@@ -130,19 +141,26 @@ export const markHopCooldown = (
       setterSessionKey: existing.setterSessionKey,
       setAtMs: existing.setAtMs,
       recoverAtMs: mergeRecoverAt(existing.recoverAtMs, recoverAtMs, now),
+      ...(existing.authReasonCode !== undefined
+        ? { authReasonCode: existing.authReasonCode }
+        : {}),
     });
     return changed;
   }
   const unchanged =
     existing !== undefined &&
     existing.untilMs === until &&
-    existing.reason === reason;
+    existing.reason === reason &&
+    existing.authReasonCode === storedAuthReason;
   marks.set(k, {
     untilMs: until,
     reason,
     setterSessionKey,
     setAtMs: now,
     recoverAtMs: mergeRecoverAt(existing?.recoverAtMs, recoverAtMs, now),
+    ...(storedAuthReason !== undefined
+      ? { authReasonCode: storedAuthReason }
+      : {}),
   });
   return !unchanged;
 };
@@ -203,6 +221,7 @@ export const clearHopCooldowns = (): void => {
 export type TAuthCooldownForProvider = {
   readonly until_ms: number;
   readonly model_id: string;
+  readonly reason_code?: TAuthRefreshCooldownReason;
 };
 
 /**
@@ -231,7 +250,13 @@ export const authCooldownForProvider = (
       entry.untilMs > latest.until_ms ||
       (entry.untilMs === latest.until_ms && model_id < latest.model_id)
     ) {
-      latest = { until_ms: entry.untilMs, model_id };
+      latest = {
+        until_ms: entry.untilMs,
+        model_id,
+        ...(entry.authReasonCode !== undefined
+          ? { reason_code: entry.authReasonCode }
+          : {}),
+      };
     }
   }
   return latest;

@@ -156,6 +156,20 @@ const emptyKeychainCounters = (): TKeychainCounters => ({
 let keychainCounters = emptyKeychainCounters();
 let lastWatcherSnapshot = emptyKeychainCounters();
 
+let securitySpawnSetupHookForTests: (() => Promise<void> | void) | null = null;
+let lastSecurityTimerMsForTests: number | null = null;
+
+/** Test-only: run after `superviseSpawn`, before the child timeout is armed. */
+export const setSecuritySpawnSetupHookForTests = (
+  hook: (() => Promise<void> | void) | null,
+): void => {
+  securitySpawnSetupHookForTests = hook;
+};
+
+/** Test-only: delay passed to `setTimeout` for the last security child. */
+export const lastSecurityTimerMsForTestsSnapshot = (): number | null =>
+  lastSecurityTimerMsForTests;
+
 const cloneKeychainCounters = (
   counters: TKeychainCounters,
 ): TKeychainCounters => ({
@@ -313,6 +327,7 @@ const spawnSecurityNow = async (
   const laneWaitMs = Math.max(0, Date.now() - queuedAtMs);
   const remainingAtSpawn = budget.remainingMs();
   const configuredTimeoutMs = securitySpawnTimeoutMs();
+  const preSpawnMs = performance.now();
   try {
     const child = superviseSpawn(
       sandboxSpawnArgs(["security", ...argv], { probe: unwrapKeychainSpawn() }),
@@ -325,7 +340,11 @@ const spawnSecurityNow = async (
         env: { ...process.env, HOME: home },
       },
     );
+    if (securitySpawnSetupHookForTests !== null) {
+      await securitySpawnSetupHookForTests();
+    }
     const spawnedAtMs = performance.now();
+    const spawnSetupMs = spawnedAtMs - preSpawnMs;
     keychainCounters.attempts++;
     noteKeychainVerb(verb);
     const proc = child.subprocess;
@@ -357,9 +376,10 @@ const spawnSecurityNow = async (
       );
       void complete.catch(() => {});
       const timeout = new Promise<TSecurityOutcome>((resolve) => {
+        lastSecurityTimerMsForTests = remainingAtSpawn;
         timer = setTimeout(
           () => resolve({ kind: "timeout" }),
-          budget.remainingMs(),
+          remainingAtSpawn,
         );
       });
       const abortWait =
@@ -396,6 +416,7 @@ const spawnSecurityNow = async (
             configured_timeout_ms: configuredTimeoutMs,
             lane_wait_ms: laneWaitMs,
             budget_remaining_ms_at_spawn: remainingAtSpawn,
+            spawn_setup_ms: spawnSetupMs,
             spawn_elapsed_ms: performance.now() - spawnedAtMs,
             verb,
             child_pid: child.pid,
@@ -530,7 +551,10 @@ const invalidateUnlockSkip = (kc: string): void => {
 };
 
 const noteKeychainIoResult = (kc: string, res: TSecurityResult): void => {
-  if (res.timedOut || isInteractionNotAllowed(res.stderr)) {
+  // Timeouts stay `unknown` with observe/active backoff. Tear the skip only
+  // on a classified lock-state change (`-25308`); mtime/size drift is
+  // detected by `skipEligible` on the next call.
+  if (isInteractionNotAllowed(res.stderr)) {
     invalidateUnlockSkip(kc);
   }
 };
@@ -1079,7 +1103,6 @@ const ensureKeychainNow = async (
     return { kind: "indeterminate", cause: "keychain_unlock_transient" };
   }
   if (res.timedOut) {
-    invalidateUnlockSkip(kc);
     return noteTransientFailure(kc, "keychain_unlock_transient");
   }
 
@@ -1178,7 +1201,6 @@ const observeKeychainNow = async (
   if (res.aborted) {
     return { kind: "indeterminate", cause: "keychain_unlock_transient" };
   }
-  invalidateUnlockSkip(kc);
   return noteObserveTransientFailure(kc, "keychain_unlock_transient");
 };
 
@@ -1234,6 +1256,8 @@ export const resetKeychainStateForTests = (): void => {
   macosKeychainLane = Promise.resolve();
   keychainCounters = emptyKeychainCounters();
   lastWatcherSnapshot = emptyKeychainCounters();
+  securitySpawnSetupHookForTests = null;
+  lastSecurityTimerMsForTests = null;
 };
 
 /**

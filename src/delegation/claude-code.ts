@@ -92,6 +92,7 @@ import {
   readIsolatedKeychain,
   readJsonStore,
   runCapture,
+  runCaptureResult,
   STATUS_CHECK_FAILED_DETAIL,
   storeReadValue,
   toEpochMs,
@@ -100,6 +101,8 @@ import {
 
 const PROVIDER = "claude_code" as const;
 const KEYCHAIN_SERVICE = "Claude Code-credentials";
+/** Peer of the keychain lane (4s); below the 10s owner status budget. */
+const AUTH_STATUS_TIMEOUT_MS = 4_000;
 const OAUTH_BETA = "oauth-2025-04-20";
 // Usage endpoint LEAF path — the host is derived from the captured inference
 // endpoint (`resolveProviderUrl`), so a vendor host migration is auto-tracked.
@@ -331,9 +334,13 @@ type TClaudeStatusObservation = {
 const claudeStatusCache =
   createPassiveObservationCache<TClaudeStatusObservation>();
 
+type TAuthStatusProbe =
+  | { readonly kind: "timeout" }
+  | { readonly kind: "value"; readonly result: boolean | null };
+
 let authStatusInFlight: {
   readonly generation: number;
-  readonly work: Promise<boolean | null>;
+  readonly work: Promise<TAuthStatusProbe>;
 } | null = null;
 
 /**
@@ -358,13 +365,14 @@ export const clearAuthStatusCache = (): void => {
 type TAuthStatusWait =
   | { readonly kind: "aborted" }
   | { readonly kind: "invalidated" }
+  | { readonly kind: "timeout" }
   | { readonly kind: "value"; readonly result: boolean | null };
 
 const awaitAuthStatus = async (
-  work: Promise<boolean | null>,
+  work: Promise<TAuthStatusProbe>,
   signal?: AbortSignal,
 ): Promise<TAuthStatusWait> => {
-  if (signal === undefined) return { kind: "value", result: await work };
+  if (signal === undefined) return await work;
   if (signal.aborted) return { kind: "aborted" };
 
   let onAbort = (): void => {};
@@ -373,10 +381,7 @@ const awaitAuthStatus = async (
     signal.addEventListener("abort", onAbort, { once: true });
   });
   try {
-    const raced = await Promise.race([
-      work.then((result): TAuthStatusWait => ({ kind: "value", result })),
-      aborted,
-    ]);
+    const raced = await Promise.race([work, aborted]);
     return raced;
   } finally {
     signal.removeEventListener("abort", onAbort);
@@ -390,24 +395,26 @@ const authStatusLoggedIn = async (
   let flight = authStatusInFlight;
   if (flight === null || flight.generation !== generation) {
     if (signal?.aborted === true) return { kind: "aborted" };
-    const work = (async (): Promise<boolean | null> => {
+    const work = (async (): Promise<TAuthStatusProbe> => {
       // macOS securityd refuses keychain reads for a Seatbelt-confined caller,
       // so this shared producer is unconfined on macOS and bounded internally by
       // runCapture. Observer cancellation must not kill another status waiter's
       // probe.
-      const out = await runCapture([bin(), "auth", "status"], env(), {
+      const out = await runCaptureResult([bin(), "auth", "status"], env(), {
         probe: unwrapKeychainSpawn(PROVIDER),
+        timeoutMs: AUTH_STATUS_TIMEOUT_MS,
       });
-      if (out === null) return null;
+      if (out.kind === "timeout") return { kind: "timeout" };
+      if (out.kind !== "ok") return { kind: "value", result: null };
       try {
-        const parsed = JSON.parse(out) as {
+        const parsed = JSON.parse(out.text) as {
           loggedIn?: boolean;
           authMethod?: string;
         };
-        if (parsed.loggedIn !== true) return false;
-        return parsed.authMethod !== "api_key";
+        if (parsed.loggedIn !== true) return { kind: "value", result: false };
+        return { kind: "value", result: parsed.authMethod !== "api_key" };
       } catch {
-        return null;
+        return { kind: "value", result: null };
       }
     })();
     flight = { generation, work };
@@ -714,6 +721,16 @@ export const claudeCodeDelegate: TProviderDelegate = {
         provider: PROVIDER,
         status: "disconnected",
         ...unknownObservation("probe_failed"),
+        cli_installed: true,
+        ...(version !== null ? { cli_version: version } : {}),
+        detail: STATUS_CHECK_FAILED_DETAIL,
+      };
+    }
+    if (viaWait.kind === "timeout") {
+      return {
+        provider: PROVIDER,
+        status: "disconnected",
+        ...unknownObservation("probe_timeout"),
         cli_installed: true,
         ...(version !== null ? { cli_version: version } : {}),
         detail: STATUS_CHECK_FAILED_DETAIL,

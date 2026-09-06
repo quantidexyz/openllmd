@@ -184,6 +184,11 @@ import {
 } from "./config";
 import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
+import type { TRefreshErrorClass } from "./delegation/refresh";
+import {
+  authReasonCodeForRefreshError,
+  takeStaleRefreshReason,
+} from "./delegation/refresh";
 import type { TProviderDelegate } from "./delegation/types";
 import { stateDir } from "./env";
 import { forwardToCloud } from "./forward";
@@ -213,6 +218,8 @@ import {
 
 /** Test seam: how many immediate status pushes auth-cooldown marks requested. */
 let authCooldownStatusPushesForTests = 0;
+/** Active walk's session key so `acquireUpstream` can stamp cooldown provenance. */
+let currentWalkSessionKey: string | undefined;
 
 export const takeAuthCooldownStatusPushesForTests = (): number => {
   const n = authCooldownStatusPushesForTests;
@@ -933,17 +940,48 @@ const decodeUpstreamJson = (
  * `credentialForUpstream`). Returns "retry" when no usable local credential is
  * available, so the walker falls through.
  */
+const coolHopAfterStaleRefresh = (
+  hop: { readonly provider: string; readonly modelId: string },
+  errorClass: TRefreshErrorClass,
+  walkSessionKey?: string,
+): void => {
+  const authReasonCode = authReasonCodeForRefreshError(errorClass);
+  const changed = markHopCooldown(
+    hop.provider,
+    hop.modelId,
+    "auth",
+    walkSessionKey,
+    undefined,
+    Date.now(),
+    authReasonCode,
+  );
+  if (changed && isSubscriptionSlug(hop.provider)) {
+    getDelegate(hop.provider)?.invalidateStatusObservation?.();
+    authCooldownStatusPushesForTests += 1;
+    requestStatusPush();
+  }
+};
+
 export const acquireUpstream = async (
   provider: string,
   args: TWalkArgs,
+  hop?: { readonly provider: string; readonly modelId: string },
+  walkSessionKey?: string,
 ): Promise<
   | { headers: Record<string, string>; url: string; accountHash: string | null }
   | "retry"
 > => {
   const delegate = getDelegate(provider);
   if (delegate === null) return "retry";
+  const coolIfStale = (): boolean => {
+    const stale = takeStaleRefreshReason(provider);
+    if (stale === null) return false;
+    if (hop !== undefined) coolHopAfterStaleRefresh(hop, stale, walkSessionKey);
+    return true;
+  };
   try {
     const cred = await delegate.credentialForUpstream(args.req.headers);
+    if (coolIfStale()) return "retry";
     return {
       headers: {
         ...originatorHeadersFrom(args.req.headers),
@@ -956,6 +994,7 @@ export const acquireUpstream = async (
       accountHash: cred.account_hash ?? null,
     };
   } catch {
+    coolIfStale();
     return "retry";
   }
 };
@@ -1176,7 +1215,12 @@ const serveSubscription = async (
   finalHop: boolean,
   onQuotaExhausted?: (provider: string, accountHash: string | null) => void,
 ): Promise<THopServeOutcome> => {
-  const acquired = await acquireUpstream(hop.provider, args);
+  const acquired = await acquireUpstream(
+    hop.provider,
+    args,
+    hop,
+    currentWalkSessionKey,
+  );
   if (acquired === "retry") return hopRetry("no usable credential");
   const { headers: baseHeaders, url, accountHash } = acquired;
 
@@ -2380,6 +2424,7 @@ const walkPlan = async (
 ): Promise<Response> => {
   walkCounter += 1;
   const walkSessionKey = `walk-${walkCounter}`;
+  currentWalkSessionKey = walkSessionKey;
   const accountHashByProvider = new Map<string, string | null>();
   // Shared per-request cache of `delegate.status()` — the local auth gate and
   // the quota-account lookup both read through it so a hop pays status once.
@@ -3378,7 +3423,7 @@ export const runCountTokens = async (args: TWalkArgs): Promise<Response> => {
   if (UPSTREAM_WIRE[hop.provider] !== "anthropic") {
     return estimate(`${hop.provider} has no count_tokens endpoint`);
   }
-  const acquired = await acquireUpstream(hop.provider, args);
+  const acquired = await acquireUpstream(hop.provider, args, hop);
   if (acquired === "retry") {
     return estimate(`no usable ${hop.provider} credential`);
   }
@@ -3471,7 +3516,11 @@ export const runResponsesCompact = async (
   const compactHop = compactPlan
     .map((modelId, i) => resolveHop(modelId, compactPmids[i]))
     .find((h) => h.provider === "chatgpt");
-  const acquired = await acquireUpstream("chatgpt", args);
+  const acquired = await acquireUpstream(
+    "chatgpt",
+    args,
+    compactHop ?? { provider: "chatgpt", modelId: providerModelId },
+  );
   if (acquired === "retry") {
     return errorJson(
       502,

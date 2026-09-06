@@ -185,9 +185,15 @@ export const setCaptureCompleteHookForTests = (
   captureCompleteHookForTests = hook;
 };
 
+export type TRunCaptureResult =
+  | { readonly kind: "ok"; readonly text: string }
+  | { readonly kind: "timeout" }
+  | { readonly kind: "aborted" }
+  | { readonly kind: "failed" };
+
 /**
- * Run a command and capture trimmed stdout (best-effort). Returns null on
- * spawn failure, non-zero exit, or a timeout. stdin is ignored so it never
+ * Run a command and capture trimmed stdout. Distinguishes timeout from
+ * abort / non-zero / empty / spawn failure. stdin is ignored so it never
  * blocks. `env` is merged onto the parent env — used to run the isolated vendor
  * CLIs with their home pointed inside the OpenLLM dir.
  *
@@ -195,12 +201,12 @@ export const setCaptureCompleteHookForTests = (
  * the supervisor's process-group termination rather than `proc.kill()`: a
  * descendant holding the inherited stdout fd must be reaped for EOF to occur.
  */
-export const runCapture = async (
+export const runCaptureResult = async (
   argv: ReadonlyArray<string>,
   env?: Record<string, string>,
   opts?: TRunCaptureOpts,
-): Promise<string | null> => {
-  if (opts?.signal?.aborted === true) return null;
+): Promise<TRunCaptureResult> => {
+  if (opts?.signal?.aborted === true) return { kind: "aborted" };
   try {
     const command = spawnCommand(
       process.platform,
@@ -224,7 +230,7 @@ export const runCapture = async (
     const stdout = proc.stdout;
     if (stdout === undefined || typeof stdout === "number") {
       await child.terminate();
-      return null;
+      return { kind: "failed" };
     }
     const configuredTimeoutMs = captureTimeoutMs(opts?.timeoutMs);
     const parentBudget = budgetFromSignal(opts?.signal);
@@ -289,28 +295,41 @@ export const runCapture = async (
           argv: redactSensitiveArgv(argv),
         });
         await child.terminate(splitReapBudget(budget.remainingMs()));
-        return null;
+        return { kind: "timeout" };
       }
       if (outcome.kind === "aborted") {
         await child.terminate(splitReapBudget(budget.remainingMs()));
-        return null;
+        return { kind: "aborted" };
       }
       // `probe:true` runs UNWRAPPED — a signal death there is not a sandbox
       // denial (this was the mislabeled `--version` status-probe drain).
       logIfKilled(redactSensitiveArgv(argv), proc, {
         confined: opts?.probe !== true,
       });
-      if (outcome.code !== 0) return null;
+      if (outcome.code !== 0) return { kind: "failed" };
       const trimmed = outcome.out.trim();
-      return trimmed.length > 0 ? trimmed : null;
+      return trimmed.length > 0
+        ? { kind: "ok", text: trimmed }
+        : { kind: "failed" };
     } finally {
       unbind();
       unbindAbortWait();
       if (timer !== null) clearTimeout(timer);
     }
   } catch {
-    return null;
+    return { kind: "failed" };
   }
+};
+
+/** Run a command and capture trimmed stdout (best-effort). Returns null on
+ *  spawn failure, non-zero exit, abort, or a timeout. */
+export const runCapture = async (
+  argv: ReadonlyArray<string>,
+  env?: Record<string, string>,
+  opts?: TRunCaptureOpts,
+): Promise<string | null> => {
+  const result = await runCaptureResult(argv, env, opts);
+  return result.kind === "ok" ? result.text : null;
 };
 
 /** Run a binary's `--version` (best-effort). Returns null on failure.

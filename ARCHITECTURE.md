@@ -806,10 +806,17 @@ no inference); kimi → a minimal `kimi -p` query under a PTY (subscription mode
 The refresher (`makeRefresher`) fires in the BACKGROUND while the token is still
 valid — no hot-path stall — and only AWAITS the spawn once the token is
 hard-expired ("no latency unless the refresh is close"); single-flight per
-provider. Being the SINGLE refresher means claude's URL capture stays disabled
-and the old refresh-token rotation race is gone. (kimi's device-code LOGIN —
-which the daemon must drive, the CLI having only an in-TUI `/login` — keeps its
-public OAuth `client_id`/host; that is login infra, not refresh.)
+provider. A hard-expired refresh that the daemon itself killed (`abandoned` /
+`timeout`) or otherwise failed is a **local** miss: the walker cools the hop
+`upstream_auth_cooldown` with `refresh_abandoned` / `refresh_failed` *before*
+returning the stale token, so the request falls through the chain instead of
+spending a 401 to discover it. An expired token inside the failure-backoff
+window is the same typed stale (counted in `fallbacks`); a still-valid token
+in that window stays `"fresh"` and does not re-spawn. Being the SINGLE
+refresher means claude's URL capture stays disabled and the old refresh-token
+rotation race is gone. (kimi's device-code LOGIN — which the daemon must drive,
+the CLI having only an in-TUI `/login` — keeps its public OAuth
+`client_id`/host; that is login infra, not refresh.)
 
 The captured URL (+ `cli_version` and a TTL timestamp) persists to a per-provider
 `config.json` sidecar (`<cliRoot>/config.json`, plain JSON), version-keyed with a
@@ -841,8 +848,10 @@ connected/failed directly — the dashboard's Connect button stays in its
   `set-key-partition-list` after login keeps reads prompt-free. Passive
   `status()` reuses a determinate observation while keychain/file identity
   is unchanged (`observation-cache.ts`); it uses `observeKeychainReady`
-  (unlock-only, no create/repair) and does not call `readToken`. See
-  `delegation/util.ts` and `delegation/keychain.ts`.
+  (unlock-only, no create/repair) and does not call `readToken`. A timed-out
+  `claude auth status` returns unknown (`probe_timeout`) without a keychain
+  dump/find fallback; a parse failure or definite `loggedIn: false` still
+  consults the store. See `delegation/util.ts` and `delegation/keychain.ts`.
 - **chatgpt** — `codex login`; token at `<CODEX_HOME>/auth.json`. Passive
   `status()` reads that file once and does not run `codex doctor`.
 - **kimi_code** — the Kimi CLI has NO spawnable login (sign-in is the

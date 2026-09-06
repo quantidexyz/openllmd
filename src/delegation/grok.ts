@@ -604,10 +604,13 @@ export const parseGrokBilling = (body: unknown): TProviderUsageSnapshot =>
  * body parser so `parseGrokUsage` stays pure. */
 export const grokWeeklyUsageUnavailable = (
   status: number,
+  hasRefreshToken = false,
 ): TProviderUsageSnapshot => {
   const reason =
     status === 401
-      ? "Grok authorization was rejected — re-sign in via `grok login`."
+      ? hasRefreshToken
+        ? "Grok authorization was rejected — this machine could not refresh the sign-in. Try again."
+        : "Grok authorization was rejected — re-sign in via `grok login`."
       : status === 403
         ? "No active SuperGrok / X Premium+ subscription on this account."
         : status === 0
@@ -833,7 +836,10 @@ export const grokDelegate: TProviderDelegate = {
     ]);
 
     if ("error" in credits) {
-      return grokWeeklyUsageUnavailable(credits.error);
+      return grokWeeklyUsageUnavailable(
+        credits.error,
+        Boolean(token.session.refresh_token),
+      );
     }
 
     const snapshot = parseGrokUsage(

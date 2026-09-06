@@ -357,11 +357,33 @@ export const classifyRefreshError = (err: unknown): TRefreshErrorClass => {
 };
 
 const lastRefreshErrorClasses = new Map<string, TRefreshErrorClass | null>();
+const lastStaleReasons = new Map<string, TRefreshErrorClass>();
 
 /** In-memory result of the most recently settled refresh for one provider. */
 export const lastRefreshErrorClass = (
   provider: string,
 ): TRefreshErrorClass | null => lastRefreshErrorClasses.get(provider) ?? null;
+
+/**
+ * Consume the stale reason from the most recent `makeRefresher` call for
+ * this provider, if that call returned `{ kind: "stale" }`. The walker
+ * uses this to cool the hop BEFORE serving the expired token.
+ */
+export const takeStaleRefreshReason = (
+  provider: string,
+): TRefreshErrorClass | null => {
+  const reason = lastStaleReasons.get(provider);
+  if (reason === undefined) return null;
+  lastStaleReasons.delete(provider);
+  return reason;
+};
+
+export const authReasonCodeForRefreshError = (
+  errorClass: TRefreshErrorClass,
+): "refresh_abandoned" | "refresh_failed" =>
+  errorClass === "abandoned" || errorClass === "timeout"
+    ? "refresh_abandoned"
+    : "refresh_failed";
 
 const networkErrnoPattern =
   /\b(EHOSTUNREACH|ENETUNREACH|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET)\b/i;
@@ -517,10 +539,20 @@ export const makeRefresher = (opts: {
     }
     return inFlight;
   };
+  const noteStale = (reason: TRefreshErrorClass): TRefreshOutcome => {
+    lastStaleReasons.set(opts.slug, reason);
+    return { kind: "stale", reason };
+  };
+  const noteLive = (
+    outcome: Exclude<TRefreshOutcome, { kind: "stale" }>,
+  ): TRefreshOutcome => {
+    lastStaleReasons.delete(opts.slug);
+    return outcome;
+  };
   return async (expiresAtMs) => {
-    if (expiresAtMs === null) return "fresh";
+    if (expiresAtMs === null) return noteLive("fresh");
     const remaining = expiresAtMs - Date.now();
-    if (remaining >= opts.leewayMs) return "fresh";
+    if (remaining >= opts.leewayMs) return noteLive("fresh");
     // A recent spawn already gathered current info — don't spawn again until the
     // cooldown lapses. Serving the current token for at most `cooldownMs` is the
     // right backoff; it never serves a WORSE token than one spawn ago.
@@ -532,7 +564,7 @@ export const makeRefresher = (opts: {
         phase: "refresh_skipped",
         reason: "cooldown",
       });
-      return "fresh";
+      return noteLive("fresh");
     }
     if (now < failureBackoffUntil) {
       counterFor(opts.slug).backoff_skips++;
@@ -541,26 +573,23 @@ export const makeRefresher = (opts: {
         phase: "refresh_skipped",
         reason: "failure_backoff",
       });
-      // NOTE: an expired credential inside the failure-backoff window returns
-      // "fresh" (serve the current token, don't re-spawn) rather than a stale
-      // outcome. This is deliberate — see `refresh-cooldown.test.ts` "cooldown
-      // holds after a FAILED trigger too": re-spawning on every periodic status observation
-      // would hammer a broken refresh. A CodeRabbit nitpick suggested returning
-      // stale here; not adopted, as it changes tested backoff behavior and
-      // borders the deferred Stage-8 persistence-aware predicate.
-      return "fresh";
+      // Still-valid token: serve it, do not re-spawn. Hard-expired: typed stale
+      // so the walker cools the hop instead of spending the request on a 401.
+      if (remaining > 0 || lastErrorClass === null) return noteLive("fresh");
+      counterFor(opts.slug).fallbacks++;
+      return noteStale(lastErrorClass);
     }
     if (remaining > 0) {
       void fire();
-      return "kicked";
+      return noteLive("kicked");
     }
     await fire();
     if (lastErrorClass !== null) {
       // The caller will serve the stale credential — count it centrally so no
       // delegate has to remember to (they all log `refresh_fallback` already).
       counterFor(opts.slug).fallbacks++;
-      return { kind: "stale", reason: lastErrorClass };
+      return noteStale(lastErrorClass);
     }
-    return "awaited";
+    return noteLive("awaited");
   };
 };
