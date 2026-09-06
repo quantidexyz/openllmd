@@ -126,21 +126,65 @@ export const sseResponseForClient = (
   );
 
 /**
+ * Client body cancel (Ctrl-C / reader.cancel). `name` stays `AbortError` for
+ * DOM abort compatibility; `clientHangUp` / `code` distinguish it from an
+ * upstream AbortError that must still be recorded as a provider failure.
+ */
+export class ClientHangUpError extends Error {
+  readonly clientHangUp = true as const;
+  readonly code = "client_hang_up" as const;
+
+  constructor(reason?: unknown) {
+    super(
+      reason === undefined || reason === ""
+        ? "The operation was aborted."
+        : reason instanceof Error
+          ? reason.message
+          : String(reason),
+    );
+    this.name = "AbortError";
+    if (reason instanceof Error) this.cause = reason;
+  }
+}
+
+const isHangUpMarker = (value: unknown): boolean =>
+  value instanceof ClientHangUpError ||
+  (typeof value === "object" &&
+    value !== null &&
+    (("clientHangUp" in value &&
+      (value as { clientHangUp: unknown }).clientHangUp === true) ||
+      ("code" in value &&
+        (value as { code: unknown }).code === "client_hang_up")));
+
+/**
+ * True when `err` (or anything on its `.cause` chain) is a client hang-up.
+ * Accumulators wrap the cancel reason; walking the chain is the single check
+ * both the walker and native serve use.
+ */
+export const isClientHangUp = (err: unknown): boolean => {
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  while (current !== undefined && current !== null && !seen.has(current)) {
+    seen.add(current);
+    if (isHangUpMarker(current)) return true;
+    current =
+      current instanceof Error
+        ? current.cause
+        : typeof current === "object" && "cause" in current
+          ? (current as { cause: unknown }).cause
+          : undefined;
+  }
+  return false;
+};
+
+/**
  * Deliver a COMMITTED canonical chunk stream to a STREAMING client: tee →
  * meter one branch (accumulate → `onResponse`/`onError`, never blocking the
  * client) → re-encode the other onto the client wire with the frame-aligned
  * heartbeat and the shared SSE headers.
  */
-const abortReason = (reason: unknown): Error => {
-  if (reason instanceof Error && reason.name === "AbortError") return reason;
-  const err = new Error(
-    reason === undefined || reason === ""
-      ? "The operation was aborted."
-      : String(reason),
-  );
-  err.name = "AbortError";
-  return err;
-};
+const hangUpReason = (reason: unknown): ClientHangUpError =>
+  reason instanceof ClientHangUpError ? reason : new ClientHangUpError(reason);
 
 const viewOfReader = (
   reader: ReadableStreamDefaultReader<TChatCompletionChunk>,
@@ -175,7 +219,7 @@ export const deliverChunkStream = (
   const cancelTee = (reason: unknown): void => {
     if (teeCancelled) return;
     teeCancelled = true;
-    const abort = abortReason(reason);
+    const abort = hangUpReason(reason);
     void clientReader.cancel(abort).catch(() => {});
     void meterReader.cancel(abort).catch(() => {});
   };

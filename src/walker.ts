@@ -170,6 +170,7 @@ import {
   deliverChunkStream,
   deliverJsonResponse,
   heartbeatOptionsFor,
+  isClientHangUp,
   sseResponseForClient,
 } from "./client-encode";
 import { recordRequest } from "./cloud-client";
@@ -1419,23 +1420,13 @@ const serveSubscription = async (
    * only the zero token count as a hint). The client has already received a
    * 200 and partial bytes; this row is the only record that it broke.
    *
-   * A CLIENT abort is excluded. The upstream fetch is wired to
-   * `args.req.signal`, so a client hanging up mid-stream (Ctrl-C on a long
-   * turn — routine) rejects this same meter branch with an AbortError. That is
-   * terminal but NOT an upstream fault, and recording it as one would poison
-   * the very provider-health data this row exists to make trustworthy. Same
-   * rule the neighbouring decisions already apply (the pre-commit 499,
-   * `peekedError`, `refusalWalks`): an aborted request writes no failure row.
+   * A CLIENT abort is excluded: `args.req.signal.aborted` or
+   * {@link isClientHangUp} (the marker `cancelTee` stamps on body cancel).
+   * A plain upstream AbortError is still a provider failure and IS recorded.
    */
   const recordStreamFailure = (err: unknown): void => {
     if (args.req.signal.aborted) return;
-    const cause = streamFailureCause(err);
-    const abortNamed = (value: unknown): boolean =>
-      typeof value === "object" &&
-      value !== null &&
-      "name" in value &&
-      (value as { name: unknown }).name === "AbortError";
-    if (abortNamed(err) || abortNamed(cause)) return;
+    if (isClientHangUp(err)) return;
     report(
       {
         ...baseRow,

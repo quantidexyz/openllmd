@@ -26,7 +26,11 @@ import { accumulateChunksToResponse } from "@openllmsh/wire/lib/streaming/accumu
 import { partialUsageFrom } from "@openllmsh/wire/lib/streaming/upstream-error";
 import { clientWireOf } from "@openllmsh/wire/providers/upstream-request";
 import { cliBin, cliEnv } from "../cli-paths";
-import { deliverChunkStream, deliverJsonResponse } from "../client-encode";
+import {
+  deliverChunkStream,
+  deliverJsonResponse,
+  isClientHangUp,
+} from "../client-encode";
 import { planSigningKey } from "../config";
 import { errorJson } from "../cors";
 import { daemonApiKeyId } from "../env";
@@ -400,6 +404,10 @@ export const tryServeNativeRuntime = async (
     );
   };
   const fail = (err: unknown): void => {
+    if (params.signal.aborted || isClientHangUp(err)) {
+      lease.abandon();
+      return;
+    }
     const usage = partialUsageFrom(err);
     params.record(
       usage === null ? ZERO_TOKENS : tokensFromResponse({ usage }),
@@ -490,6 +498,7 @@ const serveCursorHop = async (
     params.record(tokensFromResponse(resp), "success");
   };
   const fail = (err: unknown): void => {
+    if (params.signal.aborted || isClientHangUp(err)) return;
     const usage = partialUsageFrom(err);
     params.record(
       usage === null ? ZERO_TOKENS : tokensFromResponse({ usage }),
