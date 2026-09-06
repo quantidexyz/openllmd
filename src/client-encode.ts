@@ -189,11 +189,21 @@ const hangUpReason = (reason: unknown): ClientHangUpError =>
 const viewOfReader = (
   reader: ReadableStreamDefaultReader<TChatCompletionChunk>,
   onCancel?: (reason: unknown) => void,
+  /** Why the tee was torn down, if it was. A cancelled reader resolves its
+   *  pending read as `done`, indistinguishable from a clean upstream close —
+   *  so the view REJECTS with this instead, or the meter would "settle" a
+   *  turn the client hung up on (the native path would commit the session). */
+  cancellationReason?: () => ClientHangUpError | undefined,
 ): ReadableStream<TChatCompletionChunk> =>
   new ReadableStream<TChatCompletionChunk>({
     async pull(controller) {
       const result = await reader.read();
       if (result.done) {
+        const reason = cancellationReason?.();
+        if (reason !== undefined) {
+          controller.error(reason);
+          return;
+        }
         controller.close();
         return;
       }
@@ -215,16 +225,15 @@ export const deliverChunkStream = (
   const [toClient, toMeter] = chunks.tee();
   const clientReader = toClient.getReader();
   const meterReader = toMeter.getReader();
-  let teeCancelled = false;
+  let teeCancelReason: ClientHangUpError | undefined;
   const cancelTee = (reason: unknown): void => {
-    if (teeCancelled) return;
-    teeCancelled = true;
-    const abort = hangUpReason(reason);
-    void clientReader.cancel(abort).catch(() => {});
-    void meterReader.cancel(abort).catch(() => {});
+    if (teeCancelReason !== undefined) return;
+    teeCancelReason = hangUpReason(reason);
+    void clientReader.cancel(teeCancelReason).catch(() => {});
+    void meterReader.cancel(teeCancelReason).catch(() => {});
   };
   void accumulateChunksToResponse(
-    viewOfReader(meterReader),
+    viewOfReader(meterReader, undefined, () => teeCancelReason),
     params.providerModelId,
   )
     .then(params.onResponse)
