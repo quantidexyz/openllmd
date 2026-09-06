@@ -19,6 +19,7 @@ import { getDelegate, isSubscriptionSlug } from "./delegation";
 import { logWarn } from "./logger";
 import type { TWalkArgs } from "./walker";
 import {
+  coolHopAfterStaleRefresh,
   parsePlan,
   passthroughHeaders,
   planSignatureOk,
@@ -43,14 +44,20 @@ type TXaiVideoStatus = {
   readonly error?: { readonly message?: unknown } | string;
 };
 
-const acquireVideoUpstream = async (
+export const acquireVideoUpstream = async (
   provider: string,
   args: TWalkArgs,
+  hop: { readonly provider: string; readonly modelId: string },
+  walkSessionKey?: string,
 ): Promise<TVideoUpstream | "retry"> => {
   const delegate = getDelegate(provider);
   if (delegate?.credentialForVideo === undefined) return "retry";
   try {
     const cred = await delegate.credentialForVideo(args.req.headers);
+    if (cred.stale_refresh !== undefined) {
+      coolHopAfterStaleRefresh(hop, cred.stale_refresh, walkSessionKey);
+      return "retry";
+    }
     return {
       headers: {
         ...originatorHeadersFrom(args.req.headers),
@@ -293,7 +300,7 @@ export const runVideoCreate = async (args: TWalkArgs): Promise<Response> => {
       "No subscription video provider in the daemon plan can serve this request",
     );
   }
-  const upstream = await acquireVideoUpstream(hop.provider, args);
+  const upstream = await acquireVideoUpstream(hop.provider, args, hop);
   if (upstream === "retry") {
     return errorJson(404, `No video credential available for ${hop.provider}`);
   }
@@ -384,7 +391,7 @@ export const runVideoPoll = async (
   const hop = videoHop(args);
   if (hop === undefined)
     return errorJson(404, "No subscription video provider available");
-  const upstream = await acquireVideoUpstream(hop.provider, args);
+  const upstream = await acquireVideoUpstream(hop.provider, args, hop);
   if (upstream === "retry")
     return errorJson(404, `No video credential available for ${hop.provider}`);
   const status = await getStatus(args, upstream, payload);
@@ -415,7 +422,7 @@ export const runVideoContent = async (
   const hop = videoHop(args);
   if (hop === undefined)
     return errorJson(404, "No subscription video provider available");
-  const upstream = await acquireVideoUpstream(hop.provider, args);
+  const upstream = await acquireVideoUpstream(hop.provider, args, hop);
   if (upstream === "retry")
     return errorJson(404, `No video credential available for ${hop.provider}`);
   const status = await getStatus(args, upstream, payload);
@@ -519,7 +526,7 @@ export const runVideoCancel = async (
   if (payload instanceof Response) return payload;
   const hop = videoHop(args);
   if (hop !== undefined) {
-    const upstream = await acquireVideoUpstream(hop.provider, args);
+    const upstream = await acquireVideoUpstream(hop.provider, args, hop);
     if (upstream !== "retry") {
       await fetch(`${upstream.url}/videos/${encodeURIComponent(payload.u)}`, {
         method: "DELETE",

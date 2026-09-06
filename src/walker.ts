@@ -935,7 +935,7 @@ const decodeUpstreamJson = (
  * `credentialForUpstream`). Returns "retry" when no usable local credential is
  * available, so the walker falls through.
  */
-const coolHopAfterStaleRefresh = (
+export const coolHopAfterStaleRefresh = (
   hop: { readonly provider: string; readonly modelId: string },
   errorClass: TRefreshErrorClass,
   walkSessionKey?: string,

@@ -375,13 +375,20 @@ const spawnSecurityNow = async (
         }),
       );
       void complete.catch(() => {});
-      const timeout = new Promise<TSecurityOutcome>((resolve) => {
-        lastSecurityTimerMsForTests = remainingAtSpawn;
-        timer = setTimeout(
-          () => resolve({ kind: "timeout" }),
-          remainingAtSpawn,
-        );
-      });
+      // Setup (Bun.spawn + test hook) is part of the absolute 4 s budget.
+      // Arm from remaining *after* spawn so a slow spawn cannot extend the
+      // deadline. Pre-spawn remaining stays in telemetry only.
+      const remainingAfterSpawn = budget.remainingMs();
+      lastSecurityTimerMsForTests = remainingAfterSpawn;
+      const timeout =
+        remainingAfterSpawn === 0
+          ? Promise.resolve<TSecurityOutcome>({ kind: "timeout" })
+          : new Promise<TSecurityOutcome>((resolve) => {
+              timer = setTimeout(
+                () => resolve({ kind: "timeout" }),
+                remainingAfterSpawn,
+              );
+            });
       const abortWait =
         opts.signal === undefined
           ? null

@@ -27,8 +27,8 @@ export type TImageCredential = {
   readonly url: string;
   readonly account_hash?: string;
   /**
-   * Set when the native refresh settled stale; the walker cools the hop
-   * instead of serving the expired token. Image paths ignore it.
+   * Set when the native refresh settled stale; image and video walkers cool
+   * the hop instead of serving the expired token, matching chat.
    */
   readonly stale_refresh?: TRefreshErrorClass;
 };

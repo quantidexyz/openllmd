@@ -15,6 +15,7 @@ import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
 import type { TWalkArgs } from "./walker";
 import {
+  coolHopAfterStaleRefresh,
   parsePlan,
   passthroughHeaders,
   planSignatureOk,
@@ -90,14 +91,20 @@ const persistImageDataItem = async (
   };
 };
 
-const acquireImageUpstream = async (
+export const acquireImageUpstream = async (
   provider: string,
   args: TWalkArgs,
+  hop: { readonly provider: string; readonly modelId: string },
+  walkSessionKey?: string,
 ): Promise<TImageUpstream | "retry"> => {
   const delegate = getDelegate(provider);
   if (delegate?.credentialForImage === undefined) return "retry";
   try {
     const cred = await delegate.credentialForImage(args.req.headers);
+    if (cred.stale_refresh !== undefined) {
+      coolHopAfterStaleRefresh(hop, cred.stale_refresh, walkSessionKey);
+      return "retry";
+    }
     return {
       headers: {
         ...originatorHeadersFrom(args.req.headers),
@@ -218,7 +225,7 @@ export const runImageWalker = async (args: TWalkArgs): Promise<Response> => {
     );
   }
 
-  const acquired = await acquireImageUpstream(hop.provider, args);
+  const acquired = await acquireImageUpstream(hop.provider, args, hop);
   if (acquired === "retry") {
     return errorJson(404, `No image credential available for ${hop.provider}`);
   }
