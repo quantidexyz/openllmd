@@ -230,7 +230,9 @@ interface CliInstallCacheEntry {
   /**
    * TTL used for this entry. After a consecutive inconclusive probe this
    * doubles (capped at {@link CLI_VERSION_HARD_MAX_MS}); a successful parse
-   * resets it to {@link CLI_INSTALL_STATE_TTL_MS}.
+   * resets it to {@link CLI_INSTALL_STATE_TTL_MS}. The initial inconclusive TTL
+   * is also `min(base, hard-max)` so a configured hard-max below the base
+   * never lets the first cache window overshoot.
    */
   readonly ttlMs: number;
 }
@@ -276,7 +278,9 @@ export const clearCliInstallStateCache = (): void => {
 const nextInconclusiveTtlMs = (
   cached: CliInstallCacheEntry | undefined,
 ): number => {
-  if (cached?.inconclusive !== true) return CLI_INSTALL_STATE_TTL_MS;
+  if (cached?.inconclusive !== true) {
+    return Math.min(CLI_INSTALL_STATE_TTL_MS, CLI_VERSION_HARD_MAX_MS);
+  }
   return Math.min(cached.ttlMs * 2, CLI_VERSION_HARD_MAX_MS);
 };
 

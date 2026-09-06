@@ -611,13 +611,10 @@ export const parseGrokBilling = (body: unknown): TProviderUsageSnapshot =>
  * body parser so `parseGrokUsage` stays pure. */
 export const grokWeeklyUsageUnavailable = (
   status: number,
-  hasRefreshToken = false,
 ): TProviderUsageSnapshot => {
   const reason =
     status === 401
-      ? hasRefreshToken
-        ? "Grok authorization was rejected — this machine could not refresh the sign-in. Try again."
-        : "Grok authorization was rejected — re-sign in via `grok login`."
+      ? "Grok authorization was rejected — re-sign in via `grok login`."
       : status === 403
         ? "No active SuperGrok / X Premium+ subscription on this account."
         : status === 0
@@ -844,10 +841,7 @@ export const grokDelegate: TProviderDelegate = {
       ]);
 
       if ("error" in credits) {
-        return grokWeeklyUsageUnavailable(
-          credits.error,
-          Boolean(token.session.refresh_token),
-        );
+        return grokWeeklyUsageUnavailable(credits.error);
       }
 
       const snapshot = parseGrokUsage(
@@ -861,16 +855,19 @@ export const grokDelegate: TProviderDelegate = {
         : { ...snapshot, plan, plan_source: "private-client" };
     }),
 
-  listModels: () =>
-    withRefreshCaller("models", async () => {
-      // Live `/v1/models` rows via the shared cached fetch (both Grok Build
-      // models report `api_backend` through it). Metadata only; null on any
-      // failure (never an empty list).
-      const rows = await modelRows();
-      if (rows === null) return null;
-      const entries = parseGrokModelRows(rows);
-      return entries.length > 0 ? entries : null;
-    }),
+  listModels: (): ReturnType<NonNullable<TProviderDelegate["listModels"]>> =>
+    withRefreshCaller(
+      "models",
+      async (): ReturnType<NonNullable<TProviderDelegate["listModels"]>> => {
+        // Live `/v1/models` rows via the shared cached fetch (both Grok Build
+        // models report `api_backend` through it). Metadata only; null on any
+        // failure (never an empty list).
+        const rows = await modelRows();
+        if (rows === null) return null;
+        const entries = parseGrokModelRows(rows);
+        return entries.length > 0 ? entries : null;
+      },
+    ),
 
   discoverModels: async (
     options: TModelDiscoveryOptions,
@@ -918,18 +915,23 @@ export const grokDelegate: TProviderDelegate = {
   // them recursively from every tool's `parameters`.
   unsupportedToolSchemaKeywords: ["minContains", "maxContains"],
 
-  credentialForUpstream: () =>
-    withRefreshCaller("upstream", async () => {
-      // cli-chat-proxy.grok.com's 426 gate requires `x-grok-client-version`, so
-      // `grokClientCredential` supplies the installed CLI's REAL version — but we
-      // identify as ourselves (`user-agent: openllm/<ver>`) and do NOT send
-      // `x-grok-client-identifier`; we are not the Grok CLI. The Responses TARGET
-      // URL is captured/default per-hop; the originator's other headers ride through.
-      return {
-        ...(await grokClientCredential()),
-        url: await resolveUpstreamUrl(PROVIDER),
-      };
-    }),
+  credentialForUpstream: (): ReturnType<
+    TProviderDelegate["credentialForUpstream"]
+  > =>
+    withRefreshCaller(
+      "upstream",
+      async (): ReturnType<TProviderDelegate["credentialForUpstream"]> => {
+        // cli-chat-proxy.grok.com's 426 gate requires `x-grok-client-version`, so
+        // `grokClientCredential` supplies the installed CLI's REAL version — but we
+        // identify as ourselves (`user-agent: openllm/<ver>`) and do NOT send
+        // `x-grok-client-identifier`; we are not the Grok CLI. The Responses TARGET
+        // URL is captured/default per-hop; the originator's other headers ride through.
+        return {
+          ...(await grokClientCredential()),
+          url: await resolveUpstreamUrl(PROVIDER),
+        };
+      },
+    ),
 
   credentialForImage: (): Promise<TImageCredential> =>
     withRefreshCaller(
@@ -940,11 +942,18 @@ export const grokDelegate: TProviderDelegate = {
       }),
     ),
 
-  credentialForVideo: () =>
-    withRefreshCaller("upstream", async () => ({
-      ...(await grokClientCredential()),
-      url: GROK_VIDEO_BASE,
-    })),
+  credentialForVideo: (): ReturnType<
+    NonNullable<TProviderDelegate["credentialForVideo"]>
+  > =>
+    withRefreshCaller(
+      "upstream",
+      async (): ReturnType<
+        NonNullable<TProviderDelegate["credentialForVideo"]>
+      > => ({
+        ...(await grokClientCredential()),
+        url: GROK_VIDEO_BASE,
+      }),
+    ),
 
   logout: async () => {
     // `grok logout` clears the cached credentials; then ensure the isolated
