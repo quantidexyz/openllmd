@@ -58,6 +58,7 @@ import {
 import type { TDeviceAuth, TDevicePoll } from "./login-direct";
 import { makeDeviceCodeConnect } from "./login-direct";
 import { makeCancelConnect } from "./login-flow";
+import type { TRefreshErrorClass } from "./refresh";
 import {
   credentialUnrefreshable,
   isStaleRefresh,
@@ -287,7 +288,10 @@ const readStoredToken = async (): Promise<TStoredKimiToken> => {
  * `credentialForUpstream` so inference carries a live token. Passive `status()`
  * and `usage()` must not call this — they would refresh and provision model config.
  */
-const readToken = async (): Promise<{ accessToken: string } | null> => {
+const readToken = async (): Promise<{
+  accessToken: string;
+  staleRefresh?: TRefreshErrorClass;
+} | null> => {
   const stored = await readStoredToken();
   if (stored.kind === "missing") return null;
   const tok =
@@ -321,7 +325,7 @@ const readToken = async (): Promise<{ accessToken: string } | null> => {
       phase: "refresh_fallback",
       error_class: outcome.reason,
     });
-    return { accessToken: tok.access_token };
+    return { accessToken: tok.access_token, staleRefresh: outcome.reason };
   }
   if (outcome !== "awaited") {
     return { accessToken: tok.access_token };
@@ -936,6 +940,9 @@ export const kimiCodeDelegate: TProviderDelegate = {
         url,
         // Which account this hop's cost attributes to (recorded on the row).
         ...accountHashField(PROVIDER, jwtClaims(token.accessToken)?.user_id),
+        ...(token.staleRefresh !== undefined
+          ? { stale_refresh: token.staleRefresh }
+          : {}),
       };
     }),
 

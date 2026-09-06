@@ -50,6 +50,7 @@ import {
 import { jwtExpiryMs } from "./jwt";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
+import type { TRefreshErrorClass } from "./refresh";
 import {
   credentialUnrefreshable,
   isStaleRefresh,
@@ -212,6 +213,7 @@ const readStoredToken = async (): Promise<TStoredChatgptToken> => {
 const readToken = async (): Promise<{
   accessToken: string;
   accountId: string | null;
+  staleRefresh?: TRefreshErrorClass;
 } | null> => {
   const tokens = storeReadValue(await loadStore())?.tokens;
   if (tokens?.access_token === undefined || tokens.access_token.length === 0) {
@@ -231,6 +233,7 @@ const readToken = async (): Promise<{
     return {
       accessToken: tokens.access_token,
       accountId: tokens.account_id ?? null,
+      staleRefresh: outcome.reason,
     };
   }
   if (outcome !== "awaited") {
@@ -645,6 +648,9 @@ export const chatgptDelegate: TProviderDelegate = {
         ...(token.accountId !== null
           ? { account_hash: accountHash(PROVIDER, token.accountId) }
           : {}),
+        ...(token.staleRefresh !== undefined
+          ? { stale_refresh: token.staleRefresh }
+          : {}),
       };
     }),
 
@@ -676,6 +682,9 @@ export const chatgptDelegate: TProviderDelegate = {
         access_token: token.accessToken,
         headers,
         url,
+        ...(token.staleRefresh !== undefined
+          ? { stale_refresh: token.staleRefresh }
+          : {}),
         ...(token.accountId !== null
           ? { account_hash: accountHash(PROVIDER, token.accountId) }
           : {}),

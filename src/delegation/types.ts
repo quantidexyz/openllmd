@@ -3,6 +3,7 @@ import type {
   TProviderModelEntry,
   TProviderUsageSnapshot,
 } from "@openllmsh/protocol";
+import type { TRefreshErrorClass } from "./refresh";
 
 /**
  * A provider delegate wraps ONE official vendor CLI (Claude Code, Codex,
@@ -25,6 +26,11 @@ export type TImageCredential = {
   readonly headers: Readonly<Record<string, string>>;
   readonly url: string;
   readonly account_hash?: string;
+  /**
+   * Set when the native refresh settled stale; the walker cools the hop
+   * instead of serving the expired token. Image paths ignore it.
+   */
+  readonly stale_refresh?: TRefreshErrorClass;
 };
 
 /**
@@ -219,6 +225,11 @@ export type TProviderDelegate = {
      * unreadable.
      */
     readonly account_hash?: string;
+    /**
+     * Present when `readToken` kept an expired token after a stale native
+     * refresh. The walker cools the hop BEFORE any upstream fetch.
+     */
+    readonly stale_refresh?: TRefreshErrorClass;
   }>;
 
   /**

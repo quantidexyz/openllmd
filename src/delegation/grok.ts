@@ -76,6 +76,7 @@ import {
 } from "./fetch-model-list";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
+import type { TRefreshErrorClass } from "./refresh";
 import {
   credentialUnrefreshable,
   isStaleRefresh,
@@ -284,6 +285,7 @@ const readStoredToken = async (): Promise<TStoredGrokToken> => {
 const readToken = async (): Promise<{
   accessToken: string;
   session: TGrokSession;
+  staleRefresh?: TRefreshErrorClass;
 } | null> => {
   const session = await newestSession();
   if (session?.key === undefined || session.key.length === 0) return null;
@@ -297,7 +299,7 @@ const readToken = async (): Promise<{
       phase: "refresh_fallback",
       error_class: outcome.reason,
     });
-    return { accessToken: session.key, session };
+    return { accessToken: session.key, session, staleRefresh: outcome.reason };
   }
   if (outcome !== "awaited") return { accessToken: session.key, session };
   // Hard-expired path: the CLI refresh was awaited — re-read the rotated store.
@@ -327,6 +329,7 @@ const grokClientCredential = async (): Promise<{
   readonly access_token: string;
   readonly headers: Readonly<Record<string, string>>;
   readonly account_hash?: string;
+  readonly stale_refresh?: TRefreshErrorClass;
 }> => {
   const token = await readToken();
   if (token === null) {
@@ -340,6 +343,9 @@ const grokClientCredential = async (): Promise<{
     },
     // Which account this hop's cost attributes to (recorded on the row).
     ...accountHashField(PROVIDER, token.session.user_id),
+    ...(token.staleRefresh !== undefined
+      ? { stale_refresh: token.staleRefresh }
+      : {}),
   };
 };
 

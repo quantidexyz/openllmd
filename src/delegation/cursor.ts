@@ -46,6 +46,7 @@ import {
   fingerprintStoreIdentity,
   rememberIfFingerprintStable,
 } from "./observation-cache";
+import type { TRefreshErrorClass } from "./refresh";
 import {
   credentialUnrefreshable,
   isStaleRefresh,
@@ -492,7 +493,9 @@ const readStoredToken = async (
 const readToken = async (
   signal?: AbortSignal,
   storedRead?: TStoreRead<TCursorStoredTokens>,
-): Promise<TCursorStoredTokens | null> => {
+): Promise<
+  (TCursorStoredTokens & { staleRefresh?: TRefreshErrorClass }) | null
+> => {
   const stored = storeReadValue(storedRead ?? (await readStoredTokens(signal)));
   if (stored === null) return null;
   if (!stored.refreshTokenPresent) credentialUnrefreshable(PROVIDER);
@@ -505,7 +508,7 @@ const readToken = async (
       phase: "refresh_fallback",
       error_class: outcome.reason,
     });
-    return stored;
+    return { ...stored, staleRefresh: outcome.reason };
   }
   if (outcome !== "awaited") return stored;
   // CLI remains the sole token-store owner. Re-read after a hard-expiry refresh.
@@ -787,6 +790,14 @@ export const cursorDelegate: TProviderDelegate = {
       // Resolve the auth-config default target for diagnostics/contract parity,
       // then reject before any request can be issued to the dashboard endpoint.
       const url = await resolveUpstreamUrl(PROVIDER);
+      if (token.staleRefresh !== undefined) {
+        return {
+          access_token: token.accessToken,
+          headers: {},
+          url,
+          stale_refresh: token.staleRefresh,
+        };
+      }
       throw new Error(
         `cursor is served by the ACP bridge (cursor-agent acp); there is no manual upstream transport (configured target: ${new URL(url).origin})`,
       );

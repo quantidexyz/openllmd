@@ -185,10 +185,7 @@ import {
 import { errorJson } from "./cors";
 import { getDelegate, isSubscriptionSlug } from "./delegation";
 import type { TRefreshErrorClass } from "./delegation/refresh";
-import {
-  authReasonCodeForRefreshError,
-  takeStaleRefreshReason,
-} from "./delegation/refresh";
+import { authReasonCodeForRefreshError } from "./delegation/refresh";
 import type { TProviderDelegate } from "./delegation/types";
 import { stateDir } from "./env";
 import { forwardToCloud } from "./forward";
@@ -218,8 +215,6 @@ import {
 
 /** Test seam: how many immediate status pushes auth-cooldown marks requested. */
 let authCooldownStatusPushesForTests = 0;
-/** Active walk's session key so `acquireUpstream` can stamp cooldown provenance. */
-let currentWalkSessionKey: string | undefined;
 
 export const takeAuthCooldownStatusPushesForTests = (): number => {
   const n = authCooldownStatusPushesForTests;
@@ -973,15 +968,14 @@ export const acquireUpstream = async (
 > => {
   const delegate = getDelegate(provider);
   if (delegate === null) return "retry";
-  const coolIfStale = (): boolean => {
-    const stale = takeStaleRefreshReason(provider);
-    if (stale === null) return false;
-    if (hop !== undefined) coolHopAfterStaleRefresh(hop, stale, walkSessionKey);
-    return true;
-  };
   try {
     const cred = await delegate.credentialForUpstream(args.req.headers);
-    if (coolIfStale()) return "retry";
+    if (cred.stale_refresh !== undefined) {
+      if (hop !== undefined) {
+        coolHopAfterStaleRefresh(hop, cred.stale_refresh, walkSessionKey);
+      }
+      return "retry";
+    }
     return {
       headers: {
         ...originatorHeadersFrom(args.req.headers),
@@ -994,7 +988,6 @@ export const acquireUpstream = async (
       accountHash: cred.account_hash ?? null,
     };
   } catch {
-    coolIfStale();
     return "retry";
   }
 };
@@ -1214,12 +1207,13 @@ const serveSubscription = async (
   args: TWalkArgs,
   finalHop: boolean,
   onQuotaExhausted?: (provider: string, accountHash: string | null) => void,
+  walkSessionKey?: string,
 ): Promise<THopServeOutcome> => {
   const acquired = await acquireUpstream(
     hop.provider,
     args,
     hop,
-    currentWalkSessionKey,
+    walkSessionKey,
   );
   if (acquired === "retry") return hopRetry("no usable credential");
   const { headers: baseHeaders, url, accountHash } = acquired;
@@ -2424,7 +2418,6 @@ const walkPlan = async (
 ): Promise<Response> => {
   walkCounter += 1;
   const walkSessionKey = `walk-${walkCounter}`;
-  currentWalkSessionKey = walkSessionKey;
   const accountHashByProvider = new Map<string, string | null>();
   // Shared per-request cache of `delegate.status()` — the local auth gate and
   // the quota-account lookup both read through it so a hop pays status once.
@@ -2827,6 +2820,7 @@ const walkPlan = async (
         args,
         finalHop,
         sampleQuotaUsage,
+        walkSessionKey,
       );
       if (!isHopRetry(served)) {
         if (

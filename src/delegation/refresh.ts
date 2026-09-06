@@ -421,26 +421,11 @@ export const classifyRefreshError = (err: unknown): TRefreshErrorClass => {
 };
 
 const lastRefreshErrorClasses = new Map<string, TRefreshErrorClass | null>();
-const lastStaleReasons = new Map<string, TRefreshErrorClass>();
 
 /** In-memory result of the most recently settled refresh for one provider. */
 export const lastRefreshErrorClass = (
   provider: string,
 ): TRefreshErrorClass | null => lastRefreshErrorClasses.get(provider) ?? null;
-
-/**
- * Consume the stale reason from the most recent `makeRefresher` call for
- * this provider, if that call returned `{ kind: "stale" }`. The walker
- * uses this to cool the hop BEFORE serving the expired token.
- */
-export const takeStaleRefreshReason = (
-  provider: string,
-): TRefreshErrorClass | null => {
-  const reason = lastStaleReasons.get(provider);
-  if (reason === undefined) return null;
-  lastStaleReasons.delete(provider);
-  return reason;
-};
 
 export const authReasonCodeForRefreshError = (
   errorClass: TRefreshErrorClass,
@@ -639,20 +624,10 @@ export const makeRefresher = (opts: {
     }
     return inFlight;
   };
-  const noteStale = (reason: TRefreshErrorClass): TRefreshOutcome => {
-    lastStaleReasons.set(opts.slug, reason);
-    return { kind: "stale", reason };
-  };
-  const noteLive = (
-    outcome: Exclude<TRefreshOutcome, { kind: "stale" }>,
-  ): TRefreshOutcome => {
-    lastStaleReasons.delete(opts.slug);
-    return outcome;
-  };
   return async (expiresAtMs) => {
-    if (expiresAtMs === null) return noteLive("fresh");
+    if (expiresAtMs === null) return "fresh";
     const remaining = expiresAtMs - Date.now();
-    if (remaining >= opts.leewayMs) return noteLive("fresh");
+    if (remaining >= opts.leewayMs) return "fresh";
     // A recent spawn already gathered current info — don't spawn again until the
     // cooldown lapses. Serving the current token for at most `cooldownMs` is the
     // right backoff; it never serves a WORSE token than one spawn ago.
@@ -664,7 +639,7 @@ export const makeRefresher = (opts: {
         phase: "refresh_skipped",
         reason: "cooldown",
       });
-      return noteLive("fresh");
+      return "fresh";
     }
     if (now < failureBackoffUntil) {
       counterFor(opts.slug).backoff_skips++;
@@ -675,21 +650,21 @@ export const makeRefresher = (opts: {
       });
       // Still-valid token: serve it, do not re-spawn. Hard-expired: typed stale
       // so the walker cools the hop instead of spending the request on a 401.
-      if (remaining > 0 || lastErrorClass === null) return noteLive("fresh");
+      if (remaining > 0 || lastErrorClass === null) return "fresh";
       counterFor(opts.slug).fallbacks++;
-      return noteStale(lastErrorClass);
+      return { kind: "stale", reason: lastErrorClass };
     }
     if (remaining > 0) {
       void fire();
-      return noteLive("kicked");
+      return "kicked";
     }
     await fire();
     if (lastErrorClass !== null) {
       // The caller will serve the stale credential — count it centrally so no
       // delegate has to remember to (they all log `refresh_fallback` already).
       counterFor(opts.slug).fallbacks++;
-      return noteStale(lastErrorClass);
+      return { kind: "stale", reason: lastErrorClass };
     }
-    return noteLive("awaited");
+    return "awaited";
   };
 };

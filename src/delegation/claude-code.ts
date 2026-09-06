@@ -66,6 +66,7 @@ import {
   fingerprintStoreIdentity,
   rememberIfFingerprintStable,
 } from "./observation-cache";
+import type { TRefreshErrorClass } from "./refresh";
 import {
   credentialUnrefreshable,
   isStaleRefresh,
@@ -280,6 +281,7 @@ const readToken = async (
 ): Promise<{
   accessToken: string;
   expiresAtMs: number | null;
+  staleRefresh?: TRefreshErrorClass;
 } | null> => {
   const oauth = storeReadValue(await loadStore(signal))?.claudeAiOauth;
   if (oauth?.accessToken === undefined || oauth.accessToken.length === 0) {
@@ -296,7 +298,11 @@ const readToken = async (
       phase: "refresh_fallback",
       error_class: outcome.reason,
     });
-    return { accessToken: oauth.accessToken, expiresAtMs };
+    return {
+      accessToken: oauth.accessToken,
+      expiresAtMs,
+      staleRefresh: outcome.reason,
+    };
   }
   if (outcome !== "awaited") {
     return { accessToken: oauth.accessToken, expiresAtMs };
@@ -928,6 +934,9 @@ export const claudeCodeDelegate: TProviderDelegate = {
         url,
         // Which account this hop's cost attributes to (recorded on the row).
         ...(acct !== null ? { account_hash: acct } : {}),
+        ...(token.staleRefresh !== undefined
+          ? { stale_refresh: token.staleRefresh }
+          : {}),
       };
     }),
 
