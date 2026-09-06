@@ -137,6 +137,7 @@ import { buildChatGptToolNameMap } from "@openllmsh/wire/providers/chatgpt/reque
 import type { TChatGptStreamEvent } from "@openllmsh/wire/providers/chatgpt/streaming";
 import {
   chatGptEventToChunk,
+  isChatGptResponsesTerminalEvent,
   newChatGptStreamState,
 } from "@openllmsh/wire/providers/chatgpt/streaming";
 import { withChatGptNativeSearch } from "@openllmsh/wire/providers/chatgpt/web-search";
@@ -873,6 +874,7 @@ export const decodeUpstreamStream = (
         eventSchema: ChatGptStreamEventSchema,
         initialState: newChatGptStreamState,
         eventToChunk: chatGptEventToChunk,
+        isTerminalEvent: isChatGptResponsesTerminalEvent,
       },
       options,
     );
@@ -1427,6 +1429,13 @@ const serveSubscription = async (
    */
   const recordStreamFailure = (err: unknown): void => {
     if (args.req.signal.aborted) return;
+    const cause = streamFailureCause(err);
+    const abortNamed = (value: unknown): boolean =>
+      typeof value === "object" &&
+      value !== null &&
+      "name" in value &&
+      (value as { name: unknown }).name === "AbortError";
+    if (abortNamed(err) || abortNamed(cause)) return;
     report(
       {
         ...baseRow,

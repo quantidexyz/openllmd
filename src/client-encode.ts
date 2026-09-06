@@ -131,16 +131,64 @@ export const sseResponseForClient = (
  * client) → re-encode the other onto the client wire with the frame-aligned
  * heartbeat and the shared SSE headers.
  */
+const abortReason = (reason: unknown): Error => {
+  if (reason instanceof Error && reason.name === "AbortError") return reason;
+  const err = new Error(
+    reason === undefined || reason === ""
+      ? "The operation was aborted."
+      : String(reason),
+  );
+  err.name = "AbortError";
+  return err;
+};
+
+const viewOfReader = (
+  reader: ReadableStreamDefaultReader<TChatCompletionChunk>,
+  onCancel?: (reason: unknown) => void,
+): ReadableStream<TChatCompletionChunk> =>
+  new ReadableStream<TChatCompletionChunk>({
+    async pull(controller) {
+      const result = await reader.read();
+      if (result.done) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(result.value);
+    },
+    cancel(reason) {
+      if (onCancel !== undefined) {
+        onCancel(reason);
+        return;
+      }
+      void reader.cancel(reason).catch(() => {});
+    },
+  });
+
 export const deliverChunkStream = (
   chunks: ReadableStream<TChatCompletionChunk>,
   params: TDeliverStreamParams,
 ): Response => {
   const [toClient, toMeter] = chunks.tee();
-  void accumulateChunksToResponse(toMeter, params.providerModelId)
+  const clientReader = toClient.getReader();
+  const meterReader = toMeter.getReader();
+  let teeCancelled = false;
+  const cancelTee = (reason: unknown): void => {
+    if (teeCancelled) return;
+    teeCancelled = true;
+    const abort = abortReason(reason);
+    void clientReader.cancel(abort).catch(() => {});
+    void meterReader.cancel(abort).catch(() => {});
+  };
+  void accumulateChunksToResponse(
+    viewOfReader(meterReader),
+    params.providerModelId,
+  )
     .then(params.onResponse)
-    .catch(params.onError);
+    .catch((err: unknown) => {
+      params.onError(err);
+    });
   return sseResponseForClient(
-    toClient,
+    viewOfReader(clientReader, cancelTee),
     params.surface,
     params.clientWire,
     params.status,
