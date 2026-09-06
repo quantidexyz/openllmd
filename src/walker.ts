@@ -193,6 +193,7 @@ import {
   TRANSIENT_COOLDOWN_REASONS,
 } from "./hop-cooldown";
 import { logWarn } from "./logger";
+import { maybeReportModels } from "./model-report";
 import {
   isNativeRuntimeProvider,
   tryServeNativeRuntime,
@@ -710,6 +711,12 @@ export const report = (
       recordedRow.account_hash ?? accountHash,
     );
   }
+  // Fire-and-forget automatic catalog refresh for the hop that actually
+  // used tokens. Never delays the response stream; skipped/failed stays
+  // quiet; does not walk the fleet or failed hops.
+  void maybeReportModels(Date.now(), recordedRow.provider, "auto").catch(
+    () => {},
+  );
 };
 
 const decodeAnthropicResponse = Schema.decodeUnknownSync(AnthropicResponse);

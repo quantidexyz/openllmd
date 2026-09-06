@@ -27,6 +27,28 @@ export type TImageCredential = {
   readonly account_hash?: string;
 };
 
+/**
+ * Options for automatic (no-renewal) model discovery. `cliVersion` is a
+ * previously observed / cached CLI version — never probed here.
+ */
+export type TModelDiscoveryOptions = {
+  readonly cliVersion?: string;
+};
+
+/**
+ * Distinct from `listModels`: `skipped` means no usable existing credential
+ * (retry after a later successful request); `failed` means an HTTP/list
+ * attempt actually ran and failed (backoff). Auto callers must not share
+ * `listModels`, which is refresh-capable.
+ */
+export type TModelDiscoveryResult =
+  | {
+      readonly kind: "success";
+      readonly models: ReadonlyArray<TProviderModelEntry>;
+    }
+  | { readonly kind: "skipped" }
+  | { readonly kind: "failed" };
+
 export type TProviderDelegate = {
   readonly slug: string;
 
@@ -124,6 +146,17 @@ export type TProviderDelegate = {
    * empty list.
    */
   listModels?: () => Promise<ReadonlyArray<TProviderModelEntry> | null>;
+
+  /**
+   * Automatic model discovery: existing unexpired credential only, no
+   * refresh/CLI/version/identity mint/config write/endpoint capture. Returns
+   * `skipped` when there is no usable stored credential or required cached
+   * metadata; `failed` only after a real list attempt; `success` never with
+   * an empty list (empty/null fetch is `failed` so a cache is not wiped).
+   */
+  discoverModels?: (
+    options: TModelDiscoveryOptions,
+  ) => Promise<TModelDiscoveryResult>;
 
   /**
    * Whether ONE model accepts a configurable `reasoning.effort` on this

@@ -565,10 +565,12 @@ const urlFresh = (cfg: TAuthConfig, cliVer: string | null): boolean =>
  * Ensure (and return) the captured upstream URL for a provider: the stored URL
  * if fresh (version match AND within TTL AND a valid inference path), else a
  * freshly captured one. Returns the stale stored URL (or null) if capture fails
- * so serving never hard-breaks. `force` bypasses the cache (used right after a
- * re-login). `captureIfMissing: false` NEVER spawns the CLI — it serves the best
- * stored URL (even stale) or null, for callers that must not spawn a capture
- * (e.g. when the isolated CLI may be logged OUT).
+ * so serving never hard-breaks. `force` bypasses the freshness cache (used
+ * right after a re-login) and recaptures **only** when capture is allowed.
+ * `captureIfMissing: false` is a hard read-only gate: it NEVER spawns the CLI
+ * (`--version` or capture) and **wins over `force`** — the combo still serves
+ * the best stored URL (even stale) or null. Callers that previously passed
+ * both flags are tolerated; this does not throw. Use `force` alone to recapture.
  */
 const ensureUpstreamUrl = async (
   provider: TCliProvider,
@@ -588,11 +590,13 @@ const ensureUpstreamUrl = async (
   // `claude auth status`, a pure local READ (verified — no token refresh), so
   // with the capture gone the daemon is the SOLE refresher (no rotation race).
   if (CAPTURE[provider].liveCapture === false) return stored;
+  // Hard read-only: wins over `force`. Auto discoverModels / usage / a
+  // logged-out box must not spawn `--version` or recapture.
+  if (opts?.captureIfMissing === false) return stored;
   if (opts?.force !== true && stored !== null) {
     const ver = await cliVersion(cliBin(provider), cliEnv(provider));
     if (urlFresh(cfg, ver)) return stored;
   }
-  if (opts?.captureIfMissing === false) return stored;
   const captured = await runCaptureOnce(provider);
   return captured?.url ?? stored;
 };
@@ -675,6 +679,8 @@ export const resolveProviderUrl = async (
  * Re-capture a provider's upstream URL — called after a fresh login, when the
  * identity / CLI may have changed. Best-effort. Token REFRESH is the CLI's own
  * job (see `delegation/refresh.ts`), so the URL is all there is to refresh here.
+ * `captureIfMissing: false` remains hard read-only and wins over `force`
+ * (same precedence as {@link ensureUpstreamUrl}).
  */
 export const ensureAuthConfig = async (
   provider: TCliProvider,

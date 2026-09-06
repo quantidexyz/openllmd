@@ -39,7 +39,14 @@ import { DAEMON_VERSION } from "../version";
 import { accountHash } from "./account-id";
 import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
 import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
-import { fetchModelList, positiveInt } from "./fetch-model-list";
+import {
+  cachedCliSemver,
+  credentialHasFetchLifetime,
+  fetchModelList,
+  modelDiscoveryFromList,
+  parseChatgptModelList,
+  skippedModelDiscovery,
+} from "./fetch-model-list";
 import { jwtExpiryMs } from "./jwt";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
@@ -50,7 +57,12 @@ import {
   resolveToken,
   spawnRefresh,
 } from "./refresh";
-import type { TImageCredential, TProviderDelegate } from "./types";
+import type {
+  TImageCredential,
+  TModelDiscoveryOptions,
+  TModelDiscoveryResult,
+  TProviderDelegate,
+} from "./types";
 import {
   reduceChatgptCredits,
   reduceChatgptPools,
@@ -520,25 +532,43 @@ export const chatgptDelegate: TProviderDelegate = {
           : {}),
         accept: "application/json",
       },
-      (body) => {
-        const models = (
-          body as { models?: ReadonlyArray<Record<string, unknown>> }
-        ).models;
-        return (models ?? []).flatMap((m) => {
-          if (typeof m.slug !== "string" || m.slug.length === 0) return [];
-          if (m.visibility !== "list") return [];
-          const ctx = positiveInt(m.context_window);
-          return [
-            {
-              provider_model_id: m.slug,
-              ...(typeof m.display_name === "string"
-                ? { display_name: m.display_name }
-                : {}),
-              ...(ctx !== undefined ? { context_window: ctx } : {}),
-            },
-          ];
-        });
-      },
+      parseChatgptModelList,
+    );
+  },
+
+  discoverModels: async (
+    options: TModelDiscoveryOptions,
+  ): Promise<TModelDiscoveryResult> => {
+    const ver = cachedCliSemver(options.cliVersion);
+    if (ver === null) return skippedModelDiscovery();
+    const store = await loadStore();
+    if (store.kind !== "present") return skippedModelDiscovery();
+    const tokens = store.value.tokens;
+    if (tokens === undefined) return skippedModelDiscovery();
+    const accessToken = tokens.access_token;
+    if (accessToken === undefined || accessToken.length === 0) {
+      return skippedModelDiscovery();
+    }
+    if (
+      !credentialHasFetchLifetime(jwtExpiryMs(accessToken), REFRESH_LEEWAY_MS)
+    ) {
+      return skippedModelDiscovery();
+    }
+    return modelDiscoveryFromList(
+      await fetchModelList(
+        await resolveProviderUrl(
+          PROVIDER,
+          `/backend-api/codex/models?client_version=${encodeURIComponent(ver)}`,
+        ),
+        {
+          authorization: `Bearer ${accessToken}`,
+          ...(tokens.account_id !== undefined && tokens.account_id.length > 0
+            ? { "chatgpt-account-id": tokens.account_id }
+            : {}),
+          accept: "application/json",
+        },
+        parseChatgptModelList,
+      ),
     );
   },
 

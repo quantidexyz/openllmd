@@ -264,6 +264,37 @@ export const runCommandInner = async (
         }
         return { id: cmd.id, status: "done" };
       }
+      // Automatic discovery when due. Never resets the throttle, never
+      // calls `listModels`. Quiet `done` on skip and on failure so an
+      // old-dashboard force path is not implied and the UI stays silent.
+      case "refresh_models_due": {
+        const report = await maybeReportModels(
+          Date.now(),
+          undefined,
+          "auto",
+        ).catch(
+          (): {
+            readonly attempted: boolean;
+            readonly reported: number;
+            readonly failed: boolean;
+            readonly error?: string;
+          } => ({
+            attempted: false,
+            reported: 0,
+            failed: true,
+          }),
+        );
+        return {
+          id: cmd.id,
+          status: "done",
+          result: {
+            attempted: report.attempted,
+            reported: report.reported,
+            failed: report.failed,
+            ...(report.error === undefined ? {} : { error: report.error }),
+          },
+        };
+      }
       // Vendor-local session index for the device-session picker (history +
       // ~/.openllm/run live.json + durable session-host registry). Result rides the lifecycle.
       // Short-TTL cache so rapid picker refreshes do not re-scan vendor stores

@@ -87,7 +87,7 @@ daemon/
     control-channel.ts      outbound relay WebSocket (partysocket) — hello/status/ack frames, heartbeat, and migrateIfRelayMoved (bootstrap-tick channel re-fetch: reconnect when a deploy moved the relay to a new content-addressed box)
     status.ts               computeStatus() — shared snapshot for relay status_push (cheap local store/metadata; not token refresh)
     usage-cache.ts          per-provider TTL cache over delegate.usage() (rate-limit safe)
-    model-report.ts         demand-driven live catalog POST: login-succeeded (scoped) or refresh_models — never idle bootstrap
+    model-report.ts         demand-driven live catalog POST: login/`refresh_models` via listModels; auto/`refresh_models_due` via discoverModels — never idle bootstrap
     events.ts               /events SSE: push status on change (replaces polling)
     cors.ts                 shared CORS + PNA preflight for both surfaces
     cli-paths.ts            isolated-CLI paths + per-provider run env
@@ -674,7 +674,9 @@ store snapshot (`present` / `absent` / `indeterminate`). They never call
 managed `config.toml`. Expired-but-stored credentials stay `connected`; a
 read error stays `unknown` (`store_unreadable`) and is not collapsed to
 `credential_absent`. `readToken()` remains the demand path for inference,
-on-demand usage, and requested `listModels()`.
+on-demand usage, and requested (refresh-capable) `listModels()`. Automatic
+catalog observation uses `discoverModels` instead and must not call
+`readToken()`.
 
 **Claude / Cursor idle observations are reused while store identity is stable
 (`delegation/observation-cache.ts`).** Reuse is keyed by path + inode + mtime +
@@ -694,25 +696,45 @@ presence metadata, not vendor-validity proof, and does not replace request-time
 
 **Live model catalogs are demand-driven (`model-report.ts`).** Healthy cloud
 bootstrap and the 5-minute (or unhealthy-retry) tick in `main.ts` MUST NOT call
-`maybeReportModels` / `listModels` / a vendor catalog fetch. Boot only
-`observeLoginModelReports()` once (subscribe to auth events — zero vendor I/O).
-The local 30m success / 15m failure throttle applies to demand callers; it is
-not a background timer.
+`maybeReportModels` / `listModels` / `discoverModels` / a vendor catalog fetch.
+Boot only `observeLoginModelReports()` once (subscribe to auth events — zero
+vendor I/O). The local 30m success / 15m failure throttle applies to demand
+callers; it is not a background timer. An idle skip never stamps failure
+backoff and never POSTs an empty list.
+
+Two listing authorities (do not collapse them):
+- **`listModels()`** — refresh-capable. Explicit `refresh_models` and
+  successful login may acquire a live token (`readToken`) and native-refresh
+  as they always did.
+- **`discoverModels({ cliVersion? })`** — auto only. Returns `success` (non-empty
+  models), `skipped` (no usable existing credential / cached CLI identity /
+  remaining lifetime for a bounded fetch), or `failed` (an HTTP/list attempt
+  actually ran). Never renews auth, never probes CLI version, never mints
+  device id / repairs keychain / writes vendor config / captures endpoints.
+  Uses an existing unexpired store snapshot, observe-only reads, no-capture
+  URL resolution, and the cached `cliVersion` (or last-known identity) passed
+  in. Missing metadata → `skipped` so a later successful use can retry;
+  real fetch failure → `failed` (backoff). Empty vendor lists are `failed`,
+  not a wipe.
 
 Discovery still runs:
-- **Unscoped:** control command `refresh_models` (dashboard “Available models”).
-  Awaits `maybeReportModels()`, which uses `computeStatus()` (bounded snapshot
-  producer) and lists only serviceable providers. Not cron, not
+- **Unscoped force:** control command `refresh_models` (dashboard “Available
+  models”). Awaits `maybeReportModels()` with `listModels`. Not cron, not
   `model-lists-sweep`, not `GET /v1/models`, not a cache-read auto-enqueue.
-- **Scoped:** `auth.login.succeeded` only. One slug; `listModels` for that
+- **Scoped login:** `auth.login.succeeded` only. One slug; `listModels` for that
   provider; last-known CLI version via `peekLastKnownConnection` — does not join
-  an in-flight unknown/pending status probe. Covers immediate connect **and**
-  pending device-code / paste-back when `finishInBackground` /
-  `finalizeLoginTerminal` actually land a credential. Connect /
-  `connect_device_code` / `submit_login_code` acks do **not** report (pending is
-  not success; `submit_login_code` `r.ok` may only be paste acceptance).
-  Failed/cancelled terminals do not report. Do not also fire on `r.connected`
-  (duplicate). `refresh` (usage) is unrelated; status usage stays peek-only.
+  an in-flight unknown/pending status probe. Connect /
+  `connect_device_code` / `submit_login_code` acks do **not** report.
+- **Automatic (use-triggered):** `discoverModels` after real provider use and
+  on model-management activation, gated by the existing TTL/single-flight.
+  Exact command/capability wiring is owned by the scheduler (`refresh_models_due`
+  / `control_caps`); auto must never fall back to `listModels`. Cursor auto
+  discovery captures **only** advertised `session/new` models from an **actual
+  inference** turn — never a standalone ACP client and never an extra
+  same-client `cursor/list_available_models` RPC (even while inference is
+  active). A generation ticket is taken at request entry; the trusted store
+  fingerprint is recorded after native authenticate and before `session/new`;
+  a late result from a switched account is dropped.
 
 Cloud cache: `MODEL_CACHE_TTL_MS` (30m) is freshness for cloud/BYOK writers
 (`scheduleModelListRefresh` skips fresh rows). `MODEL_CACHE_MAX_AGE_MS` (24h)
@@ -835,8 +857,14 @@ connected/failed directly — the dashboard's Connect button stays in its
   isolated run-view points to the user's `grok` executable.
 - **cursor** — `cursor-agent login`; its local credential store is checked for
   status/usage (idle status reuses a determinate observation while store
-  identity is unchanged) and its ACP bridge supplies model discovery and the
-  walker's native-runtime inference transport.
+  identity is unchanged). Manual `listModels` may still spawn ACP and call
+  `cursor/list_available_models`. Automatic `discoverModels` only reads models
+  advertised on `session/new` of a real inference turn (observation age is
+  that capture time); generation is ticketed at request entry, the trusted
+  store fingerprint is taken after native authenticate and before
+  `session/new`, and a late switched-account result is dropped. Logout /
+  connect / refresh invalidate via `clearCursorStatusObservationCache`. The
+  walker still uses the ACP bridge for native-runtime inference.
 
 The dashboard's `/providers` OAuth tab drives a flow off `/status`'s
 per-provider `cli_installed` + `connected`: CLI missing (prompt to re-run

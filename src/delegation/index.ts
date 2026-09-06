@@ -6,7 +6,7 @@ import { grokDelegate } from "./grok";
 import { kimiCodeDelegate } from "./kimi-code";
 import type { TProviderDelegate } from "./types";
 
-export type { TProviderDelegate } from "./types";
+export * from "./types";
 
 /**
  * The subscription provider slugs the daemon serves locally. These are

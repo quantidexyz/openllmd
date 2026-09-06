@@ -171,6 +171,13 @@ export const lastKnownConnectionForTests = (
   slug: string,
 ): TDaemonProviderConnection | undefined => peekLastKnownConnection(slug);
 
+/** Test-only: seed last-known without running `computeStatus`. */
+export const seedLastKnownConnectionForTests = (
+  conn: TDaemonProviderConnection,
+): void => {
+  lastKnownConnections.set(conn.provider, conn);
+};
+
 /** Test-only: the last-known map is process-global and leaks across suites. */
 export const resetLastKnownConnectionsForTests = (): void => {
   lastKnownConnections.clear();
@@ -449,6 +456,7 @@ const computeStatusFreshInner = async (): Promise<TDaemonStatus> => {
     port: daemonPort(),
     sandbox: sandboxState(),
     caps: currentDaemonCaps(),
+    control_caps: ["refresh_models_due"],
     connections,
     // TTL-cached CLI probe from `getCliState()`. It returns cached state when fresh
     // and schedules a background refresh when stale, so status can stay responsive

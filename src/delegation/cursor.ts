@@ -2,8 +2,10 @@
  * Cursor subscription delegate through the official `cursor-agent` CLI.
  *
  * Login URL stream and token store are live-verified; inference remains ACP-only
- * (`cursor-agent acp`). This delegate deliberately exposes login/status/usage only
- * until the daemon ACP bridge is implemented.
+ * (`cursor-agent acp`). Auto `discoverModels` reuses native model metadata from
+ * an already-authorized inference ACP session (real observation age, store
+ * provenance, lifecycle invalidation) and never starts a standalone ACP client.
+ * Manual `listModels` may still probe ACP.
  */
 import { platform } from "node:os";
 import { join } from "node:path";
@@ -18,6 +20,14 @@ import { cliInstallState } from "../cli-install";
 import { cliConfigDir, cliHome } from "../cli-paths";
 import { logError, logInfo, logWarn } from "../logger";
 import { listCursorModelsViaAcp } from "../native-runtime/cursor-acp";
+import {
+  clearCursorNativeModels,
+  cursorNativeModelFingerprint,
+  cursorNativeModelGeneration,
+  entriesFromCursorModelRows,
+  readCursorNativeModels,
+  rememberCursorNativeModels,
+} from "../native-runtime/cursor-model-observation";
 import {
   clearPendingAuth,
   getPendingAuth,
@@ -43,7 +53,11 @@ import {
   resolveToken,
   spawnRefresh,
 } from "./refresh";
-import type { TProviderDelegate } from "./types";
+import type {
+  TModelDiscoveryOptions,
+  TModelDiscoveryResult,
+  TProviderDelegate,
+} from "./types";
 import { statusForWindows } from "./usage-reduce";
 import type { TStoreRead } from "./util";
 import {
@@ -72,14 +86,20 @@ const REFRESH_LEEWAY_MS = 5 * 60_000;
 
 const { bin, env } = cliLaunch(PROVIDER, { NO_OPEN_BROWSER: "1" });
 
-// ─── Live model rows via the ACP bridge (cursor/list_available_models) ─────
-const CURSOR_MODELS_TTL_MS = 5 * 60_000;
-let cursorModelsCache: {
-  at: number;
-  entries: ReadonlyArray<TProviderModelEntry>;
-} | null = null;
+// ─── Live model rows: one native observation cache (inference + manual) ─────
 let cursorModelsInflight: Promise<ReadonlyArray<TProviderModelEntry> | null> | null =
   null;
+
+const cursorModelProvenance = (
+  accountHint: string | null,
+): {
+  readonly fingerprint: string;
+  readonly accountHint: string | null;
+} | null => {
+  const fingerprint = cursorNativeModelFingerprint(cliHome(PROVIDER));
+  if (fingerprint === null) return null;
+  return { fingerprint, accountHint };
+};
 
 const redactUrls = (value: string): string =>
   value.replace(/(https?:\/\/[^\s?]+)\?\S*/g, "$1?<redacted>");
@@ -291,6 +311,7 @@ let statusAccessInFlight: {
  *  mutations call this so the next status tick re-reads the store. */
 export const clearCursorStatusObservationCache = (): void => {
   cursorStatusCache.invalidate();
+  clearCursorNativeModels();
 };
 
 const cursorPassiveReuseAllowed = (): {
@@ -664,44 +685,64 @@ export const cursorDelegate: TProviderDelegate = {
     }
   },
 
-  // Cursor model discovery is ACP-only: a short-lived `cursor-agent acp`
-  // session's `cursor/list_available_models` extension request (VERIFIED
-  // LIVE) returns `{ models: [{ value, name }] }`. Cached 5 min (like grok's
-  // modelRows); null on any failure — never an empty list.
-  listModels: async (): Promise<ReadonlyArray<TProviderModelEntry> | null> => {
-    if (
-      cursorModelsCache !== null &&
-      Date.now() - cursorModelsCache.at < CURSOR_MODELS_TTL_MS
-    ) {
-      return cursorModelsCache.entries;
+  // Automatic discovery reads native observations captured during a real
+  // inference ACP session (or a prior manual probe). Never constructs ACP,
+  // never refreshes tokens, never probes CLI version.
+  discoverModels: async (
+    _options: TModelDiscoveryOptions,
+  ): Promise<TModelDiscoveryResult> => {
+    const accessRead = await readStatusAccessToken();
+    if (accessRead.kind !== "present") return { kind: "skipped" };
+    const expiryMs = jwtExpiryMs(accessRead.value);
+    if (expiryMs === null || expiryMs <= Date.now()) {
+      return { kind: "skipped" };
     }
+    const accountHint = jwtSubject(accessRead.value)?.split("|").at(-1) ?? null;
+    const provenance = cursorModelProvenance(accountHint);
+    if (provenance === null) return { kind: "skipped" };
+    const cached = readCursorNativeModels(provenance);
+    if (cached === null) return { kind: "skipped" };
+    return { kind: "success", models: cached };
+  },
+
+  // Manual list still may spawn a short-lived ACP session. The same native
+  // observation cache stores the result (and inference-captured rows).
+  listModels: async (): Promise<ReadonlyArray<TProviderModelEntry> | null> => {
+    const token = await readToken();
+    const expiryMs = token === null ? null : jwtExpiryMs(token.accessToken);
+    const accountHint =
+      token === null
+        ? null
+        : (jwtSubject(token.accessToken)?.split("|").at(-1) ?? null);
+    const provenance = cursorModelProvenance(accountHint);
+    if (provenance !== null) {
+      const cached = readCursorNativeModels(provenance);
+      if (cached !== null) return cached;
+    }
+    if (expiryMs === null || expiryMs <= Date.now()) return null;
     if (cursorModelsInflight === null) {
+      const observedGeneration = cursorNativeModelGeneration();
       cursorModelsInflight =
         (async (): Promise<ReadonlyArray<TProviderModelEntry> | null> => {
-          // `readToken` refreshes a refreshable credential. A failed hard-expiry
-          // refresh deliberately returns the stale token for request-path
-          // diagnostics, so model discovery must validate the resolved JWT again
-          // before it can spawn the auth-capable ACP CLI.
-          const token = await readToken();
-          const expiryMs =
-            token === null ? null : jwtExpiryMs(token.accessToken);
-          if (expiryMs === null || expiryMs <= Date.now()) return null;
           const rows = await listCursorModelsViaAcp({ bin: bin(), env: env() });
           if (rows === null) return null;
-          const entries: TProviderModelEntry[] = rows.map((row) => ({
-            provider_model_id: row.value,
-            ...(row.name !== null ? { display_name: row.name } : {}),
-          }));
-          return entries.length > 0 ? entries : null;
+          const live = cursorModelProvenance(accountHint);
+          if (live !== null) {
+            rememberCursorNativeModels(
+              live,
+              rows,
+              Date.now(),
+              observedGeneration,
+            );
+            const cached = readCursorNativeModels(live);
+            if (cached !== null) return cached;
+          }
+          return entriesFromCursorModelRows(rows);
         })().finally(() => {
           cursorModelsInflight = null;
         });
     }
-    const entries = await cursorModelsInflight;
-    if (entries !== null) {
-      cursorModelsCache = { at: Date.now(), entries };
-    }
-    return entries;
+    return cursorModelsInflight;
   },
 
   credentialForUpstream: async () => {

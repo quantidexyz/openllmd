@@ -50,7 +50,14 @@ import {
   resolveUpstreamUrl,
 } from "./auth-config";
 import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
-import { fetchModelList } from "./fetch-model-list";
+import {
+  cachedCliSemver,
+  credentialHasFetchLifetime,
+  fetchModelList,
+  modelDiscoveryFromList,
+  parseClaudeModelList,
+  skippedModelDiscovery,
+} from "./fetch-model-list";
 import { makePasteBackDevice } from "./login-device";
 import { makeBlockingConnect } from "./login-direct";
 import {
@@ -66,7 +73,11 @@ import {
   resolveToken,
   spawnRefresh,
 } from "./refresh";
-import type { TProviderDelegate } from "./types";
+import type {
+  TModelDiscoveryOptions,
+  TModelDiscoveryResult,
+  TProviderDelegate,
+} from "./types";
 import { reduceClaudeUsage, reduceQuotaStatus } from "./usage-reduce";
 import type { TStoreRead } from "./util";
 import {
@@ -800,26 +811,44 @@ export const claudeCodeDelegate: TProviderDelegate = {
         "anthropic-beta": OAUTH_BETA,
         accept: "application/json",
       },
-      (body) => {
-        const data = (body as { data?: ReadonlyArray<Record<string, unknown>> })
-          .data;
-        return (data ?? []).flatMap((m) => {
-          if (typeof m.id !== "string" || m.id.length === 0) return [];
-          const createdMs =
-            typeof m.created_at === "string" ? Date.parse(m.created_at) : NaN;
-          return [
-            {
-              provider_model_id: m.id,
-              ...(typeof m.display_name === "string"
-                ? { display_name: m.display_name }
-                : {}),
-              ...(Number.isFinite(createdMs)
-                ? { created: Math.floor(createdMs / 1000) }
-                : {}),
-            },
-          ];
-        });
-      },
+      parseClaudeModelList,
+    );
+  },
+
+  discoverModels: async (
+    options: TModelDiscoveryOptions,
+  ): Promise<TModelDiscoveryResult> => {
+    // Cached CLI version only — never probe, never a generic UA fallback.
+    // Skip before any keychain/store read when the version is missing.
+    const semver = cachedCliSemver(options.cliVersion);
+    if (semver === null) return skippedModelDiscovery();
+    // Observe-only store: no keychain repair, no native refresh. Missing
+    // / expired / unknown lifetime / near-leeway → skipped, not failed.
+    const store = await loadStore(undefined, true);
+    if (store.kind !== "present") return skippedModelDiscovery();
+    const oauth = store.value.claudeAiOauth;
+    if (oauth === undefined) return skippedModelDiscovery();
+    const accessToken = oauth.accessToken;
+    if (accessToken === undefined || accessToken.length === 0) {
+      return skippedModelDiscovery();
+    }
+    const expiresAtMs = toEpochMs(oauth.expiresAt);
+    if (!credentialHasFetchLifetime(expiresAtMs, REFRESH_LEEWAY_MS)) {
+      return skippedModelDiscovery();
+    }
+    const ua = `claude-cli/${semver}`;
+    return modelDiscoveryFromList(
+      await fetchModelList(
+        await resolveProviderUrl(PROVIDER, "/v1/models?limit=1000"),
+        {
+          authorization: `Bearer ${accessToken}`,
+          "user-agent": ua,
+          "anthropic-version": "2023-06-01",
+          "anthropic-beta": OAUTH_BETA,
+          accept: "application/json",
+        },
+        parseClaudeModelList,
+      ),
     );
   },
 

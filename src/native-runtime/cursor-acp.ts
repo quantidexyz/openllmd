@@ -58,6 +58,12 @@ import { unwrapKeychainSpawn } from "../sandbox/policy";
 import { DAEMON_VERSION } from "../version";
 import type { TCursorMcpServer } from "./cursor-mcp-server";
 import { startCursorMcpServer } from "./cursor-mcp-server";
+import {
+  cursorNativeModelGeneration,
+  observeCursorNativeModelsFromSession,
+  parseCursorListAvailableModels,
+  takeCursorNativeModelObservationTicket,
+} from "./cursor-model-observation";
 import type { TCursorImage, TCursorTool } from "./cursor-request";
 import { acpPromptBlocks, extractJsonObject } from "./cursor-request";
 import type { TNativeRunResult } from "./types";
@@ -714,6 +720,10 @@ export type TCursorNativeParams = {
 export const runCursorNative = async (
   params: TCursorNativeParams,
 ): Promise<TNativeRunResult> => {
+  // Generation is captured at request entry, before the vendor child or MCP
+  // server exists, so a logout during spawn/handshake cannot be stamped as
+  // the current account when session/new later returns.
+  const observationGeneration = cursorNativeModelGeneration();
   if (!existsSync(params.bin)) {
     return { kind: "declined", reason: "cursor-agent CLI not installed" };
   }
@@ -834,6 +844,10 @@ export const runCursorNative = async (
   } catch (error) {
     return failSetup(error);
   }
+  const observationTicket = takeCursorNativeModelObservationTicket(
+    params.env,
+    observationGeneration,
+  );
   let opened: unknown;
   try {
     opened = await client.request(
@@ -868,6 +882,13 @@ export const runCursorNative = async (
     return { kind: "declined", reason: "session/new returned no sessionId" };
   }
   sessionId = sid;
+  if (observationTicket !== null) {
+    observeCursorNativeModelsFromSession({
+      ticket: observationTicket,
+      env: params.env,
+      sessionResult: opened,
+    });
+  }
   await trySetModel(client, sid, params.providerModelId, opened);
 
   // ── The prompt turn ────────────────────────────────────────────────
@@ -984,11 +1005,11 @@ export const runCursorNative = async (
 };
 
 /**
- * Live model discovery via a short-lived ACP session: the `cursor/
- * list_available_models` extension request returns `{ models: [{ value, name
- * }] }` (VERIFIED LIVE — `value` is the bare provider model id, `name` the
- * display name). Null on ANY failure (not installed / not logged in /
- * protocol drift) — callers cache and fall back to the static catalog.
+ * Manual `listModels` only: a short-lived ACP session whose
+ * `cursor/list_available_models` request returns `{ models: [{ value, name }] }`
+ * (VERIFIED LIVE). Auto `discoverModels` must not call this — it reads native
+ * observations captured on an already-authorized inference session. Null on
+ * ANY failure (not installed / not logged in / protocol drift).
  */
 export const listCursorModelsViaAcp = async (params: {
   readonly bin: string;
@@ -1009,17 +1030,7 @@ export const listCursorModelsViaAcp = async (params: {
     const listed = await client.request("cursor/list_available_models", {
       sessionId: sid,
     });
-    const models = (listed as { readonly models?: unknown }).models;
-    if (!Array.isArray(models)) return null;
-    const rows: Array<{ value: string; name: string | null }> = [];
-    for (const m of models) {
-      const value = (m as { readonly value?: unknown }).value;
-      const name = (m as { readonly name?: unknown }).name;
-      if (typeof value === "string" && value.length > 0) {
-        rows.push({ value, name: typeof name === "string" ? name : null });
-      }
-    }
-    return rows.length > 0 ? rows : null;
+    return parseCursorListAvailableModels(listed);
   } catch {
     return null;
   } finally {

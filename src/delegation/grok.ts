@@ -65,7 +65,15 @@ import { DAEMON_VERSION } from "../version";
 import { accountHashField } from "./account-id";
 import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
 import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
-import { positiveInt } from "./fetch-model-list";
+import {
+  cachedCliSemver,
+  credentialHasFetchLifetime,
+  fetchModelList,
+  modelDiscoveryFromList,
+  parseGrokModelList,
+  parseGrokModelRows,
+  skippedModelDiscovery,
+} from "./fetch-model-list";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
 import {
@@ -74,7 +82,12 @@ import {
   resolveToken,
   spawnRefresh,
 } from "./refresh";
-import type { TImageCredential, TProviderDelegate } from "./types";
+import type {
+  TImageCredential,
+  TModelDiscoveryOptions,
+  TModelDiscoveryResult,
+  TProviderDelegate,
+} from "./types";
 import { statusForWindows } from "./usage-reduce";
 import type { TStoreRead } from "./util";
 import {
@@ -815,20 +828,43 @@ export const grokDelegate: TProviderDelegate = {
     // failure (never an empty list).
     const rows = await modelRows();
     if (rows === null) return null;
-    const entries = rows.flatMap((m) => {
-      if (typeof m.id !== "string" || m.id.length === 0) return [];
-      const ctx = positiveInt(m.context_window ?? m.context_length);
-      return [
-        {
-          provider_model_id: m.id,
-          ...(typeof m.display_name === "string"
-            ? { display_name: m.display_name }
-            : {}),
-          ...(ctx !== undefined ? { context_window: ctx } : {}),
-        },
-      ];
-    });
+    const entries = parseGrokModelRows(rows);
     return entries.length > 0 ? entries : null;
+  },
+
+  discoverModels: async (
+    options: TModelDiscoveryOptions,
+  ): Promise<TModelDiscoveryResult> => {
+    const ver = cachedCliSemver(options.cliVersion);
+    if (ver === null) return skippedModelDiscovery();
+    const store = await loadStore();
+    if (store.kind !== "present") return skippedModelDiscovery();
+    const session = newestSessionFromStore(store.value);
+    if (session === null) return skippedModelDiscovery();
+    const accessToken = session.key;
+    if (accessToken === undefined || accessToken.length === 0) {
+      return skippedModelDiscovery();
+    }
+    if (
+      !credentialHasFetchLifetime(
+        parseExpiryMs(session.expires_at),
+        REFRESH_LEEWAY_MS,
+      )
+    ) {
+      return skippedModelDiscovery();
+    }
+    return modelDiscoveryFromList(
+      await fetchModelList(
+        await resolveProviderUrl(PROVIDER, "/v1/models"),
+        {
+          authorization: `Bearer ${accessToken}`,
+          "user-agent": OPENLLM_USER_AGENT,
+          "x-grok-client-version": ver,
+          accept: "application/json",
+        },
+        parseGrokModelList,
+      ),
+    );
   },
 
   supportsReasoningEffort: async (providerModelId) => {

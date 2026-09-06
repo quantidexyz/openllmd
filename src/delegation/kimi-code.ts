@@ -47,7 +47,14 @@ import {
 import { accountHashField, jwtClaims } from "./account-id";
 import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
 import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
-import { fetchModelList, positiveInt } from "./fetch-model-list";
+import {
+  cachedCliSemver,
+  credentialHasFetchLifetime,
+  fetchModelList,
+  modelDiscoveryFromList,
+  parseKimiModelList,
+  skippedModelDiscovery,
+} from "./fetch-model-list";
 import type { TDeviceAuth, TDevicePoll } from "./login-direct";
 import { makeDeviceCodeConnect } from "./login-direct";
 import { makeCancelConnect } from "./login-flow";
@@ -57,7 +64,11 @@ import {
   resolveToken,
   spawnRefresh,
 } from "./refresh";
-import type { TProviderDelegate } from "./types";
+import type {
+  TModelDiscoveryOptions,
+  TModelDiscoveryResult,
+  TProviderDelegate,
+} from "./types";
 import {
   cliVersion,
   connectedObservation,
@@ -301,17 +312,22 @@ const readToken = async (): Promise<{ accessToken: string } | null> => {
 // at `<KIMI_CODE_HOME>/device_id` — exactly `createKimiDeviceId` in
 // packages/oauth identity.ts. The SAME id is used for the login device
 // flow and every subsequent upstream call, so the identity is stable.
-const ensureDeviceId = async (): Promise<string> => {
+const existingDeviceId = async (): Promise<string | null> => {
   const path = join(kimiHome(), "device_id");
   try {
     const file = Bun.file(path);
-    if (await file.exists()) {
-      const id = (await file.text()).trim();
-      if (id.length > 0) return id;
-    }
+    if (!(await file.exists())) return null;
+    const id = (await file.text()).trim();
+    return id.length > 0 ? id : null;
   } catch {
-    // fall through to create
+    return null;
   }
+};
+
+const ensureDeviceId = async (): Promise<string> => {
+  const existing = await existingDeviceId();
+  if (existing !== null) return existing;
+  const path = join(kimiHome(), "device_id");
   const id = crypto.randomUUID();
   mkdirSync(kimiHome(), { recursive: true, mode: 0o700 });
   writeFileSync(path, id, { encoding: "utf-8", mode: 0o600 });
@@ -809,20 +825,38 @@ export const kimiCodeDelegate: TProviderDelegate = {
         ...(await identityHeaders()),
         accept: "application/json",
       },
-      (body) => {
-        const data = (body as { data?: ReadonlyArray<Record<string, unknown>> })
-          .data;
-        return (data ?? []).flatMap((m) => {
-          if (typeof m.id !== "string" || m.id.length === 0) return [];
-          const ctx = positiveInt(m.context_length);
-          return [
-            {
-              provider_model_id: m.id,
-              ...(ctx !== undefined ? { context_window: ctx } : {}),
-            },
-          ];
-        });
-      },
+      parseKimiModelList,
+    );
+  },
+
+  discoverModels: async (
+    options: TModelDiscoveryOptions,
+  ): Promise<TModelDiscoveryResult> => {
+    const ver = cachedCliSemver(options.cliVersion);
+    const deviceId = await existingDeviceId();
+    if (ver === null || deviceId === null) return skippedModelDiscovery();
+    const store = await readJsonStore<TKimiToken>(credentialPath());
+    if (store.kind !== "present") return skippedModelDiscovery();
+    const accessToken = storedAccessToken(store.value);
+    if (accessToken === null) return skippedModelDiscovery();
+    const expiresAtMs =
+      typeof store.value.expires_at === "number" && store.value.expires_at > 0
+        ? store.value.expires_at * 1000
+        : null;
+    if (!credentialHasFetchLifetime(expiresAtMs, REFRESH_LEEWAY_MS)) {
+      return skippedModelDiscovery();
+    }
+    const base = await resolveProviderUrl(PROVIDER, "/coding/v1");
+    return modelDiscoveryFromList(
+      await fetchModelList(
+        `${base}/models`,
+        {
+          authorization: `Bearer ${accessToken}`,
+          ...headersFor(ver, deviceId),
+          accept: "application/json",
+        },
+        parseKimiModelList,
+      ),
     );
   },
 

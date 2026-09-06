@@ -164,6 +164,10 @@ export const statusChangeKey = (status: TDaemonStatus): string => {
           status.cli.version ?? "",
         ]),
     optionalArrayChangeKey(status.caps, (status.caps ?? []).join(",")),
+    optionalArrayChangeKey(
+      status.control_caps,
+      (status.control_caps ?? []).join(","),
+    ),
     status.pty_supported === undefined ? "" : String(status.pty_supported),
     connections,
     sessions,
