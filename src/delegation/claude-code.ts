@@ -72,6 +72,7 @@ import {
   keychainRefreshSpawnAllowed,
   resolveToken,
   spawnRefresh,
+  withRefreshCaller,
 } from "./refresh";
 import type {
   TModelDiscoveryOptions,
@@ -780,84 +781,89 @@ export const claudeCodeDelegate: TProviderDelegate = {
     return claudeStatusPayload(connected, version);
   },
 
-  usage: async (): Promise<TProviderUsageSnapshot> => {
-    const token = await readStoredToken();
-    if (token.kind === "missing") {
-      return { kind: "unavailable", reason: "not signed in to Claude Code" };
-    }
-    if (token.kind === "expired") {
-      return { kind: "unavailable", reason: "credential_expired" };
-    }
-    try {
-      const headers = {
-        authorization: `Bearer ${token.accessToken}`,
-        "user-agent": await userAgent(),
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": OAUTH_BETA,
-        accept: "application/json",
-      };
-      const resp = await fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {
-        method: "GET",
-        headers,
-      });
-      if (!resp.ok) {
-        const reason =
-          resp.status === 401
-            ? "Claude authorization was rejected — re-sign in via the Claude Code CLI."
-            : resp.status === 403
-              ? "No active Claude Pro/Max subscription on this account."
-              : resp.status === 429
-                ? // The usage cache serves the last known good figures (stamped
-                  // `stale`) when one exists, so this bare reason only ever
-                  // surfaces when there's NOTHING cached to fall back to — don't
-                  // promise figures we may not have. See `usage-cache.ts`.
-                  "Claude usage is rate-limited right now."
-                : `Claude couldn't report usage (HTTP ${resp.status}).`;
-        return { kind: "unavailable", reason };
+  usage: (): Promise<TProviderUsageSnapshot> =>
+    withRefreshCaller("usage", async (): Promise<TProviderUsageSnapshot> => {
+      const token = await readStoredToken();
+      if (token.kind === "missing") {
+        return { kind: "unavailable", reason: "not signed in to Claude Code" };
       }
-      const data: unknown = await resp.json();
-      // Shared plan meters → `windows` (status + tightest-window +
-      // calibration). Model-scoped caps (Fable / Opus / Sonnet) →
-      // `extra_pools`, same contract as Codex Spark: display-only, never
-      // flip overall status when only a single model family is exhausted.
-      const { windows, extra_pools } = reduceClaudeUsage(data);
-      const plan = await readClaudePlan(headers);
-      return {
-        kind: "quota",
-        status: reduceQuotaStatus(undefined, windows),
-        ...(plan !== null ? { plan, plan_source: "private-client" } : {}),
-        windows,
-        ...(extra_pools.length > 0 ? { extra_pools } : {}),
-        note: "Pro/Max subscription — read locally via Claude Code",
-      };
-    } catch (err) {
-      return {
-        kind: "unavailable",
-        reason: err instanceof Error ? err.message : "usage fetch failed",
-      };
-    }
-  },
+      if (token.kind === "expired") {
+        return { kind: "unavailable", reason: "credential_expired" };
+      }
+      try {
+        const headers = {
+          authorization: `Bearer ${token.accessToken}`,
+          "user-agent": await userAgent(),
+          "anthropic-version": "2023-06-01",
+          "anthropic-beta": OAUTH_BETA,
+          accept: "application/json",
+        };
+        const resp = await fetch(
+          await resolveProviderUrl(PROVIDER, USAGE_PATH),
+          {
+            method: "GET",
+            headers,
+          },
+        );
+        if (!resp.ok) {
+          const reason =
+            resp.status === 401
+              ? "Claude authorization was rejected — re-sign in via the Claude Code CLI."
+              : resp.status === 403
+                ? "No active Claude Pro/Max subscription on this account."
+                : resp.status === 429
+                  ? // The usage cache serves the last known good figures (stamped
+                    // `stale`) when one exists, so this bare reason only ever
+                    // surfaces when there's NOTHING cached to fall back to — don't
+                    // promise figures we may not have. See `usage-cache.ts`.
+                    "Claude usage is rate-limited right now."
+                  : `Claude couldn't report usage (HTTP ${resp.status}).`;
+          return { kind: "unavailable", reason };
+        }
+        const data: unknown = await resp.json();
+        // Shared plan meters → `windows` (status + tightest-window +
+        // calibration). Model-scoped caps (Fable / Opus / Sonnet) →
+        // `extra_pools`, same contract as Codex Spark: display-only, never
+        // flip overall status when only a single model family is exhausted.
+        const { windows, extra_pools } = reduceClaudeUsage(data);
+        const plan = await readClaudePlan(headers);
+        return {
+          kind: "quota",
+          status: reduceQuotaStatus(undefined, windows),
+          ...(plan !== null ? { plan, plan_source: "private-client" } : {}),
+          windows,
+          ...(extra_pools.length > 0 ? { extra_pools } : {}),
+          note: "Pro/Max subscription — read locally via Claude Code",
+        };
+      } catch (err) {
+        return {
+          kind: "unavailable",
+          reason: err instanceof Error ? err.message : "usage fetch failed",
+        };
+      }
+    }),
 
-  listModels: async () => {
-    // Anthropic's `GET /v1/models` accepts the subscription OAuth bearer
-    // (same auth shape as the usage read above). Host derived from the
-    // CAPTURED inference URL via `resolveProviderUrl` — no hardcoded
-    // origin; only the stable leaf path is a constant. Metadata only;
-    // bounded + null on any failure via `fetchModelList`.
-    const token = await readToken();
-    if (token === null) return null;
-    return fetchModelList(
-      await resolveProviderUrl(PROVIDER, "/v1/models?limit=1000"),
-      {
-        authorization: `Bearer ${token.accessToken}`,
-        "user-agent": await userAgent(),
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": OAUTH_BETA,
-        accept: "application/json",
-      },
-      parseClaudeModelList,
-    );
-  },
+  listModels: () =>
+    withRefreshCaller("models", async () => {
+      // Anthropic's `GET /v1/models` accepts the subscription OAuth bearer
+      // (same auth shape as the usage read above). Host derived from the
+      // CAPTURED inference URL via `resolveProviderUrl` — no hardcoded
+      // origin; only the stable leaf path is a constant. Metadata only;
+      // bounded + null on any failure via `fetchModelList`.
+      const token = await readToken();
+      if (token === null) return null;
+      return fetchModelList(
+        await resolveProviderUrl(PROVIDER, "/v1/models?limit=1000"),
+        {
+          authorization: `Bearer ${token.accessToken}`,
+          "user-agent": await userAgent(),
+          "anthropic-version": "2023-06-01",
+          "anthropic-beta": OAUTH_BETA,
+          accept: "application/json",
+        },
+        parseClaudeModelList,
+      );
+    }),
 
   discoverModels: async (
     options: TModelDiscoveryOptions,
@@ -896,31 +902,34 @@ export const claudeCodeDelegate: TProviderDelegate = {
     );
   },
 
-  credentialForUpstream: async () => {
-    const token = await readToken();
-    if (token === null) {
-      throw new Error("claude_code: not signed in (no stored credential)");
-    }
-    // Resolve the request TARGET URL (captured from the genuine `claude`
-    // request, or the default) + the isolated CLI's own IDENTITY HEADERS
-    // (handrolled/bridge parity — active-sub-method.md): the walker layers
-    // them over the originator's headers so the vendor sees the same identity
-    // whether the hop ran through the native CLI (bridge) or this manual
-    // transport, and the wire builder still layers the OAuth `anthropic-beta`
-    // + `anthropic-version` last (isOAuth). Identity comes from the shape-only
-    // fixture capture (never `authorization`); an absent fixture serves
-    // originator-only, the pre-parity behavior.
-    const url = await resolveUpstreamUrl(PROVIDER, { captureIfMissing: true });
-    const identity = await resolveIdentityHeaders(PROVIDER);
-    const acct = await readAccountHash();
-    return {
-      access_token: token.accessToken,
-      headers: identity ?? {},
-      url,
-      // Which account this hop's cost attributes to (recorded on the row).
-      ...(acct !== null ? { account_hash: acct } : {}),
-    };
-  },
+  credentialForUpstream: () =>
+    withRefreshCaller("upstream", async () => {
+      const token = await readToken();
+      if (token === null) {
+        throw new Error("claude_code: not signed in (no stored credential)");
+      }
+      // Resolve the request TARGET URL (captured from the genuine `claude`
+      // request, or the default) + the isolated CLI's own IDENTITY HEADERS
+      // (handrolled/bridge parity — active-sub-method.md): the walker layers
+      // them over the originator's headers so the vendor sees the same identity
+      // whether the hop ran through the native CLI (bridge) or this manual
+      // transport, and the wire builder still layers the OAuth `anthropic-beta`
+      // + `anthropic-version` last (isOAuth). Identity comes from the shape-only
+      // fixture capture (never `authorization`); an absent fixture serves
+      // originator-only, the pre-parity behavior.
+      const url = await resolveUpstreamUrl(PROVIDER, {
+        captureIfMissing: true,
+      });
+      const identity = await resolveIdentityHeaders(PROVIDER);
+      const acct = await readAccountHash();
+      return {
+        access_token: token.accessToken,
+        headers: identity ?? {},
+        url,
+        // Which account this hop's cost attributes to (recorded on the row).
+        ...(acct !== null ? { account_hash: acct } : {}),
+      };
+    }),
 
   logout: async () => {
     // The credential is about to disappear — drop the cached status so no

@@ -63,6 +63,7 @@ import {
   isStaleRefresh,
   resolveToken,
   spawnRefresh,
+  withRefreshCaller,
 } from "./refresh";
 import type {
   TModelDiscoveryOptions,
@@ -798,80 +799,85 @@ export const kimiCodeDelegate: TProviderDelegate = {
     };
   },
 
-  usage: async (): Promise<TProviderUsageSnapshot> => {
-    const token = await readStoredToken();
-    if (token.kind === "missing") {
-      return { kind: "unavailable", reason: "not signed in to Kimi CLI" };
-    }
-    if (token.kind === "expired") {
-      return { kind: "unavailable", reason: "credential_expired" };
-    }
-    try {
-      const resp = await fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {
-        method: "GET",
-        headers: {
+  usage: (): Promise<TProviderUsageSnapshot> =>
+    withRefreshCaller("usage", async (): Promise<TProviderUsageSnapshot> => {
+      const token = await readStoredToken();
+      if (token.kind === "missing") {
+        return { kind: "unavailable", reason: "not signed in to Kimi CLI" };
+      }
+      if (token.kind === "expired") {
+        return { kind: "unavailable", reason: "credential_expired" };
+      }
+      try {
+        const resp = await fetch(
+          await resolveProviderUrl(PROVIDER, USAGE_PATH),
+          {
+            method: "GET",
+            headers: {
+              authorization: `Bearer ${token.accessToken}`,
+              ...(await identityHeaders()),
+              accept: "application/json",
+            },
+          },
+        );
+        if (!resp.ok) {
+          // Phrase like the Kimi CLI itself (packages/oauth managed-usage):
+          // 401 = the token was rejected — your Kimi Code subscription has
+          // likely run out / is inactive, or the session needs a re-login.
+          // 403 = the coding feature isn't available to this account.
+          // 404 = the usage endpoint isn't enabled for this plan.
+          const hasRefreshToken =
+            token.tok.refresh_token !== undefined &&
+            token.tok.refresh_token.length > 0;
+          const reason =
+            resp.status === 401
+              ? hasRefreshToken
+                ? "Kimi Code authorization was rejected — this machine could not refresh the sign-in. Try again."
+                : "Kimi Code authorization was rejected — your subscription may be inactive or expired. Re-sign in via the Kimi CLI (/login)."
+              : resp.status === 403
+                ? "No active Kimi Code subscription — your coding plan has run out or isn't enabled for this account."
+                : resp.status === 404
+                  ? "Kimi Code usage isn't available on this plan."
+                  : `Kimi Code couldn't report usage (HTTP ${resp.status}).`;
+          return { kind: "unavailable", reason };
+        }
+        // Parse the `{ usage, limits[] }` payload into one window per limit
+        // (+ the rolled-up summary), skipping incomplete quota rows. NO tier is
+        // attached: Kimi Code exposes no subscription tier through any surface
+        // reachable here — the `/usages` payload is limits + a credit balance,
+        // the access-token JWT carries only identity claims (client_id, device_id,
+        // sub, user_id, scope, region, … — no level/plan/membership), and the
+        // vendor reference has no userinfo/account endpoint. So kimi rows simply
+        // omit the tier rather than fabricate one. See ref/kimi-code.
+        return parseKimiUsage(await resp.json());
+      } catch (err) {
+        return {
+          kind: "unavailable",
+          reason: err instanceof Error ? err.message : "usage fetch failed",
+        };
+      }
+    }),
+
+  listModels: () =>
+    withRefreshCaller("models", async () => {
+      // Same `GET /coding/v1/models` call `provisionModelConfig` makes —
+      // the vendor's per-subscription list (ids + `context_length`),
+      // reported to the cloud's model cache so `/v1/models` reflects what
+      // THIS subscription actually serves. Metadata only; bounded + null
+      // on any failure via `fetchModelList`.
+      const token = await readToken();
+      if (token === null) return null;
+      const base = await resolveProviderUrl(PROVIDER, "/coding/v1");
+      return fetchModelList(
+        `${base}/models`,
+        {
           authorization: `Bearer ${token.accessToken}`,
           ...(await identityHeaders()),
           accept: "application/json",
         },
-      });
-      if (!resp.ok) {
-        // Phrase like the Kimi CLI itself (packages/oauth managed-usage):
-        // 401 = the token was rejected — your Kimi Code subscription has
-        // likely run out / is inactive, or the session needs a re-login.
-        // 403 = the coding feature isn't available to this account.
-        // 404 = the usage endpoint isn't enabled for this plan.
-        const hasRefreshToken =
-          token.tok.refresh_token !== undefined &&
-          token.tok.refresh_token.length > 0;
-        const reason =
-          resp.status === 401
-            ? hasRefreshToken
-              ? "Kimi Code authorization was rejected — this machine could not refresh the sign-in. Try again."
-              : "Kimi Code authorization was rejected — your subscription may be inactive or expired. Re-sign in via the Kimi CLI (/login)."
-            : resp.status === 403
-              ? "No active Kimi Code subscription — your coding plan has run out or isn't enabled for this account."
-              : resp.status === 404
-                ? "Kimi Code usage isn't available on this plan."
-                : `Kimi Code couldn't report usage (HTTP ${resp.status}).`;
-        return { kind: "unavailable", reason };
-      }
-      // Parse the `{ usage, limits[] }` payload into one window per limit
-      // (+ the rolled-up summary), skipping incomplete quota rows. NO tier is
-      // attached: Kimi Code exposes no subscription tier through any surface
-      // reachable here — the `/usages` payload is limits + a credit balance,
-      // the access-token JWT carries only identity claims (client_id, device_id,
-      // sub, user_id, scope, region, … — no level/plan/membership), and the
-      // vendor reference has no userinfo/account endpoint. So kimi rows simply
-      // omit the tier rather than fabricate one. See ref/kimi-code.
-      return parseKimiUsage(await resp.json());
-    } catch (err) {
-      return {
-        kind: "unavailable",
-        reason: err instanceof Error ? err.message : "usage fetch failed",
-      };
-    }
-  },
-
-  listModels: async () => {
-    // Same `GET /coding/v1/models` call `provisionModelConfig` makes —
-    // the vendor's per-subscription list (ids + `context_length`),
-    // reported to the cloud's model cache so `/v1/models` reflects what
-    // THIS subscription actually serves. Metadata only; bounded + null
-    // on any failure via `fetchModelList`.
-    const token = await readToken();
-    if (token === null) return null;
-    const base = await resolveProviderUrl(PROVIDER, "/coding/v1");
-    return fetchModelList(
-      `${base}/models`,
-      {
-        authorization: `Bearer ${token.accessToken}`,
-        ...(await identityHeaders()),
-        accept: "application/json",
-      },
-      parseKimiModelList,
-    );
-  },
+        parseKimiModelList,
+      );
+    }),
 
   discoverModels: async (
     options: TModelDiscoveryOptions,
@@ -904,33 +910,34 @@ export const kimiCodeDelegate: TProviderDelegate = {
     );
   },
 
-  credentialForUpstream: async () => {
-    const token = await readToken();
-    if (token === null) {
-      throw new Error("kimi_code: not signed in (no stored credential)");
-    }
-    // Resolve the request TARGET URL — the genuine OpenAI-wire
-    // `/coding/v1/chat/completions` endpoint, captured from `kimi -p ping` (or
-    // the default) — and inject kimi's CREDENTIAL-BINDING identity. Kimi's
-    // managed endpoint binds the token to its kimi-code client identity and
-    // VALIDATES the full `x-msh-*` set + UA on every request (it 403s on any
-    // subset — confirmed live with just device-id/platform/version). The daemon
-    // legitimately holds a kimi-code credential (it ran kimi's OWN device-code
-    // OAuth, registering `x-msh-device-id`), so presenting that identity is
-    // credential-intrinsic, not a forged CLI identity — unlike claude/codex,
-    // kimi's token is unusable without it. These are spread OVER the
-    // originator's headers in the walker, so the kimi-code UA/device identity
-    // wins for this hop. `identityHeaders()` is the same set used for the
-    // device-login + /usages calls.
-    const url = await resolveUpstreamUrl(PROVIDER);
-    return {
-      access_token: token.accessToken,
-      headers: await identityHeaders(),
-      url,
-      // Which account this hop's cost attributes to (recorded on the row).
-      ...accountHashField(PROVIDER, jwtClaims(token.accessToken)?.user_id),
-    };
-  },
+  credentialForUpstream: () =>
+    withRefreshCaller("upstream", async () => {
+      const token = await readToken();
+      if (token === null) {
+        throw new Error("kimi_code: not signed in (no stored credential)");
+      }
+      // Resolve the request TARGET URL — the genuine OpenAI-wire
+      // `/coding/v1/chat/completions` endpoint, captured from `kimi -p ping` (or
+      // the default) — and inject kimi's CREDENTIAL-BINDING identity. Kimi's
+      // managed endpoint binds the token to its kimi-code client identity and
+      // VALIDATES the full `x-msh-*` set + UA on every request (it 403s on any
+      // subset — confirmed live with just device-id/platform/version). The daemon
+      // legitimately holds a kimi-code credential (it ran kimi's OWN device-code
+      // OAuth, registering `x-msh-device-id`), so presenting that identity is
+      // credential-intrinsic, not a forged CLI identity — unlike claude/codex,
+      // kimi's token is unusable without it. These are spread OVER the
+      // originator's headers in the walker, so the kimi-code UA/device identity
+      // wins for this hop. `identityHeaders()` is the same set used for the
+      // device-login + /usages calls.
+      const url = await resolveUpstreamUrl(PROVIDER);
+      return {
+        access_token: token.accessToken,
+        headers: await identityHeaders(),
+        url,
+        // Which account this hop's cost attributes to (recorded on the row).
+        ...accountHashField(PROVIDER, jwtClaims(token.accessToken)?.user_id),
+      };
+    }),
 
   logout: async () => {
     // Kimi's CLI has no spawnable logout (device-code only) — clear the

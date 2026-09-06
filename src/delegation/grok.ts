@@ -81,6 +81,7 @@ import {
   isStaleRefresh,
   resolveToken,
   spawnRefresh,
+  withRefreshCaller,
 } from "./refresh";
 import type {
   TImageCredential,
@@ -789,79 +790,81 @@ export const grokDelegate: TProviderDelegate = {
     };
   },
 
-  usage: async (): Promise<TProviderUsageSnapshot> => {
-    const token = await readStoredToken();
-    if (token.kind === "missing") {
-      return { kind: "unavailable", reason: "not signed in to Grok" };
-    }
-    if (token.kind === "expired") {
-      return { kind: "unavailable", reason: "credential_expired" };
-    }
-    // Same host as inference (`resolveProviderUrl` derives it from the captured
-    // upstream, never spawning the CLI). The plain OAuth bearer is accepted; we
-    // send our own `openllm/<ver>` identity (+ the gate version header),
-    // mirroring `credentialForUpstream`.
-    const headers = {
-      authorization: `Bearer ${token.accessToken}`,
-      "user-agent": OPENLLM_USER_AGENT,
-      "x-grok-client-version": await clientVersion(),
-      accept: "application/json",
-    };
-    // One authed billing GET → the parsed body, or a `{ error }` marker carrying
-    // the HTTP status so the WEEKLY (primary) view can turn a hard error into an
-    // `unavailable` snapshot while a MONTHLY failure just degrades gracefully.
-    const getBilling = async (
-      path: string,
-    ): Promise<{ body: unknown } | { error: number }> => {
-      try {
-        const resp = await fetch(await resolveProviderUrl(PROVIDER, path), {
-          method: "GET",
-          headers,
-          signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
-        });
-        if (!resp.ok) return { error: resp.status };
-        return { body: await resp.json() };
-      } catch {
-        return { error: 0 };
+  usage: (): Promise<TProviderUsageSnapshot> =>
+    withRefreshCaller("usage", async (): Promise<TProviderUsageSnapshot> => {
+      const token = await readStoredToken();
+      if (token.kind === "missing") {
+        return { kind: "unavailable", reason: "not signed in to Grok" };
       }
-    };
+      if (token.kind === "expired") {
+        return { kind: "unavailable", reason: "credential_expired" };
+      }
+      // Same host as inference (`resolveProviderUrl` derives it from the captured
+      // upstream, never spawning the CLI). The plain OAuth bearer is accepted; we
+      // send our own `openllm/<ver>` identity (+ the gate version header),
+      // mirroring `credentialForUpstream`.
+      const headers = {
+        authorization: `Bearer ${token.accessToken}`,
+        "user-agent": OPENLLM_USER_AGENT,
+        "x-grok-client-version": await clientVersion(),
+        accept: "application/json",
+      };
+      // One authed billing GET → the parsed body, or a `{ error }` marker carrying
+      // the HTTP status so the WEEKLY (primary) view can turn a hard error into an
+      // `unavailable` snapshot while a MONTHLY failure just degrades gracefully.
+      const getBilling = async (
+        path: string,
+      ): Promise<{ body: unknown } | { error: number }> => {
+        try {
+          const resp = await fetch(await resolveProviderUrl(PROVIDER, path), {
+            method: "GET",
+            headers,
+            signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
+          });
+          if (!resp.ok) return { error: resp.status };
+          return { body: await resp.json() };
+        } catch {
+          return { error: 0 };
+        }
+      };
 
-    // The WEEKLY Grok Build pool (`?format=credits`) is the primary limit —
-    // it's what `grok /usage` and grok.com show and what gates inference; the
-    // MONTHLY included-credit view (plain path) is secondary. Fetch both; weekly
-    // decides the error envelope, monthly is best-effort (null → weekly-only).
-    const [credits, monthly] = await Promise.all([
-      getBilling(`${USAGE_PATH}?format=credits`),
-      getBilling(USAGE_PATH),
-    ]);
+      // The WEEKLY Grok Build pool (`?format=credits`) is the primary limit —
+      // it's what `grok /usage` and grok.com show and what gates inference; the
+      // MONTHLY included-credit view (plain path) is secondary. Fetch both; weekly
+      // decides the error envelope, monthly is best-effort (null → weekly-only).
+      const [credits, monthly] = await Promise.all([
+        getBilling(`${USAGE_PATH}?format=credits`),
+        getBilling(USAGE_PATH),
+      ]);
 
-    if ("error" in credits) {
-      return grokWeeklyUsageUnavailable(
-        credits.error,
-        Boolean(token.session.refresh_token),
+      if ("error" in credits) {
+        return grokWeeklyUsageUnavailable(
+          credits.error,
+          Boolean(token.session.refresh_token),
+        );
+      }
+
+      const snapshot = parseGrokUsage(
+        "body" in monthly ? monthly.body : null,
+        "body" in credits ? credits.body : null,
       );
-    }
+      if (snapshot.kind !== "quota") return snapshot;
+      const plan = await readGrokPlan(headers);
+      return plan === null
+        ? snapshot
+        : { ...snapshot, plan, plan_source: "private-client" };
+    }),
 
-    const snapshot = parseGrokUsage(
-      "body" in monthly ? monthly.body : null,
-      "body" in credits ? credits.body : null,
-    );
-    if (snapshot.kind !== "quota") return snapshot;
-    const plan = await readGrokPlan(headers);
-    return plan === null
-      ? snapshot
-      : { ...snapshot, plan, plan_source: "private-client" };
-  },
-
-  listModels: async () => {
-    // Live `/v1/models` rows via the shared cached fetch (both Grok Build
-    // models report `api_backend` through it). Metadata only; null on any
-    // failure (never an empty list).
-    const rows = await modelRows();
-    if (rows === null) return null;
-    const entries = parseGrokModelRows(rows);
-    return entries.length > 0 ? entries : null;
-  },
+  listModels: () =>
+    withRefreshCaller("models", async () => {
+      // Live `/v1/models` rows via the shared cached fetch (both Grok Build
+      // models report `api_backend` through it). Metadata only; null on any
+      // failure (never an empty list).
+      const rows = await modelRows();
+      if (rows === null) return null;
+      const entries = parseGrokModelRows(rows);
+      return entries.length > 0 ? entries : null;
+    }),
 
   discoverModels: async (
     options: TModelDiscoveryOptions,
@@ -909,27 +912,33 @@ export const grokDelegate: TProviderDelegate = {
   // them recursively from every tool's `parameters`.
   unsupportedToolSchemaKeywords: ["minContains", "maxContains"],
 
-  credentialForUpstream: async () => {
-    // cli-chat-proxy.grok.com's 426 gate requires `x-grok-client-version`, so
-    // `grokClientCredential` supplies the installed CLI's REAL version — but we
-    // identify as ourselves (`user-agent: openllm/<ver>`) and do NOT send
-    // `x-grok-client-identifier`; we are not the Grok CLI. The Responses TARGET
-    // URL is captured/default per-hop; the originator's other headers ride through.
-    return {
+  credentialForUpstream: () =>
+    withRefreshCaller("upstream", async () => {
+      // cli-chat-proxy.grok.com's 426 gate requires `x-grok-client-version`, so
+      // `grokClientCredential` supplies the installed CLI's REAL version — but we
+      // identify as ourselves (`user-agent: openllm/<ver>`) and do NOT send
+      // `x-grok-client-identifier`; we are not the Grok CLI. The Responses TARGET
+      // URL is captured/default per-hop; the originator's other headers ride through.
+      return {
+        ...(await grokClientCredential()),
+        url: await resolveUpstreamUrl(PROVIDER),
+      };
+    }),
+
+  credentialForImage: (): Promise<TImageCredential> =>
+    withRefreshCaller(
+      "upstream",
+      async (): Promise<TImageCredential> => ({
+        ...(await grokClientCredential()),
+        url: GROK_IMAGE_URL,
+      }),
+    ),
+
+  credentialForVideo: () =>
+    withRefreshCaller("upstream", async () => ({
       ...(await grokClientCredential()),
-      url: await resolveUpstreamUrl(PROVIDER),
-    };
-  },
-
-  credentialForImage: async (): Promise<TImageCredential> => ({
-    ...(await grokClientCredential()),
-    url: GROK_IMAGE_URL,
-  }),
-
-  credentialForVideo: async () => ({
-    ...(await grokClientCredential()),
-    url: GROK_VIDEO_BASE,
-  }),
+      url: GROK_VIDEO_BASE,
+    })),
 
   logout: async () => {
     // `grok logout` clears the cached credentials; then ensure the isolated

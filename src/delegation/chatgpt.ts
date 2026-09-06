@@ -56,6 +56,7 @@ import {
   lastRefreshErrorClass,
   resolveToken,
   spawnRefresh,
+  withRefreshCaller,
 } from "./refresh";
 import type {
   TImageCredential,
@@ -469,101 +470,108 @@ export const chatgptDelegate: TProviderDelegate = {
     };
   },
 
-  usage: async (): Promise<TProviderUsageSnapshot> => {
-    const token = await readStoredToken();
-    if (token.kind === "missing") {
-      return { kind: "unavailable", reason: "not signed in to Codex" };
-    }
-    if (token.kind === "expired") {
-      return { kind: "unavailable", reason: "credential_expired" };
-    }
-    try {
-      const resp = await fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {
-        method: "GET",
-        headers: {
+  usage: (): Promise<TProviderUsageSnapshot> =>
+    withRefreshCaller("usage", async (): Promise<TProviderUsageSnapshot> => {
+      const token = await readStoredToken();
+      if (token.kind === "missing") {
+        return { kind: "unavailable", reason: "not signed in to Codex" };
+      }
+      if (token.kind === "expired") {
+        return { kind: "unavailable", reason: "credential_expired" };
+      }
+      try {
+        const resp = await fetch(
+          await resolveProviderUrl(PROVIDER, USAGE_PATH),
+          {
+            method: "GET",
+            headers: {
+              authorization: `Bearer ${token.accessToken}`,
+              ...(token.accountId !== null
+                ? { "chatgpt-account-id": token.accountId }
+                : {}),
+              "user-agent": OPENLLM_USER_AGENT,
+              originator: OPENLLM_ORIGINATOR,
+              accept: "application/json",
+            },
+          },
+        );
+        if (!resp.ok) {
+          const reason =
+            resp.status === 401
+              ? "ChatGPT authorization was rejected — re-sign in via the Codex CLI."
+              : resp.status === 403
+                ? "No active ChatGPT subscription on this account."
+                : `ChatGPT couldn't report usage (HTTP ${resp.status}).`;
+          return { kind: "unavailable", reason };
+        }
+        // Reduced by the pure, payload-shape-agnostic reducers — OpenAI has
+        // already reshaped `rate_limit` once (5h primary + weekly secondary
+        // → a single weekly primary with `limit_window_seconds`), and the
+        // generic reduction absorbs the next reshape without a code change.
+        // Per-feature pools + credits ride along display-only.
+        const data = (await resp.json()) as {
+          plan_type?: string;
+          rate_limit?: unknown;
+          additional_rate_limits?: unknown;
+        };
+        const windows = reduceChatgptWindows(data.rate_limit);
+        const extraPools = reduceChatgptPools(data.additional_rate_limits);
+        const credits = reduceChatgptCredits(data);
+        return {
+          kind: "quota",
+          status: reduceQuotaStatus(data.rate_limit, windows),
+          ...(typeof data.plan_type === "string"
+            ? { plan: data.plan_type }
+            : {}),
+          windows,
+          ...(extraPools.length > 0 ? { extra_pools: extraPools } : {}),
+          ...(credits !== undefined ? { credits } : {}),
+          note: "ChatGPT Codex — read locally via Codex CLI",
+        };
+      } catch (err) {
+        return {
+          kind: "unavailable",
+          reason: err instanceof Error ? err.message : "usage fetch failed",
+        };
+      }
+    }),
+
+  listModels: () =>
+    withRefreshCaller("models", async () => {
+      // Codex's own models endpoint (`GET <base>/models?client_version=…` —
+      // `ref/codex/codex-rs/codex-api/src/endpoint/models.rs`), returning
+      // `{ models: [{ slug, display_name, visibility, context_window }] }`.
+      // Host derived from the CAPTURED inference URL via
+      // `resolveProviderUrl`; only the stable leaf path is a constant. The
+      // `client_version` query mirrors the CLI's own call (the installed
+      // codex version). Picker-visible models only (`visibility: "list"`)
+      // — same filter the CLI's model picker applies. Metadata only; null
+      // on any failure (never an empty list).
+      const token = await readToken();
+      if (token === null) return null;
+      // The backend wants a BARE semver (the CLI's own cache stores `"0.142.0"`).
+      // Read it from `cliInstallState` — the SAME source `status()` reports and
+      // `model-report` tags the list with — so the `client_version` we query with
+      // and the `cli_version` stamped on the resulting report can never disagree
+      // (which would let the cloud's older-semver guard drop a freshly-fetched
+      // list). `cliInstallState` already extracts the bare x.y.z; `0.0.0` fallback
+      // keeps the query well-formed when the version can't be read.
+      const ver = (await cliInstallState(PROVIDER)).version ?? "0.0.0";
+      return fetchModelList(
+        await resolveProviderUrl(
+          PROVIDER,
+          `/backend-api/codex/models?client_version=${encodeURIComponent(ver)}`,
+        ),
+        {
           authorization: `Bearer ${token.accessToken}`,
           ...(token.accountId !== null
             ? { "chatgpt-account-id": token.accountId }
             : {}),
-          "user-agent": OPENLLM_USER_AGENT,
-          originator: OPENLLM_ORIGINATOR,
           accept: "application/json",
         },
-      });
-      if (!resp.ok) {
-        const reason =
-          resp.status === 401
-            ? "ChatGPT authorization was rejected — re-sign in via the Codex CLI."
-            : resp.status === 403
-              ? "No active ChatGPT subscription on this account."
-              : `ChatGPT couldn't report usage (HTTP ${resp.status}).`;
-        return { kind: "unavailable", reason };
-      }
-      // Reduced by the pure, payload-shape-agnostic reducers — OpenAI has
-      // already reshaped `rate_limit` once (5h primary + weekly secondary
-      // → a single weekly primary with `limit_window_seconds`), and the
-      // generic reduction absorbs the next reshape without a code change.
-      // Per-feature pools + credits ride along display-only.
-      const data = (await resp.json()) as {
-        plan_type?: string;
-        rate_limit?: unknown;
-        additional_rate_limits?: unknown;
-      };
-      const windows = reduceChatgptWindows(data.rate_limit);
-      const extraPools = reduceChatgptPools(data.additional_rate_limits);
-      const credits = reduceChatgptCredits(data);
-      return {
-        kind: "quota",
-        status: reduceQuotaStatus(data.rate_limit, windows),
-        ...(typeof data.plan_type === "string" ? { plan: data.plan_type } : {}),
-        windows,
-        ...(extraPools.length > 0 ? { extra_pools: extraPools } : {}),
-        ...(credits !== undefined ? { credits } : {}),
-        note: "ChatGPT Codex — read locally via Codex CLI",
-      };
-    } catch (err) {
-      return {
-        kind: "unavailable",
-        reason: err instanceof Error ? err.message : "usage fetch failed",
-      };
-    }
-  },
-
-  listModels: async () => {
-    // Codex's own models endpoint (`GET <base>/models?client_version=…` —
-    // `ref/codex/codex-rs/codex-api/src/endpoint/models.rs`), returning
-    // `{ models: [{ slug, display_name, visibility, context_window }] }`.
-    // Host derived from the CAPTURED inference URL via
-    // `resolveProviderUrl`; only the stable leaf path is a constant. The
-    // `client_version` query mirrors the CLI's own call (the installed
-    // codex version). Picker-visible models only (`visibility: "list"`)
-    // — same filter the CLI's model picker applies. Metadata only; null
-    // on any failure (never an empty list).
-    const token = await readToken();
-    if (token === null) return null;
-    // The backend wants a BARE semver (the CLI's own cache stores `"0.142.0"`).
-    // Read it from `cliInstallState` — the SAME source `status()` reports and
-    // `model-report` tags the list with — so the `client_version` we query with
-    // and the `cli_version` stamped on the resulting report can never disagree
-    // (which would let the cloud's older-semver guard drop a freshly-fetched
-    // list). `cliInstallState` already extracts the bare x.y.z; `0.0.0` fallback
-    // keeps the query well-formed when the version can't be read.
-    const ver = (await cliInstallState(PROVIDER)).version ?? "0.0.0";
-    return fetchModelList(
-      await resolveProviderUrl(
-        PROVIDER,
-        `/backend-api/codex/models?client_version=${encodeURIComponent(ver)}`,
-      ),
-      {
-        authorization: `Bearer ${token.accessToken}`,
-        ...(token.accountId !== null
-          ? { "chatgpt-account-id": token.accountId }
-          : {}),
-        accept: "application/json",
-      },
-      parseChatgptModelList,
-    );
-  },
+        parseChatgptModelList,
+      );
+    }),
 
   discoverModels: async (
     options: TModelDiscoveryOptions,
@@ -601,70 +609,78 @@ export const chatgptDelegate: TProviderDelegate = {
     );
   },
 
-  credentialForUpstream: async (inbound?: Headers) => {
-    const token = await readToken();
-    if (token === null) {
-      throw new Error("chatgpt: not signed in (no stored credential)");
-    }
-    // Resolve only the request TARGET URL (captured from the genuine `codex`
-    // request, or the default). `chatgpt-account-id` is the credential-intrinsic
-    // header — the user's OWN account, read from the store, which routes the
-    // request to their subscription.
-    const url = await resolveUpstreamUrl(PROVIDER);
-    const headers: Record<string, string> =
-      token.accountId !== null ? { "chatgpt-account-id": token.accountId } : {};
+  credentialForUpstream: (inbound?: Headers) =>
+    withRefreshCaller("upstream", async () => {
+      const token = await readToken();
+      if (token === null) {
+        throw new Error("chatgpt: not signed in (no stored credential)");
+      }
+      // Resolve only the request TARGET URL (captured from the genuine `codex`
+      // request, or the default). `chatgpt-account-id` is the credential-intrinsic
+      // header — the user's OWN account, read from the store, which routes the
+      // request to their subscription.
+      const url = await resolveUpstreamUrl(PROVIDER);
+      const headers: Record<string, string> =
+        token.accountId !== null
+          ? { "chatgpt-account-id": token.accountId }
+          : {};
 
-    // Client identity. A genuine `codex` request (the real CLI proxied through
-    // the daemon) already presents `originator: codex_cli_rs` + a
-    // `codex_cli_rs/<ver>` user-agent — we leave those untouched so it reaches
-    // the vendor byte-for-byte. A NON-codex caller is served under OUR OWN
-    // identity (`openllm/<ver>`, `originator: openllm`); we do NOT fabricate the
-    // codex identity. The old model gate (`gpt-5.6-luna` 404'd without codex
-    // identity) was found lifted by a 2026-07-14 live probe (luna 200s with a
-    // generic originator), so self-identifying no longer trips it.
-    if (!hasCodexOriginator(inbound)) headers.originator = OPENLLM_ORIGINATOR;
-    if (!hasCodexUserAgent(inbound)) headers["user-agent"] = OPENLLM_USER_AGENT;
+      // Client identity. A genuine `codex` request (the real CLI proxied through
+      // the daemon) already presents `originator: codex_cli_rs` + a
+      // `codex_cli_rs/<ver>` user-agent — we leave those untouched so it reaches
+      // the vendor byte-for-byte. A NON-codex caller is served under OUR OWN
+      // identity (`openllm/<ver>`, `originator: openllm`); we do NOT fabricate the
+      // codex identity. The old model gate (`gpt-5.6-luna` 404'd without codex
+      // identity) was found lifted by a 2026-07-14 live probe (luna 200s with a
+      // generic originator), so self-identifying no longer trips it.
+      if (!hasCodexOriginator(inbound)) headers.originator = OPENLLM_ORIGINATOR;
+      if (!hasCodexUserAgent(inbound))
+        headers["user-agent"] = OPENLLM_USER_AGENT;
 
-    return {
-      access_token: token.accessToken,
-      headers,
-      url,
-      // Which account this hop's cost attributes to (recorded on the row).
-      ...(token.accountId !== null
-        ? { account_hash: accountHash(PROVIDER, token.accountId) }
-        : {}),
-    };
-  },
+      return {
+        access_token: token.accessToken,
+        headers,
+        url,
+        // Which account this hop's cost attributes to (recorded on the row).
+        ...(token.accountId !== null
+          ? { account_hash: accountHash(PROVIDER, token.accountId) }
+          : {}),
+      };
+    }),
 
-  credentialForImage: async (inbound?: Headers): Promise<TImageCredential> => {
-    const token = await readToken();
-    if (token === null) {
-      throw new Error("chatgpt: not signed in (no stored credential)");
-    }
-    // Image endpoint is a sibling of the captured `/responses` endpoint,
-    // so `resolveProviderUrl` keeps host drift from CLI version changes while
-    // enforcing same-host origin.
-    const url = await resolveProviderUrl(
-      PROVIDER,
-      "/backend-api/codex/images/generations",
-    );
-    const headers: Record<string, string> =
-      token.accountId !== null ? { "chatgpt-account-id": token.accountId } : {};
+  credentialForImage: (inbound?: Headers): Promise<TImageCredential> =>
+    withRefreshCaller("upstream", async (): Promise<TImageCredential> => {
+      const token = await readToken();
+      if (token === null) {
+        throw new Error("chatgpt: not signed in (no stored credential)");
+      }
+      // Image endpoint is a sibling of the captured `/responses` endpoint,
+      // so `resolveProviderUrl` keeps host drift from CLI version changes while
+      // enforcing same-host origin.
+      const url = await resolveProviderUrl(
+        PROVIDER,
+        "/backend-api/codex/images/generations",
+      );
+      const headers: Record<string, string> =
+        token.accountId !== null
+          ? { "chatgpt-account-id": token.accountId }
+          : {};
 
-    // Codex-CLI identity BACKFILL. Keep parity with
-    // `credentialForUpstream`.
-    if (!hasCodexOriginator(inbound)) headers.originator = OPENLLM_ORIGINATOR;
-    if (!hasCodexUserAgent(inbound)) headers["user-agent"] = OPENLLM_USER_AGENT;
+      // Codex-CLI identity BACKFILL. Keep parity with
+      // `credentialForUpstream`.
+      if (!hasCodexOriginator(inbound)) headers.originator = OPENLLM_ORIGINATOR;
+      if (!hasCodexUserAgent(inbound))
+        headers["user-agent"] = OPENLLM_USER_AGENT;
 
-    return {
-      access_token: token.accessToken,
-      headers,
-      url,
-      ...(token.accountId !== null
-        ? { account_hash: accountHash(PROVIDER, token.accountId) }
-        : {}),
-    };
-  },
+      return {
+        access_token: token.accessToken,
+        headers,
+        url,
+        ...(token.accountId !== null
+          ? { account_hash: accountHash(PROVIDER, token.accountId) }
+          : {}),
+      };
+    }),
 
   logout: async () => {
     // `codex logout` revokes the token server-side; then ensure the isolated

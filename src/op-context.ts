@@ -17,6 +17,14 @@ export type TRefreshSpawnBag = {
 
 export const refreshSpawnBag = new AsyncLocalStorage<TRefreshSpawnBag>();
 
+/** Who kicked `makeRefresher` — demand-path tag for `refresh_spawns.last`. */
+export type TRefreshCaller = "upstream" | "usage" | "models" | "login";
+
+export const refreshCallerBag = new AsyncLocalStorage<TRefreshCaller>();
+
+export const currentRefreshCaller = (): TRefreshCaller | null =>
+  refreshCallerBag.getStore() ?? null;
+
 export type TOpTick = {
   readonly tick_id: number;
   readonly slug?: string;

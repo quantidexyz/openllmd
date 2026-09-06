@@ -52,6 +52,7 @@ import {
   keychainRefreshSpawnAllowed,
   resolveToken,
   spawnRefresh,
+  withRefreshCaller,
 } from "./refresh";
 import type {
   TModelDiscoveryOptions,
@@ -659,52 +660,55 @@ export const cursorDelegate: TProviderDelegate = {
     };
   },
 
-  usage: async (): Promise<TProviderUsageSnapshot> => {
-    const token = await readStoredToken();
-    if (token.kind === "missing")
-      return { kind: "unavailable", reason: "not signed in to Cursor" };
-    if (token.kind === "expired")
-      return { kind: "unavailable", reason: "credential_expired" };
-    const stored = token.stored;
-    try {
-      const [usage, plan] = await Promise.all([
-        fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {
-          method: "POST",
-          headers: dashboardHeaders(stored.accessToken),
-          body: "{}",
-          signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
-        }),
-        fetch(await resolveProviderUrl(PROVIDER, PLAN_PATH), {
-          method: "POST",
-          headers: dashboardHeaders(stored.accessToken),
-          body: "{}",
-          signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
-        }),
-      ]);
-      if (!usage.ok || !plan.ok) {
-        const failed = !usage.ok ? usage : plan;
-        if (failed.status === 401) clearCursorStatusObservationCache();
+  usage: (): Promise<TProviderUsageSnapshot> =>
+    withRefreshCaller("usage", async (): Promise<TProviderUsageSnapshot> => {
+      const token = await readStoredToken();
+      if (token.kind === "missing")
+        return { kind: "unavailable", reason: "not signed in to Cursor" };
+      if (token.kind === "expired")
+        return { kind: "unavailable", reason: "credential_expired" };
+      const stored = token.stored;
+      try {
+        const [usage, plan] = await Promise.all([
+          fetch(await resolveProviderUrl(PROVIDER, USAGE_PATH), {
+            method: "POST",
+            headers: dashboardHeaders(stored.accessToken),
+            body: "{}",
+            signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
+          }),
+          fetch(await resolveProviderUrl(PROVIDER, PLAN_PATH), {
+            method: "POST",
+            headers: dashboardHeaders(stored.accessToken),
+            body: "{}",
+            signal: AbortSignal.timeout(MODEL_LIST_FETCH_TIMEOUT_MS),
+          }),
+        ]);
+        if (!usage.ok || !plan.ok) {
+          const failed = !usage.ok ? usage : plan;
+          if (failed.status === 401) clearCursorStatusObservationCache();
+          return {
+            kind: "unavailable",
+            reason:
+              failed.status === 401
+                ? "Cursor authorization was rejected — re-sign in via `cursor-agent login`."
+                : failed.status === 403
+                  ? "No active Cursor subscription on this account."
+                  : `Cursor couldn't report usage (HTTP ${failed.status}).`,
+            link: "https://cursor.com/dashboard",
+          };
+        }
+        return parseCursorUsage(await usage.json(), await plan.json());
+      } catch (error) {
         return {
           kind: "unavailable",
           reason:
-            failed.status === 401
-              ? "Cursor authorization was rejected — re-sign in via `cursor-agent login`."
-              : failed.status === 403
-                ? "No active Cursor subscription on this account."
-                : `Cursor couldn't report usage (HTTP ${failed.status}).`,
+            error instanceof Error
+              ? error.message
+              : "Cursor usage fetch failed",
           link: "https://cursor.com/dashboard",
         };
       }
-      return parseCursorUsage(await usage.json(), await plan.json());
-    } catch (error) {
-      return {
-        kind: "unavailable",
-        reason:
-          error instanceof Error ? error.message : "Cursor usage fetch failed",
-        link: "https://cursor.com/dashboard",
-      };
-    }
-  },
+    }),
 
   // Automatic discovery reads native observations captured during a real
   // inference ACP session (or a prior manual probe). Never constructs ACP,
@@ -728,57 +732,65 @@ export const cursorDelegate: TProviderDelegate = {
 
   // Manual list still may spawn a short-lived ACP session. The same native
   // observation cache stores the result (and inference-captured rows).
-  listModels: async (): Promise<ReadonlyArray<TProviderModelEntry> | null> => {
-    const token = await readToken();
-    const expiryMs = token === null ? null : jwtExpiryMs(token.accessToken);
-    const accountHint =
-      token === null
-        ? null
-        : (jwtSubject(token.accessToken)?.split("|").at(-1) ?? null);
-    const provenance = cursorModelProvenance(accountHint);
-    if (provenance !== null) {
-      const cached = readCursorNativeModels(provenance);
-      if (cached !== null) return cached;
-    }
-    if (expiryMs === null || expiryMs <= Date.now()) return null;
-    if (cursorModelsInflight === null) {
-      const observedGeneration = cursorNativeModelGeneration();
-      cursorModelsInflight =
-        (async (): Promise<ReadonlyArray<TProviderModelEntry> | null> => {
-          const rows = await listCursorModelsViaAcp({ bin: bin(), env: env() });
-          if (rows === null) return null;
-          const live = cursorModelProvenance(accountHint);
-          if (live !== null) {
-            rememberCursorNativeModels(
-              live,
-              rows,
-              Date.now(),
-              observedGeneration,
-            );
-            const cached = readCursorNativeModels(live);
-            if (cached !== null) return cached;
-          }
-          return entriesFromCursorModelRows(rows);
-        })().finally(() => {
-          cursorModelsInflight = null;
-        });
-    }
-    return cursorModelsInflight;
-  },
+  listModels: (): Promise<ReadonlyArray<TProviderModelEntry> | null> =>
+    withRefreshCaller(
+      "models",
+      async (): Promise<ReadonlyArray<TProviderModelEntry> | null> => {
+        const token = await readToken();
+        const expiryMs = token === null ? null : jwtExpiryMs(token.accessToken);
+        const accountHint =
+          token === null
+            ? null
+            : (jwtSubject(token.accessToken)?.split("|").at(-1) ?? null);
+        const provenance = cursorModelProvenance(accountHint);
+        if (provenance !== null) {
+          const cached = readCursorNativeModels(provenance);
+          if (cached !== null) return cached;
+        }
+        if (expiryMs === null || expiryMs <= Date.now()) return null;
+        if (cursorModelsInflight === null) {
+          const observedGeneration = cursorNativeModelGeneration();
+          cursorModelsInflight =
+            (async (): Promise<ReadonlyArray<TProviderModelEntry> | null> => {
+              const rows = await listCursorModelsViaAcp({
+                bin: bin(),
+                env: env(),
+              });
+              if (rows === null) return null;
+              const live = cursorModelProvenance(accountHint);
+              if (live !== null) {
+                rememberCursorNativeModels(
+                  live,
+                  rows,
+                  Date.now(),
+                  observedGeneration,
+                );
+                const cached = readCursorNativeModels(live);
+                if (cached !== null) return cached;
+              }
+              return entriesFromCursorModelRows(rows);
+            })().finally(() => {
+              cursorModelsInflight = null;
+            });
+        }
+        return cursorModelsInflight;
+      },
+    ),
 
-  credentialForUpstream: async () => {
-    const token = await readToken();
-    if (token === null)
-      throw new Error("cursor: not signed in (no stored credential)");
-    // Cursor has no manual HTTP inference path — the ACP bridge
-    // (native-runtime/cursor-acp.ts) serves inference and never calls this.
-    // Resolve the auth-config default target for diagnostics/contract parity,
-    // then reject before any request can be issued to the dashboard endpoint.
-    const url = await resolveUpstreamUrl(PROVIDER);
-    throw new Error(
-      `cursor is served by the ACP bridge (cursor-agent acp); there is no manual upstream transport (configured target: ${new URL(url).origin})`,
-    );
-  },
+  credentialForUpstream: () =>
+    withRefreshCaller("upstream", async () => {
+      const token = await readToken();
+      if (token === null)
+        throw new Error("cursor: not signed in (no stored credential)");
+      // Cursor has no manual HTTP inference path — the ACP bridge
+      // (native-runtime/cursor-acp.ts) serves inference and never calls this.
+      // Resolve the auth-config default target for diagnostics/contract parity,
+      // then reject before any request can be issued to the dashboard endpoint.
+      const url = await resolveUpstreamUrl(PROVIDER);
+      throw new Error(
+        `cursor is served by the ACP bridge (cursor-agent acp); there is no manual upstream transport (configured target: ${new URL(url).origin})`,
+      );
+    }),
 
   logout: async () => {
     clearCursorStatusObservationCache();

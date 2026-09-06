@@ -16,9 +16,23 @@
  * hard-expired — exactly "no latency unless the refresh is close".
  */
 import { logDebug, logInfo, logWarn } from "../logger";
-import { currentTickId, refreshSpawnBag } from "../op-context";
+import type { TRefreshCaller } from "../op-context";
+import {
+  currentRefreshCaller,
+  currentTickId,
+  refreshCallerBag,
+  refreshSpawnBag,
+} from "../op-context";
 import type { TLoginResult, TStoreRead } from "./util";
 import { spawnLogin, spawnLoginPty } from "./util";
+
+export type { TRefreshCaller } from "../op-context";
+
+/** Stamp the demand-path caller onto any nested `makeRefresher` fire. */
+export const withRefreshCaller = <T>(
+  caller: TRefreshCaller,
+  fn: () => Promise<T>,
+): Promise<T> => refreshCallerBag.run(caller, fn);
 
 /** Bound on a refresh spawn — generous for a slow first call, short enough that
  *  a wedged child is reaped (the refresh already landed mid-request before the
@@ -129,6 +143,45 @@ type TRefreshCounters = {
 
 const refreshCounters = new Map<string, TRefreshCounters>();
 
+export type TRefreshLast = {
+  readonly caller: TRefreshCaller | null;
+  readonly error_class: TRefreshErrorClass | null;
+  readonly exit_code: number | null;
+  readonly spawn_elapsed_ms: number | null;
+  readonly queued_ms: number | null;
+  readonly timeout_ms: number | null;
+  readonly in_flight: boolean;
+};
+
+const emptyLast = (): TRefreshLast => ({
+  caller: null,
+  error_class: null,
+  exit_code: null,
+  spawn_elapsed_ms: null,
+  queued_ms: null,
+  timeout_ms: null,
+  in_flight: false,
+});
+
+const refreshLast = new Map<string, TRefreshLast>();
+
+const lastFor = (provider: string): TRefreshLast => {
+  const current = refreshLast.get(provider);
+  if (current !== undefined) return current;
+  const next = emptyLast();
+  refreshLast.set(provider, next);
+  return next;
+};
+
+const patchLast = (
+  provider: string,
+  patch: Partial<TRefreshLast>,
+): TRefreshLast => {
+  const next: TRefreshLast = { ...lastFor(provider), ...patch };
+  refreshLast.set(provider, next);
+  return next;
+};
+
 const counterFor = (provider: string): TRefreshCounters => {
   const current = refreshCounters.get(provider);
   if (current !== undefined) return current;
@@ -143,13 +196,24 @@ const counterFor = (provider: string): TRefreshCounters => {
     lost: 0,
   };
   refreshCounters.set(provider, next);
+  lastFor(provider);
   return next;
+};
+
+export type TRefreshTelemetryEntry = TRefreshCounters & {
+  readonly last: TRefreshLast;
 };
 
 /** Metadata-only refresh telemetry for `openllmd status` consumers. */
 export const refreshTelemetrySnapshot = (): Readonly<
-  Record<string, Readonly<TRefreshCounters>>
-> => Object.fromEntries(refreshCounters.entries());
+  Record<string, Readonly<TRefreshTelemetryEntry>>
+> =>
+  Object.fromEntries(
+    [...refreshCounters.entries()].map(([provider, counters]) => [
+      provider,
+      { ...counters, last: lastFor(provider) },
+    ]),
+  );
 
 export const noteRefreshTokenLost = (provider: string): void => {
   counterFor(provider).lost++;
@@ -461,6 +525,16 @@ export const makeRefresher = (opts: {
       // `ok` on those benign paths.
       const counters = counterFor(opts.slug);
       counters.attempts++;
+      const caller = currentRefreshCaller();
+      patchLast(opts.slug, {
+        caller,
+        error_class: null,
+        exit_code: null,
+        spawn_elapsed_ms: null,
+        queued_ms: null,
+        timeout_ms: null,
+        in_flight: true,
+      });
       const bag: {
         meta: TRefreshSpawnMeta | undefined;
         timeoutMs: number | undefined;
@@ -480,13 +554,25 @@ export const makeRefresher = (opts: {
                   child_pid: meta.child_pid,
                 }
               : bag.meta;
+          const clocks = refreshClocks(started, spawn);
+          const timeout_ms = bag.timeoutMs ?? REFRESH_SPAWN_TIMEOUT_MS;
+          patchLast(opts.slug, {
+            caller,
+            error_class: null,
+            exit_code: null,
+            spawn_elapsed_ms: clocks.spawn_elapsed_ms,
+            queued_ms: clocks.queued_ms,
+            timeout_ms,
+            in_flight: false,
+          });
           logInfo("refresh", "native refresh trigger settled", {
             provider: opts.slug,
             label: opts.label,
             phase: "refresh_trigger",
-            ...refreshClocks(started, spawn),
-            timeout_ms: bag.timeoutMs ?? REFRESH_SPAWN_TIMEOUT_MS,
+            ...clocks,
+            timeout_ms,
             tick_id: currentTickId(),
+            caller,
           });
         })
         .catch((err: unknown) => {
@@ -510,14 +596,26 @@ export const makeRefresher = (opts: {
                   child_pid: triggerError.childPid,
                 };
           const clocks = refreshClocks(started, spawn);
+          const timeout_ms =
+            triggerError?.timeoutMs ?? REFRESH_SPAWN_TIMEOUT_MS;
+          patchLast(opts.slug, {
+            caller,
+            error_class: lastErrorClass,
+            exit_code: triggerError?.exitCode ?? null,
+            spawn_elapsed_ms: clocks.spawn_elapsed_ms,
+            queued_ms: clocks.queued_ms,
+            timeout_ms,
+            in_flight: false,
+          });
           if (lastErrorClass === "network") {
             logWarn("refresh", "codex token refresh failed: network", {
               provider: opts.slug,
               errno: triggerError?.errno ?? networkErrno(err),
               retry_in_ms: failureBackoffMs,
               ...clocks,
-              timeout_ms: triggerError?.timeoutMs ?? REFRESH_SPAWN_TIMEOUT_MS,
+              timeout_ms,
               tick_id: currentTickId(),
+              caller,
             });
             return;
           }
@@ -527,14 +625,16 @@ export const makeRefresher = (opts: {
             phase: "refresh_trigger",
             error_class: lastErrorClass,
             ...clocks,
-            timeout_ms: triggerError?.timeoutMs ?? REFRESH_SPAWN_TIMEOUT_MS,
+            timeout_ms,
             abandoned: triggerError?.abandoned ?? false,
             exit_code: triggerError?.exitCode ?? null,
             tick_id: currentTickId(),
+            caller,
           });
         })
         .finally(() => {
           inFlight = null;
+          patchLast(opts.slug, { in_flight: false });
         });
     }
     return inFlight;

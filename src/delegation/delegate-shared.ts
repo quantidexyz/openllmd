@@ -12,7 +12,11 @@ import { ensureAuthConfig } from "./auth-config";
 import type { TLoginSlot } from "./login-flow";
 import { loginSlot } from "./login-flow";
 import type { TRefreshSpawnMeta } from "./refresh";
-import { makeRefresher, REFRESH_COOLDOWN_MS } from "./refresh";
+import {
+  makeRefresher,
+  REFRESH_COOLDOWN_MS,
+  withRefreshCaller,
+} from "./refresh";
 
 export const cliLaunch = (
   provider: TCliProvider,
@@ -78,9 +82,11 @@ export const loginWiring = <
   inProgressDetail: opts.inProgressDetail as TProgress,
   isInstalled: async (): Promise<boolean> =>
     (await cliInstallState(opts.provider)).installed,
-  isConnected:
-    opts.isConnected ??
-    (async (): Promise<boolean> => (await opts.readToken()) !== null),
+  isConnected: async (): Promise<boolean> =>
+    withRefreshCaller("login", async (): Promise<boolean> => {
+      if (opts.isConnected !== undefined) return opts.isConnected();
+      return (await opts.readToken()) !== null;
+    }),
   refreshConfig: (): void => {
     void ensureAuthConfig(opts.provider, { force: true }).catch(() => {});
   },
