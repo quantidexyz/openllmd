@@ -42,20 +42,31 @@ const walkCauses = (err: unknown): ReadonlyArray<unknown> => {
   return out;
 };
 
+const errorName = (err: unknown): string | null => {
+  if (typeof err !== "object" || err === null) return null;
+  const name = (err as { name?: unknown }).name;
+  return typeof name === "string" ? name : null;
+};
+
+const errorMessage = (err: unknown): string => {
+  if (typeof err !== "object" || err === null) return "";
+  const message = (err as { message?: unknown }).message;
+  return typeof message === "string" ? message : "";
+};
+
 const isTimeoutError = (err: unknown): boolean => {
-  if (!(err instanceof Error)) return false;
-  if (err.name === "TimeoutError") return true;
   if (nodeCode(err) === "ETIMEDOUT") return true;
-  if (err.name === "AbortError") {
-    const msg = err.message.toLowerCase();
+  const name = errorName(err);
+  if (name === "TimeoutError") return true;
+  if (name === "AbortError") {
+    const msg = errorMessage(err).toLowerCase();
     return msg.includes("timeout") || msg.includes("timed out");
   }
   return false;
 };
 
 const isCallerAbort = (err: unknown): boolean => {
-  if (!(err instanceof Error)) return false;
-  if (err.name !== "AbortError") return false;
+  if (errorName(err) !== "AbortError") return false;
   return !isTimeoutError(err);
 };
 

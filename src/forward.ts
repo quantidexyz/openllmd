@@ -25,12 +25,13 @@ import {
 
 /** Bound how long we wait for origin *headers*. The timer is cleared once
  *  headers arrive so a long inference stream is not cut by this budget.
- *  {@link inbound.signal} stays on the fetch via `AbortSignal.any`. */
-const originHeaderTimeoutMs = (): number => {
+ *  {@link inbound.signal} stays on the fetch via `AbortSignal.any`.
+ *  Env override must be a strict positive safe integer. */
+export const originHeaderTimeoutMs = (): number => {
   const raw = process.env.OPENLLM_ORIGIN_HEADER_TIMEOUT_MS;
   if (raw === undefined) return CLOUD_FETCH_TIMEOUT_MS;
-  const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) && n >= 0 ? n : CLOUD_FETCH_TIMEOUT_MS;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n > 0 ? n : CLOUD_FETCH_TIMEOUT_MS;
 };
 
 const headerTimeoutAbort = (): Error => {
