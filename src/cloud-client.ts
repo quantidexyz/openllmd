@@ -134,7 +134,9 @@ const authHeaders = (): Record<string, string> => {
 // early-return — the daemon is stuck "connecting" until the process restarts.
 // Bounding every call with an AbortSignal lets a stalled connection reject
 // promptly so the channel loop's backoff (or the caller) retries cleanly.
-const CLOUD_FETCH_TIMEOUT_MS = 15_000;
+/** Control-plane header budget. Origin inference reuses this only for
+ *  waiting on headers — never as a stream cutoff. */
+export const CLOUD_FETCH_TIMEOUT_MS = 15_000;
 const MEDIA_UPLOAD_TIMEOUT_MS = 120_000;
 
 const cloudFetch = (url: string, init: RequestInit): Promise<Response> =>
@@ -189,12 +191,13 @@ export const fetchBootstrap = async (): Promise<TDaemonBootstrap> => {
 export const fetchPlan = async (
   model: string,
   estTokens: number,
+  signal?: AbortSignal,
 ): Promise<TDaemonPlanResponse> => {
   const params = new URLSearchParams({ model });
   if (estTokens > 0) params.set("est_tokens", String(Math.ceil(estTokens)));
   const resp = await cloudFetch(
     cloudUrl(`/api/daemon/plan?${params.toString()}`),
-    { method: "GET", headers: authHeaders() },
+    { method: "GET", headers: authHeaders(), signal },
   );
   if (resp.status === 401 || resp.status === 403) {
     throw new InvalidApiKeyError(resp.status);

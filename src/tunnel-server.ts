@@ -122,9 +122,9 @@ function tunneledRequest(
 /** The request dispatcher — `handleInference` in production; injectable so
  *  tests exercise the tunnel state machine without a walker/cloud. */
 type TDispatch = (req: Request) => Promise<Response>;
-let dispatch: TDispatch = handleInference;
+let dispatch: TDispatch = (req) => handleInference(req);
 export const setTunnelDispatcher = (fn: TDispatch | null): void => {
-  dispatch = fn ?? handleInference;
+  dispatch = fn ?? ((req) => handleInference(req));
 };
 
 /** Admission remains daemon-owned so concurrent mux tunnels share one cap. */

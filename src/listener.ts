@@ -33,6 +33,12 @@ import { isSubscriptionSlug } from "./delegation";
 import { passthroughToOrigin } from "./forward";
 import { runImageWalker } from "./image-walker";
 import { logWarn } from "./logger";
+import {
+  originFailureMessage,
+  originFailureStatus,
+  originFailureType,
+  planFetchFailureAction,
+} from "./net-error";
 import { lookupPlan, storePlan } from "./plan-cache";
 import { isBodylessVideoOp, videoOperationFor } from "./video-ops";
 import {
@@ -240,8 +246,24 @@ export const handleInference = async (req: Request): Promise<Response> => {
   ) {
     let fetched: Awaited<ReturnType<typeof fetchPlan>> | null = null;
     try {
-      fetched = await fetchPlan(alias, estimateBodyTokens(rawBody));
+      fetched = await fetchPlan(alias, estimateBodyTokens(rawBody), req.signal);
     } catch (err) {
+      const decision = planFetchFailureAction(err, req.signal);
+      if (decision.action === "origin-error") {
+        logWarn(
+          "listener",
+          `plan fetch ${decision.kind} for ${alias} — not repeating the same origin`,
+        );
+        return withCors(
+          req,
+          errorJson(
+            originFailureStatus(decision.kind),
+            originFailureMessage(decision.kind),
+            originFailureType(decision.kind),
+          ),
+        );
+      }
+      if (decision.action === "throw") throw err;
       logWarn(
         "listener",
         `plan fetch failed for ${alias} — passing through to origin (${err instanceof Error ? err.message : String(err)})`,

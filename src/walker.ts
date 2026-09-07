@@ -85,6 +85,14 @@ import {
   quotaGateDecision,
 } from "@openllmsh/wire/features/quota-gate";
 import {
+  countTokensEndpointIdentity,
+  countTokensUnsupportedFromUpstream,
+  isCountTokensUnsupported,
+  rememberCountTokensUnsupported,
+} from "@openllmsh/wire/lib/canonical/count-tokens-capability";
+import type { TTokenEncoding } from "@openllmsh/wire/lib/canonical/encoding-select";
+import {
+  DEFAULT_ENCODING,
   encodingForSurface,
   getTokenCounter,
 } from "@openllmsh/wire/lib/canonical/encoding-select";
@@ -3379,14 +3387,22 @@ export const countTokensUpstreamUrl = (messagesUrl: string): string | null => {
  * row is recorded; the vendor bills nothing for a token count.
  */
 export const runCountTokens = async (args: TWalkArgs): Promise<Response> => {
-  const estimate = (reason: string): Response => {
-    logWarn(
-      "count-tokens",
-      `serving local estimate for ${args.endpoint}: ${reason}`,
-    );
+  const estimate = async (
+    encoding: TTokenEncoding,
+    reason: string | null,
+  ): Promise<Response> => {
+    if (reason !== null) {
+      logWarn(
+        "count-tokens",
+        `serving local estimate for ${args.endpoint}: ${reason}`,
+      );
+    }
     return new Response(
       JSON.stringify({
-        input_tokens: estimateAnthropicInputTokens(args.rawBody),
+        input_tokens: await estimateAnthropicInputTokens(
+          args.rawBody,
+          encoding,
+        ),
       }),
       { status: 200, headers: { "content-type": "application/json" } },
     );
@@ -3403,27 +3419,48 @@ export const runCountTokens = async (args: TWalkArgs): Promise<Response> => {
       args.sigParam,
     )
   ) {
-    return estimate("plan signature missing or invalid");
+    return estimate(DEFAULT_ENCODING, "plan signature missing or invalid");
   }
   const planModelIds = parsePlan(args.planParam);
   const head = planModelIds[0];
-  if (head === undefined) return estimate("no plan");
+  if (head === undefined) return estimate(DEFAULT_ENCODING, null);
   const pmids = args.pmidsParam === null ? [] : args.pmidsParam.split(",");
   // The HEAD of the chain only: it's the hop that would serve the matching
   // `/v1/messages` call, so it's the one whose tokenizer the client is asking
   // about. A preflight never walks — a fallback hop's count would describe a
   // model the request isn't going to.
   const hop = resolveHop(head, pmids[0]);
+  const hopEncoding: TTokenEncoding =
+    UPSTREAM_WIRE[hop.provider] === "anthropic" ? "claude" : DEFAULT_ENCODING;
   if (UPSTREAM_WIRE[hop.provider] !== "anthropic") {
-    return estimate(`${hop.provider} has no count_tokens endpoint`);
+    // Known non-Anthropic wire: no count_tokens leaf exists. Local BPE only —
+    // never a fetch, never a warning (this is the expected ChatGPT/Kimi/Grok
+    // preflight path).
+    return estimate(hopEncoding, null);
   }
+  // The count URL is the captured delegate inference URL + `/count_tokens`.
+  // That host is not in the unsigned request; guessing it would mix custom
+  // endpoints. `acquireUpstream` is therefore required to *name* the
+  // identity (it may refresh CLI auth as a side effect). Once named, a
+  // remembered-unsupported hop skips the count HTTP below — not the
+  // acquire.
   const acquired = await acquireUpstream(hop.provider, args, hop);
   if (acquired === "retry") {
-    return estimate(`no usable ${hop.provider} credential`);
+    return estimate(hopEncoding, `no usable ${hop.provider} credential`);
   }
   const url = countTokensUpstreamUrl(acquired.url);
   if (url === null) {
-    return estimate("captured upstream url is not a /messages endpoint");
+    return estimate(
+      hopEncoding,
+      "captured upstream url is not a /messages endpoint",
+    );
+  }
+  const scope = {
+    provider: hop.provider,
+    endpointIdentity: countTokensEndpointIdentity(url),
+  };
+  if (isCountTokensUnsupported(scope)) {
+    return estimate(hopEncoding, null);
   }
   let built: ReturnType<typeof buildUpstreamRequest>;
   try {
@@ -3444,7 +3481,7 @@ export const runCountTokens = async (args: TWalkArgs): Promise<Response> => {
     });
   } catch (err) {
     if (err instanceof UnsupportedContentError) {
-      return estimate("unsupported_content");
+      return estimate(hopEncoding, "unsupported_content");
     }
     throw err;
   }
@@ -3462,10 +3499,20 @@ export const runCountTokens = async (args: TWalkArgs): Promise<Response> => {
     // 500 — the one thing this handler promises never to do.
     text = await resp.text();
   } catch (err) {
-    return estimate(`upstream unreachable: ${sanitizeErrorLine(err, 200)}`);
+    return estimate(
+      hopEncoding,
+      `upstream unreachable: ${sanitizeErrorLine(err, 200)}`,
+    );
   }
   if (!resp.ok) {
-    return estimate(`upstream ${resp.status}: ${text.slice(0, 200)}`);
+    if (countTokensUnsupportedFromUpstream(resp.status, text)) {
+      rememberCountTokensUnsupported(scope);
+      return estimate(hopEncoding, null);
+    }
+    return estimate(
+      hopEncoding,
+      `upstream ${resp.status}: ${text.slice(0, 200)}`,
+    );
   }
   return new Response(text, {
     status: 200,

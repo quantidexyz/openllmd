@@ -364,7 +364,9 @@ const probeCliInstallState = async (
   // Past the TTL but the binary is unchanged AND still inside the hard-max
   // window → reuse a SUCCESSFUL version without re-spawning `--version`, just
   // renewing the TTL. Inconclusive entries must re-spawn when their TTL
-  // expires (that is the backoff clock).
+  // expires (that is the backoff clock) UNTIL that TTL has already reached
+  // the hard-max — then an unchanged hung binary is parked until a
+  // signature/link change or `clearCliInstallStateCache`.
   if (
     reusable &&
     cached !== undefined &&
@@ -378,6 +380,21 @@ const probeCliInstallState = async (
       probedAt: cached.probedAt,
       inconclusive: false,
       ttlMs: CLI_INSTALL_STATE_TTL_MS,
+    });
+    return cached.result;
+  }
+  if (
+    reusable &&
+    cached?.inconclusive === true &&
+    cached.ttlMs >= CLI_VERSION_HARD_MAX_MS
+  ) {
+    writeCacheEntry(provider, generation, {
+      result: cached.result,
+      expiresAt: now + cached.ttlMs,
+      signature,
+      probedAt: cached.probedAt,
+      inconclusive: true,
+      ttlMs: cached.ttlMs,
     });
     return cached.result;
   }
