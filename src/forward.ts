@@ -12,7 +12,62 @@
  * already validates for `/v1/*`.
  */
 import { NO_DAEMON_HEADER } from "@openllmsh/protocol";
+import { CLOUD_FETCH_TIMEOUT_MS } from "./cloud-client";
+import { errorJson } from "./cors";
 import { daemonEnv } from "./env";
+import { logWarn } from "./logger";
+import {
+  classifyOriginThrow,
+  originFailureMessage,
+  originFailureStatus,
+  originFailureType,
+} from "./net-error";
+
+/** Bound how long we wait for origin *headers*. The timer is cleared once
+ *  headers arrive so a long inference stream is not cut by this budget.
+ *  {@link inbound.signal} stays on the fetch via `AbortSignal.any`.
+ *  Env override must be a strict positive safe integer. */
+export const originHeaderTimeoutMs = (): number => {
+  const raw = process.env.OPENLLM_ORIGIN_HEADER_TIMEOUT_MS;
+  if (raw === undefined) return CLOUD_FETCH_TIMEOUT_MS;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n > 0 ? n : CLOUD_FETCH_TIMEOUT_MS;
+};
+
+const headerTimeoutAbort = (): Error => {
+  const err = new Error("origin header timeout");
+  err.name = "TimeoutError";
+  return err;
+};
+
+const fetchOrigin = async (
+  target: string,
+  init: RequestInit,
+  inbound: Request,
+): Promise<Response> => {
+  const headerTimeout = new AbortController();
+  const timer = setTimeout(() => {
+    if (!headerTimeout.signal.aborted) {
+      headerTimeout.abort(headerTimeoutAbort());
+    }
+  }, originHeaderTimeoutMs());
+  const signal = AbortSignal.any([inbound.signal, headerTimeout.signal]);
+  try {
+    const resp = await fetch(target, { ...init, signal });
+    clearTimeout(timer);
+    return stripHopByHopResponseHeaders(resp);
+  } catch (err) {
+    clearTimeout(timer);
+    const kind = classifyOriginThrow(err, inbound.signal);
+    if (kind === null) throw err;
+    logWarn("forward", `origin ${kind}: ${originFailureMessage(kind)}`);
+    return errorJson(
+      originFailureStatus(kind),
+      originFailureMessage(kind),
+      originFailureType(kind),
+    );
+  }
+};
 
 /**
  * Bun's `fetch` auto-decompresses upstream bodies but may leave the
@@ -69,13 +124,15 @@ export const forwardToCloud = async (
   headers.delete("host");
   headers.delete("content-length");
 
-  const resp = await fetch(target, {
-    method: inbound.method,
-    headers,
-    body: bodyBytes,
-    signal: inbound.signal,
-  });
-  return stripHopByHopResponseHeaders(resp);
+  return fetchOrigin(
+    target,
+    {
+      method: inbound.method,
+      headers,
+      body: bodyBytes,
+    },
+    inbound,
+  );
 };
 
 /**
@@ -118,16 +175,18 @@ export const passthroughToOrigin = async (
   headers.delete("host");
   headers.delete("content-length");
 
-  const resp = await fetch(target, {
-    method: inbound.method,
-    headers,
-    // GET/HEAD cannot carry a body (a model-listing passthrough has none) —
-    // undici throws if one is supplied, so omit it for those methods.
-    body:
-      inbound.method === "GET" || inbound.method === "HEAD"
-        ? undefined
-        : bodyBytes,
-    signal: inbound.signal,
-  });
-  return stripHopByHopResponseHeaders(resp);
+  return fetchOrigin(
+    target,
+    {
+      method: inbound.method,
+      headers,
+      // GET/HEAD cannot carry a body (a model-listing passthrough has none) —
+      // undici throws if one is supplied, so omit it for those methods.
+      body:
+        inbound.method === "GET" || inbound.method === "HEAD"
+          ? undefined
+          : bodyBytes,
+    },
+    inbound,
+  );
 };
