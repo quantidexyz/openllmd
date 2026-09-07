@@ -662,10 +662,12 @@ in `status.ts`): the manual **"Refresh usage"** button and a **one-shot
 providers-page mount** when a connected provider has no snapshot. Real
 requests also drive detached usage sampling after successful bursts or quota
 exhaustion. A routing read with a revalidation callback can refresh a passed
-reset or an exhausted snapshot beyond the freshness TTL, even if its reset
-is still ahead: an external tier upgrade may have restored capacity. The
-current request keeps its cached routing decision; subsequent demand sees
-the refreshed tier and quota. Passive status and `peekUsage` never schedule
+reset (once per reset: success freshness is bypassed only while the last
+good observation predates that deadline; failure retry still applies) or an
+exhausted snapshot beyond the freshness TTL, even if its reset is still
+ahead: an external tier upgrade may have restored capacity. The current
+request keeps its cached routing decision; subsequent demand sees the
+refreshed tier and quota. Passive status and `peekUsage` never schedule
 these reads, and mere age-out while idle is not a demand signal.
 
 `cachedUsage(slug, () => delegate.usage())` wraps demand reads in TTL,

@@ -57,7 +57,11 @@
  * An external upgrade may restore capacity before that reset, so an exhausted
  * snapshot past {@link FRESH_TTL_MS} also schedules a detached, demand-driven
  * revalidate (no `force`) even while the reset is still ahead. A passed reset
- * does the same. The reader never creates a polling sweep or blocks an
+ * uses a distinct {@link cachedUsage} mode that bypasses only SUCCESS
+ * freshness / success back-off, and only when the last successful observation
+ * predates that reset — so a vendor that still reports the same passed reset
+ * does not hammer. Failure retry back-off, in-flight sharing, and generation
+ * fencing stay in force. The reader never creates a polling sweep or blocks an
  * inference request on the vendor.
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -134,6 +138,43 @@ const requestSamples = new Map<string, TRequestSample>();
 
 const isUsable = (s: TProviderUsageSnapshot): boolean =>
   s.kind !== "unavailable";
+
+type TCachedUsageOptions = {
+  readonly force?: boolean;
+  readonly accountHash?: string;
+  // Bypass SUCCESS freshness / success back-off when a cached reset has
+  // newly passed and the last good observation predates it. Never a blanket
+  // `force` (request-sampler semantics stay separate). A failed attempt
+  // uses the ordinary backoff (FRESH_TTL while good is servable).
+  readonly resetExpired?: boolean;
+};
+
+type TQuotaPool = Extract<
+  TProviderUsageSnapshot,
+  { readonly kind: "quota" }
+>["windows"][number];
+
+const quotaPools = (
+  snapshot: TProviderUsageSnapshot,
+): readonly TQuotaPool[] => {
+  if (snapshot.kind !== "quota") return [];
+  return [...snapshot.windows, ...(snapshot.extra_pools ?? [])];
+};
+
+// True when some pool reset has passed since the last successful observation.
+// Uses ANY such deadline (not the earliest), so a later window can still
+// trigger a once-per-reset fetch after an earlier expired pool was observed.
+const hasUnobservedPassedReset = (
+  snapshot: TProviderUsageSnapshot,
+  observedAtMs: number,
+  now: number,
+): boolean =>
+  quotaPools(snapshot).some(
+    (pool) =>
+      pool.reset_at_ms !== null &&
+      observedAtMs < pool.reset_at_ms &&
+      pool.reset_at_ms <= now,
+  );
 
 // Record when this process actually observed the vendor figures. Fresh
 // quota snapshots carry `as_of_ms` so later status frames preserve the
@@ -289,16 +330,29 @@ const servable = (entry: TUsageEntry, now: number): TProviderUsageSnapshot => {
 export const cachedUsage = async (
   slug: string,
   fetcher: () => Promise<TProviderUsageSnapshot>,
-  options: { readonly force?: boolean; readonly accountHash?: string } = {},
+  options: TCachedUsageOptions = {},
 ): Promise<TProviderUsageSnapshot> => {
   const key = usageCacheKey(slug, options.accountHash);
   const generation = generationFor(key);
   const now = Date.now();
   const entry = cache.get(key);
   if (entry !== undefined) {
-    // Fresh, usable snapshot — serve it with no upstream call.
+    // Once-per-reset: last SUCCESS must predate a passed deadline. A later
+    // success that still reports the same expired reset must not bypass again.
+    // Failures keep the ordinary success/failure backoff (never a 20s special
+    // window while good is still servable).
+    const resetExpiredBypass =
+      options.resetExpired === true &&
+      options.force !== true &&
+      entry.failure === null &&
+      entry.good !== null &&
+      hasUnobservedPassedReset(entry.good.snapshot, entry.good.atMs, now);
+
+    // Fresh, usable snapshot — serve it with no upstream call, unless a
+    // newly-passed reset has not yet been observed after that deadline.
     if (
       !options.force &&
+      !resetExpiredBypass &&
       entry.good !== null &&
       now - entry.good.atMs < FRESH_TTL_MS &&
       isUsable(entry.good.snapshot)
@@ -322,7 +376,11 @@ export const cachedUsage = async (
     const goodServable =
       entry.good !== null && now - entry.good.atMs < STALE_TTL_MS;
     const backoff = goodServable ? FRESH_TTL_MS : FAILURE_RETRY_MS;
-    if (!options.force && now - entry.lastAttemptAtMs < backoff) {
+    if (
+      !options.force &&
+      !resetExpiredBypass &&
+      now - entry.lastAttemptAtMs < backoff
+    ) {
       return servable(entry, now);
     }
   }
@@ -402,14 +460,15 @@ export const peekUsage = (
  * snapshot is exhausted past {@link FRESH_TTL_MS} even with a future reset.
  * All other cases preserve {@link peekUsage}'s exact display-TTL behavior.
  *
- * A passed reset proves the cached quota is expired. An exhausted snapshot
- * past {@link FRESH_TTL_MS} is the same demand-driven recovery even when the
- * reset is still in the future (an external upgrade may have restored
- * capacity). When a fetcher is supplied, schedule one detached,
- * provider/account-scoped cache read without `force`; `cachedUsage` supplies
- * the existing freshness, back-off, and single-flight limits. The reader
- * returns the cached routing decision immediately and never lets a vendor
- * failure throw.
+ * A passed reset proves the cached quota is expired and uses the
+ * `resetExpired` cache mode (success freshness bypassed once per reset). An
+ * exhausted snapshot past {@link FRESH_TTL_MS} is demand-driven recovery even
+ * when the reset is still in the future (an external upgrade may have restored
+ * capacity) and still uses ordinary freshness. When a fetcher is supplied,
+ * schedule one detached, provider/account-scoped cache read; `cachedUsage`
+ * supplies in-flight sharing, generation fencing, and failure retry. The
+ * reader returns the cached routing decision immediately and never lets a
+ * vendor failure throw.
  */
 export const peekUsageForQuotaGate = (
   slug: string,
@@ -423,7 +482,7 @@ export const peekUsageForQuotaGate = (
 
   const snapshot = entry.good.snapshot;
   if (snapshot.kind !== "quota") return peekUsage(slug, accountHash);
-  const pools = [...snapshot.windows, ...(snapshot.extra_pools ?? [])];
+  const pools = quotaPools(snapshot);
   const resetPassed = pools.some(
     (pool) => pool.reset_at_ms !== null && now >= pool.reset_at_ms,
   );
@@ -433,7 +492,10 @@ export const peekUsageForQuotaGate = (
   if (revalidate !== undefined && (resetPassed || exhaustedPastFresh)) {
     // Detached: TTL / backoff / single-flight stay inside cachedUsage.
     // Catch so a vendor rejection cannot surface as an unhandled promise.
-    void cachedUsage(slug, revalidate, { accountHash }).catch(() => {});
+    void cachedUsage(slug, revalidate, {
+      accountHash,
+      resetExpired: resetPassed,
+    }).catch(() => {});
   }
   if (now - entry.good.atMs < STALE_TTL_MS) {
     return stampStale(snapshot, entry.good.atMs, now);
