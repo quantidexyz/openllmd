@@ -362,11 +362,42 @@ type TAuthStatusProbe =
   | { readonly kind: "timeout" }
   | { readonly kind: "value"; readonly result: boolean | null };
 
-let authStatusInFlight: {
+type TAuthStatusFlight = {
   readonly generation: number;
   readonly startFingerprint: string;
   readonly work: Promise<TAuthStatusProbe>;
-} | null = null;
+  liveObservers: number;
+  abandonedObservers: number;
+  consumedObservers: number;
+  settled: TAuthStatusProbe | undefined;
+  lateAdmitted: boolean;
+};
+
+let authStatusInFlight: TAuthStatusFlight | null = null;
+
+const maybeAdmitInnerAuthLate = (flight: TAuthStatusFlight): void => {
+  if (flight.lateAdmitted) return;
+  if (flight.settled === undefined) return;
+  if (flight.liveObservers > 0) return;
+  if (flight.consumedObservers > 0) return;
+  if (flight.abandonedObservers === 0) return;
+  flight.lateAdmitted = true;
+  admitInnerAuthLate({
+    probe: flight.settled,
+    generation: flight.generation,
+    startFingerprint: flight.startFingerprint,
+  });
+};
+
+const releaseAuthStatusObserver = (
+  flight: TAuthStatusFlight,
+  abandoned: boolean,
+): void => {
+  flight.liveObservers -= 1;
+  if (abandoned) flight.abandonedObservers += 1;
+  else flight.consumedObservers += 1;
+  maybeAdmitInnerAuthLate(flight);
+};
 
 /**
  * After the only observer aborted, a determinate inner `auth status` may still
@@ -514,26 +545,49 @@ const authStatusLoggedIn = async (
         return { kind: "value", result: null };
       }
     })();
-    flight = { generation, startFingerprint, work };
+    flight = {
+      generation,
+      startFingerprint,
+      work,
+      liveObservers: 0,
+      abandonedObservers: 0,
+      consumedObservers: 0,
+      settled: undefined,
+      lateAdmitted: false,
+    };
     authStatusInFlight = flight;
+    const captured = flight;
     const clearFlight = (): void => {
       if (authStatusInFlight?.work === work) authStatusInFlight = null;
     };
-    void work.then((probe) => {
-      clearFlight();
-      admitInnerAuthLate({
-        probe,
-        generation,
-        startFingerprint,
-      });
-    }, clearFlight);
+    void work.then(
+      (probe) => {
+        clearFlight();
+        captured.settled = probe;
+        maybeAdmitInnerAuthLate(captured);
+      },
+      () => {
+        clearFlight();
+      },
+    );
   }
 
-  const result = await awaitAuthStatus(flight.work, signal);
-  if (generation !== claudeStatusCache.generation()) {
-    return { kind: "invalidated" };
+  if (signal?.aborted === true) return { kind: "aborted" };
+  flight.liveObservers += 1;
+  let abandoned = false;
+  try {
+    const result = await awaitAuthStatus(flight.work, signal);
+    abandoned = result.kind === "aborted";
+    if (generation !== claudeStatusCache.generation()) {
+      return { kind: "invalidated" };
+    }
+    return result;
+  } catch (error) {
+    abandoned = false;
+    throw error;
+  } finally {
+    releaseAuthStatusObserver(flight, abandoned);
   }
-  return result;
 };
 
 const claudePassiveStoreIdentity = (): ReturnType<typeof fileStoreIdentity> => {

@@ -78,7 +78,7 @@ export const createStatusPublishCoalescer = (
 
   const snapshot = (): TStatusPublishQueueSnapshot => {
     const now = host.now();
-    const oldest = followUp ?? active;
+    const oldest = active ?? followUp;
     return {
       queued_publish_depth:
         (active !== null ? 1 : 0) + (followUp !== null ? 1 : 0),
