@@ -10,7 +10,7 @@ import type { TDaemonRelease } from "./release-types";
 
 export const DAEMON_RELEASE: TDaemonRelease = {
   repo: "openllmsh/daemon",
-  tag: "v2.6.21",
+  tag: "v2.6.22",
   targets: [
     "darwin-arm64",
     "darwin-x64-baseline",
@@ -19,12 +19,12 @@ export const DAEMON_RELEASE: TDaemonRelease = {
   ],
   sha256: {
     "darwin-arm64":
-      "b0dff444d8f05bed6466a3bdc6e3b6b9798682ca9f3923719740e96b1a397603",
+      "b0e5f94fb3fe20d0cebb53ea181fc25a31e270865e0e3c54a40bf7475cdf91ab",
     "darwin-x64-baseline":
-      "132035f8d52919e898983cab0a3a1d9e69b0469be4842202299272d8783947ef",
+      "495fdb9cfe87e658d905cdc00cd4addf89a4407839aae8fe7fda06917537bf77",
     "linux-x64-baseline":
-      "f4777d65b876af1e30defea4a474f5b79d72869e438cf4eecc4d567298806c10",
+      "cade9e9b728a953fd2cb5af9456a4f3b6a59cfd9fca7fe5bb2fe821d38c2bdb0",
     "linux-arm64":
-      "14a872fb55761d216ee8629003056eb406a78c54516586cfd90f967613a0b2e5",
+      "b29fe9db4516151a51265f94792c3023b35dc571d4be2b1652c83d18c51fbd1b",
   },
 };
