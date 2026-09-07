@@ -26,7 +26,6 @@
  *     2023-06-01`, `User-Agent: claude-cli/<version>`.
  *   - Usage: GET https://api.anthropic.com/api/oauth/usage.
  */
-import { rm } from "node:fs/promises";
 import { platform } from "node:os";
 import { join } from "node:path";
 import type {
@@ -36,6 +35,8 @@ import type {
 import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
 import { cliInstallState } from "../cli-install";
 import { cliConfigDir, cliHome } from "../cli-paths";
+import { noteAuthStoreIdentityChange } from "../auth-user-action";
+import { createDeadlineBudget, firstOfBudget } from "../deadline-budget";
 import { logWarn } from "../logger";
 import {
   clearPendingAuth,
@@ -61,6 +62,7 @@ import {
 import { makePasteBackDevice } from "./login-device";
 import { makeBlockingConnect } from "./login-direct";
 import type { TLoginVerify } from "./login-flow";
+import { runWithAuthOperation } from "./login-flow";
 import {
   createPassiveObservationCache,
   fileStoreIdentity,
@@ -84,7 +86,7 @@ import type {
   TProviderDelegate,
 } from "./types";
 import { reduceClaudeUsage, reduceQuotaStatus } from "./usage-reduce";
-import type { TStoreRead } from "./util";
+import type { TRunCaptureResult, TStoreRead } from "./util";
 import {
   cliVersion,
   connectedObservation,
@@ -108,6 +110,19 @@ const PROVIDER = "claude_code" as const;
 const KEYCHAIN_SERVICE = "Claude Code-credentials";
 /** Peer of the keychain lane (4s); below the 10s owner status budget. */
 const AUTH_STATUS_TIMEOUT_MS = 4_000;
+/**
+ * Whole-operation logout budget (CLI + store verify). Not the 4s auth-status
+ * probe and not the 5s capture default — that default killed legitimate logout.
+ */
+export const AUTH_LOGOUT_TIMEOUT_MS = 30_000;
+let logoutTimeoutMsForTests: number | null = null;
+
+export const setAuthLogoutTimeoutMsForTests = (ms: number | null): void => {
+  logoutTimeoutMsForTests = ms;
+};
+
+const logoutTimeoutMs = (): number =>
+  logoutTimeoutMsForTests ?? AUTH_LOGOUT_TIMEOUT_MS;
 const OAUTH_BETA = "oauth-2025-04-20";
 // Usage endpoint LEAF path — the host is derived from the captured inference
 // endpoint (`resolveProviderUrl`), so a vendor host migration is auto-tracked.
@@ -457,6 +472,7 @@ const admitInnerAuthLate = (opts: {
  */
 export const clearAuthStatusCache = (): void => {
   claudeStatusCache.invalidate();
+  noteAuthStoreIdentityChange(PROVIDER);
 };
 
 /**
@@ -493,6 +509,58 @@ export const classifyClaudeLoginVerify = (opts: {
     return { state: tokenPresent ? "unavailable" : "absent" };
   }
   return { state: tokenPresent ? "connected" : "unavailable" };
+};
+
+export type TClaudeLogoutCapture =
+  | TRunCaptureResult
+  | { readonly kind: "skipped" };
+
+/**
+ * Logout verification. Timeout/abort is never success, even if the store
+ * looks absent (unread vs cleared). Remaining credentials fail and keep the
+ * capture timeout/failure note. Empty-stdout success is `kind: "ok"`.
+ * Unknown/indeterminate is never signed-out.
+ */
+export const classifyClaudeLogout = (opts: {
+  readonly capture: TClaudeLogoutCapture;
+  readonly store: TStoreRead<{
+    readonly claudeAiOauth?: { readonly accessToken?: string };
+  }>;
+}): { readonly ok: boolean; readonly detail: string } => {
+  const captureNote =
+    opts.capture.kind === "timeout"
+      ? "logout timed out; "
+      : opts.capture.kind === "failed"
+        ? "logout command failed; "
+        : opts.capture.kind === "aborted"
+          ? "logout aborted; "
+          : "";
+  const token =
+    opts.store.kind === "present"
+      ? opts.store.value.claudeAiOauth?.accessToken
+      : undefined;
+  const remaining = typeof token === "string" && token.length > 0;
+  if (opts.capture.kind === "timeout" || opts.capture.kind === "aborted") {
+    return {
+      ok: false,
+      detail: remaining
+        ? `${captureNote}credential still present after logout`
+        : `${captureNote}could not verify credential store after logout`,
+    };
+  }
+  if (opts.store.kind === "indeterminate") {
+    return {
+      ok: false,
+      detail: `${captureNote}could not verify credential store after logout`,
+    };
+  }
+  if (remaining) {
+    return {
+      ok: false,
+      detail: `${captureNote}credential still present after logout`,
+    };
+  }
+  return { ok: true, detail: "signed out of Claude Code" };
 };
 
 const awaitAuthStatus = async (
@@ -1108,44 +1176,55 @@ export const claudeCodeDelegate: TProviderDelegate = {
       };
     }),
 
-  logout: async () => {
-    // The credential is about to disappear — drop the cached status so no
-    // caller can read a stale "connected" for up to the TTL.
-    clearAuthStatusCache();
-    // `claude auth logout` clears the isolated login credential (keychain item
-    // on macOS, .credentials.json on Linux).
-    if ((await cliInstallState(PROVIDER)).installed) {
-      // macOS: without a reachable isolated keychain we can neither run
-      // `claude auth logout` (it would pop the SecurityAgent dialog) nor verify
-      // the clear — report failure rather than a logout we didn't perform.
-      // Off macOS `ensureKeychainReady` is always `present`, so this is a no-op
-      // there and the Linux `.credentials.json` rm below still runs.
-      if ((await ensureKeychainReady(cliHome(PROVIDER))).kind !== "present") {
-        return {
-          ok: false,
-          detail: "could not reach the credential store to sign out",
-        };
+  logout: () =>
+    runWithAuthOperation(PROVIDER, async () => {
+      const budget = createDeadlineBudget(logoutTimeoutMs());
+      // The credential is about to disappear — drop the cached status so no
+      // caller can read a stale "connected" for up to the TTL.
+      clearAuthStatusCache();
+      let capture: TClaudeLogoutCapture = { kind: "skipped" };
+      const timedOut = async (): Promise<{
+        readonly ok: boolean;
+        readonly detail: string;
+      }> =>
+        classifyClaudeLogout({
+          capture: { kind: "timeout" },
+          store: await loadStore(budget.signal),
+        });
+      // `claude auth logout` clears the isolated login credential. Do not
+      // spawn it after the operation deadline, and do not delete the store
+      // as a fallback if the CLI times out or fails.
+      const installed = await firstOfBudget(budget, cliInstallState(PROVIDER));
+      if (installed.kind === "expired") return timedOut();
+      if (installed.value.installed) {
+        const ready = await firstOfBudget(
+          budget,
+          ensureKeychainReady(cliHome(PROVIDER), budget.signal),
+        );
+        if (ready.kind === "expired") return timedOut();
+        if (ready.value.kind !== "present") {
+          return {
+            ok: false,
+            detail: "could not reach the credential store to sign out",
+          };
+        }
+        if (budget.expired()) return timedOut();
+        capture = await runCaptureResult([bin(), "auth", "logout"], env(), {
+          probe: unwrapKeychainSpawn(PROVIDER),
+          timeoutMs: budget.remainingMs(),
+          signal: budget.signal,
+          allowEmpty: true,
+        });
       }
-      await runCapture([bin(), "auth", "logout"], env(), {
-        probe: unwrapKeychainSpawn(PROVIDER),
-      });
-    }
-    // Belt-and-braces on Linux: drop the credentials file if it lingers.
-    if (platform() !== "darwin") {
-      await rm(join(cliConfigDir(PROVIDER), ".credentials.json"), {
-        force: true,
-      }).catch(() => {});
-    }
-    // Invalidate AGAIN after the mutation: a probe that raced the pre-logout
-    // clear could have completed mid-logout and installed a "connected"
-    // result under the new generation. The post-clear leaves the cache empty
-    // so the next read re-probes against the now-cleared credential.
-    clearAuthStatusCache();
-    const cleared =
-      storeReadValue(await loadStore())?.claudeAiOauth?.accessToken ===
-      undefined;
-    return cleared
-      ? { ok: true, detail: "signed out of Claude Code" }
-      : { ok: false, detail: "credential still present after logout" };
-  },
+      if (budget.expired() && capture.kind !== "timeout") {
+        capture = { kind: "timeout" };
+      }
+      // Invalidate AGAIN after the mutation: a probe that raced the pre-logout
+      // clear could have completed mid-logout and installed a "connected"
+      // result under the new generation. The post-clear leaves the cache empty
+      // so the next read re-probes against the now-cleared credential.
+      clearAuthStatusCache();
+      const store = await loadStore(budget.signal);
+      return classifyClaudeLogout({ capture, store });
+    }),
 };

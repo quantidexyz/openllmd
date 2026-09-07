@@ -311,9 +311,10 @@ const statusPublishCoalescer = createStatusPublishCoalescer({
   now: () => Date.now(),
   epoch: () => statusPublishEpoch,
   computeFresh: async (trigger) => {
-    const status = await computeStatusFresh(
-      trigger === "late-probe" ? { reuseSettledSlugProbes: true } : undefined,
-    );
+    const status = await computeStatusFresh({
+      trigger,
+      ...(trigger === "late-probe" ? { reuseSettledSlugProbes: true } : {}),
+    });
     return { status, fingerprint: statusChangeKey(status) };
   },
   canSend: (jobEpoch) =>

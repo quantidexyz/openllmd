@@ -449,18 +449,23 @@ const main = async (): Promise<void> => {
     logError("child-supervisor", err);
   });
 
+  // Reconcile the durable session-host registry BEFORE the relay is dialed so
+  // command handlers cannot race an in-flight reap. Discovery is bounded and
+  // async (it yields), but `main` awaits it at this boot boundary. A live
+  // socket directory belongs to an independent session process and is adopted
+  // (kept); only incomplete or dead entries are removed. Identity timeouts stay
+  // unknown and never authorize deletion.
+  try {
+    await reconcileSessionHostsAtBoot();
+  } catch (err) {
+    logError("session", err);
+  }
+
   // Dial OUT to the cloud relay over a WebSocket: it delivers dashboard
   // commands and marks this key's daemon "online" server-side — so the
   // dashboard never reaches loopback (no Private Network Access prompt). See
   // `docs/proposals/daemon-relay-websocket-push.md`.
   startControlChannel();
-
-  // Reconcile the durable session-host registry before the relay can deliver
-  // commands. `startControlChannel` only creates the socket synchronously; its
-  // connection callbacks cannot run until this boot turn yields. A live socket
-  // directory belongs to an independent session process and is adopted (kept);
-  // only incomplete or dead entries are removed.
-  reconcileSessionHostsAtBoot();
 
   // Bootstrap is intentionally last: the listener is already bound and relay
   // presence can only be published after it is routeable. Keep cloud-dependent

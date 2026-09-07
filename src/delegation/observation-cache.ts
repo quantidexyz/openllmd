@@ -144,9 +144,20 @@ export type TPassiveObservationCache<T> = {
   readonly invalidate: () => void;
 };
 
-export const createPassiveObservationCache = <
-  T,
->(): TPassiveObservationCache<T> => {
+const storeIdentityEpochs = new Map<string, number>();
+
+export const storeIdentityEpoch = (slug: string): number =>
+  storeIdentityEpochs.get(slug) ?? 0;
+
+export const bumpStoreIdentityEpoch = (slug: string): void => {
+  storeIdentityEpochs.set(slug, storeIdentityEpoch(slug) + 1);
+};
+
+export const resetStoreIdentityEpochsForTests = (): void => {
+  storeIdentityEpochs.clear();
+};
+
+export const createPassiveObservationCache = <T>(): TPassiveObservationCache<T> => {
   let generation = 0;
   let entry: { readonly fingerprint: string; readonly value: T } | null = null;
   return {

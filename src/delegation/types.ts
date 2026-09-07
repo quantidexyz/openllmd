@@ -248,7 +248,9 @@ export type TProviderDelegate = {
    * Sign out of the official CLI's LOGIN credential on this box: run the
    * vendor's own logout (revoking server-side where it supports it) and/or
    * clear the isolated store. Idempotent: already-signed-out is success.
-   * Returns `ok:false` only if a credential survives the attempt.
+   * Returns `ok:false` if a credential survives, verification is
+   * unreadable, or the vendor logout timed out / failed with remaining
+   * credentials. Unreadable verification is never treated as signed out.
    */
   logout: () => Promise<{ readonly ok: boolean; readonly detail?: string }>;
 };

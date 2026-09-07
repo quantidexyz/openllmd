@@ -152,6 +152,8 @@ export type TRunCaptureOpts = {
   readonly timeoutMs?: number;
   /** Early-cancel: terminate the process group when aborted (status-probe race). */
   readonly signal?: AbortSignal;
+  /** Exit 0 with empty stdout is success (logout prints nothing). */
+  readonly allowEmpty?: boolean;
 };
 
 /** Subscribe to `signal` abort; invoke `onAbort` immediately if already aborted. */
@@ -373,8 +375,9 @@ export const runCaptureResult = async (
       });
       if (outcome.code !== 0) return { kind: "failed" };
       const trimmed = outcome.out.trim();
-      return trimmed.length > 0
-        ? { kind: "ok", text: trimmed }
+      if (trimmed.length > 0) return { kind: "ok", text: trimmed };
+      return opts?.allowEmpty === true
+        ? { kind: "ok", text: "" }
         : { kind: "failed" };
     } finally {
       unbind();

@@ -16,6 +16,7 @@ import type {
   TProviderUsageWindow,
 } from "@openllmsh/protocol";
 import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
+import { noteAuthStoreIdentityChange } from "../auth-user-action";
 import { cliInstallState } from "../cli-install";
 import { cliConfigDir, cliHome } from "../cli-paths";
 import { logError, logInfo, logWarn } from "../logger";
@@ -39,7 +40,7 @@ import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
 import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
 import { jwtExpiryMs, jwtSubject } from "./jwt";
 import { makeStreamConnect } from "./login-direct";
-import { makeCancelConnect } from "./login-flow";
+import { makeCancelConnect, runWithAuthOperation } from "./login-flow";
 import {
   createPassiveObservationCache,
   fileStoreIdentity,
@@ -330,6 +331,7 @@ let statusAccessInFlight: {
 export const clearCursorStatusObservationCache = (): void => {
   cursorStatusCache.invalidate();
   clearCursorNativeModels();
+  noteAuthStoreIdentityChange(PROVIDER);
 };
 
 const cursorPassiveReuseAllowed = (): {
@@ -824,7 +826,8 @@ export const cursorDelegate: TProviderDelegate = {
       );
     }),
 
-  logout: async () => {
+  logout: () =>
+    runWithAuthOperation(PROVIDER, async () => {
     clearCursorStatusObservationCache();
     if ((await cliInstallState(PROVIDER)).installed) {
       await runCapture([bin(), "logout"], env(), {
@@ -837,5 +840,5 @@ export const cursorDelegate: TProviderDelegate = {
     return cleared
       ? { ok: true, detail: "signed out of Cursor" }
       : { ok: false, detail: "credential still present after logout" };
-  },
+    }),
 };

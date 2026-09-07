@@ -25,11 +25,16 @@ import { decodeJsonPayload, encodeJsonPayload } from "@openllmsh/tunnel/codec";
 import { Schema as S } from "effect";
 import { resolveOpenllmCli } from "../cli-self-update";
 import { spawnCommand } from "../command";
+import type { TDeadlineBudget } from "../deadline-budget";
+import { createDeadlineBudget, waitUntilExpired } from "../deadline-budget";
 import { isDevMode, stateDir } from "../env";
 import type { TSessionStream } from "../session-core";
 import type { TSessionHostMeta } from "./main";
 
 const SPAWN_SOCKET_TIMEOUT_MS = 2_000;
+/** Per-pid `ps` identity read. Expiry is unknown, never dead. */
+const PROCESS_IDENTITY_TIMEOUT_MS = 250;
+const DISCOVERY_CONCURRENCY = 4;
 /** RS (0x1e) prefixes a JSON control line on the pipe-mode attach stdio. */
 const PIPE_CTRL = 0x1e;
 const PIPE_CTRL_MAX_BYTES = 512;
@@ -84,26 +89,95 @@ const isSessionHostMeta = (value: unknown): value is TSessionHostMeta => {
   );
 };
 
-const processStartTime = (pid: number): string | null => {
+export type TProcessIdentity = "alive" | "dead" | "unknown";
+
+type TProcessIdentityReader = (
+  meta: Pick<TSessionHostMeta, "pid" | "processStartTime">,
+  budget: TDeadlineBudget,
+) => Promise<TProcessIdentity>;
+
+let processIdentityReaderForTests: TProcessIdentityReader | null = null;
+
+/** Test seam: replace the bounded `ps` identity probe. */
+export const setSessionHostProcessIdentityReaderForTests = (
+  reader: TProcessIdentityReader | null,
+): void => {
+  processIdentityReaderForTests = reader;
+};
+
+/**
+ * Bounded async `lstart` read. `undefined` means the deadline expired or the
+ * helper could not be observed — never treat that as a dead pid.
+ */
+const readProcessStartTime = async (
+  pid: number,
+  budget: TDeadlineBudget,
+): Promise<string | null | undefined> => {
+  if (budget.expired()) return undefined;
   try {
-    const output = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
+    const proc = Bun.spawn(["ps", "-o", "lstart=", "-p", String(pid)], {
       stdout: "pipe",
       stderr: "ignore",
     });
-    if (output.exitCode !== 0) return null;
-    const value = new TextDecoder().decode(output.stdout).trim();
+    const complete = Promise.all([
+      new Response(proc.stdout).text(),
+      proc.exited,
+    ]).then(([out, code]) => ({ kind: "done" as const, out, code }));
+    const timeout = waitUntilExpired(budget).then(() => ({
+      kind: "timeout" as const,
+    }));
+    const raced = await Promise.race([complete, timeout]);
+    if (raced.kind === "timeout") {
+      try {
+        proc.kill();
+      } catch {
+        // The helper may already have exited.
+      }
+      return undefined;
+    }
+    if (raced.code !== 0) return null;
+    const value = raced.out.trim();
     return value.length > 0 ? value : null;
   } catch {
-    return null;
+    return undefined;
   }
 };
 
-/** Match session-host.ts: pid + recorded process start time must both agree. */
-const sessionHostProcessAlive = (
+const defaultProcessIdentity: TProcessIdentityReader = async (meta, budget) => {
+  const startTime = await readProcessStartTime(meta.pid, budget);
+  if (startTime === undefined) return "unknown";
+  if (startTime === null) return "dead";
+  return startTime === meta.processStartTime ? "alive" : "dead";
+};
+
+const sessionHostProcessIdentity = async (
   meta: Pick<TSessionHostMeta, "pid" | "processStartTime">,
-): boolean => {
-  const startTime = processStartTime(meta.pid);
-  return startTime !== null && startTime === meta.processStartTime;
+  parent?: AbortSignal,
+): Promise<TProcessIdentity> => {
+  const budget = createDeadlineBudget(PROCESS_IDENTITY_TIMEOUT_MS, parent);
+  const reader = processIdentityReaderForTests ?? defaultProcessIdentity;
+  return reader(meta, budget);
+};
+
+const mapLimited = async <T, R>(
+  values: readonly T[],
+  limit: number,
+  visit: (value: T) => Promise<R>,
+): Promise<R[]> => {
+  const results: R[] = new Array(values.length);
+  if (values.length === 0) return results;
+  const maxConcurrency = Math.max(1, Math.min(limit, values.length));
+  let cursor = 0;
+  const workers = Array.from({ length: maxConcurrency }, async () => {
+    for (;;) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= values.length) return;
+      results[index] = await visit(values[index] as T);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 };
 
 const socketPresent = (path: string): boolean => {
@@ -114,15 +188,46 @@ const socketPresent = (path: string): boolean => {
   }
 };
 
-/** Scan, validate, and reap stale durable session-host registry entries. */
-export const discoverSessionHosts = (): readonly TLiveSessionHost[] => {
+type TDiscoveryCandidate = {
+  readonly id: string;
+  readonly directory: string;
+  readonly socketPath: string;
+  readonly meta: TSessionHostMeta;
+  readonly socketReady: boolean;
+};
+
+const reapSessionHostDir = (directory: string): void => {
+  try {
+    rmSync(directory, { recursive: true, force: true });
+  } catch {
+    // A concurrently exiting host owns final cleanup.
+  }
+};
+
+const withinSpawnGrace = (directory: string, startedAtMs: number): boolean => {
+  let ageStart = startedAtMs;
+  try {
+    ageStart = Number.isFinite(startedAtMs)
+      ? startedAtMs
+      : statSync(directory).mtimeMs;
+  } catch {
+    return false;
+  }
+  return Date.now() - ageStart < SPAWN_SOCKET_TIMEOUT_MS;
+};
+
+let discoveryInFlight: Promise<readonly TLiveSessionHost[]> | null = null;
+
+const discoverSessionHostsOnce = async (): Promise<
+  readonly TLiveSessionHost[]
+> => {
   let entries: string[];
   try {
     entries = readdirSync(sessionHostsRoot());
   } catch {
     return [];
   }
-  const hosts: TLiveSessionHost[] = [];
+  const candidates: TDiscoveryCandidate[] = [];
   for (const id of entries) {
     if (!SESSION_ID_PATTERN.test(id)) continue;
     const directory = sessionHostDir(id);
@@ -136,33 +241,64 @@ export const discoverSessionHosts = (): readonly TLiveSessionHost[] => {
     } catch {
       meta = null;
     }
-    const socketReady = socketPresent(socketPath);
-    const processAlive = meta !== null && sessionHostProcessAlive(meta);
-    if (meta !== null && processAlive && !socketReady) {
-      // Live host still within the ctl.sock bind grace window — keep it.
-      let startedAtMs: number | null = meta.startedAtMs;
-      try {
-        startedAtMs ??= statSync(directory).mtimeMs;
-      } catch {
-        startedAtMs = null;
-      }
-      if (
-        startedAtMs !== null &&
-        Date.now() - startedAtMs < SPAWN_SOCKET_TIMEOUT_MS
-      )
-        continue;
-    }
-    if (meta === null || !socketReady || !processAlive) {
-      try {
-        rmSync(directory, { recursive: true, force: true });
-      } catch {
-        // A concurrently exiting host owns final cleanup.
-      }
+    if (meta === null) {
+      reapSessionHostDir(directory);
       continue;
     }
-    hosts.push({ ...meta, socketPath });
+    candidates.push({
+      id,
+      directory,
+      socketPath,
+      meta,
+      socketReady: socketPresent(socketPath),
+    });
   }
+
+  const hosts: TLiveSessionHost[] = [];
+  await mapLimited(candidates, DISCOVERY_CONCURRENCY, async (candidate) => {
+    const identity = await sessionHostProcessIdentity(candidate.meta);
+    if (identity === "unknown") {
+      // Uncertainty never authorizes deletion. Surface a socket-ready host so
+      // attach/status keep the session; keep a grace-window host without a
+      // socket; otherwise leave the directory for a later observation.
+      if (candidate.socketReady) {
+        hosts.push({ ...candidate.meta, socketPath: candidate.socketPath });
+      }
+      return;
+    }
+    if (identity === "alive" && !candidate.socketReady) {
+      if (withinSpawnGrace(candidate.directory, candidate.meta.startedAtMs)) {
+        return;
+      }
+      reapSessionHostDir(candidate.directory);
+      return;
+    }
+    if (identity === "dead" || !candidate.socketReady) {
+      reapSessionHostDir(candidate.directory);
+      return;
+    }
+    hosts.push({ ...candidate.meta, socketPath: candidate.socketPath });
+  });
   return hosts.sort((a, b) => b.startedAtMs - a.startedAtMs);
+};
+
+/** Scan, validate, and reap stale durable session-host registry entries. */
+export const discoverSessionHosts = async (): Promise<
+  readonly TLiveSessionHost[]
+> => {
+  if (discoveryInFlight !== null) return discoveryInFlight;
+  const run = discoverSessionHostsOnce();
+  discoveryInFlight = run;
+  void run.finally(() => {
+    if (discoveryInFlight === run) discoveryInFlight = null;
+  });
+  return run;
+};
+
+/** Test seam: drop a coalesced scan so the next call starts a fresh one. */
+export const resetSessionHostDiscoveryForTests = (): void => {
+  discoveryInFlight = null;
+  processIdentityReaderForTests = null;
 };
 
 const waitForSessionHostSocket = async (id: string): Promise<string | null> => {

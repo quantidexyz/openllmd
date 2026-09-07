@@ -20,7 +20,10 @@
 
 import type { TAuthLoginFailedCode, TAuthLoginMode } from "@openllmsh/protocol";
 import { emitAuth, requestStatusPush } from "../auth-events";
-import { noteUserAuthAction } from "../auth-user-action";
+import {
+  noteAuthStoreIdentityChange,
+  noteUserAuthAction,
+} from "../auth-user-action";
 import { logWarn } from "../logger";
 import type { TPendingAuth } from "../pending-auth";
 import {
@@ -153,6 +156,42 @@ export const loginSlot = (provider: string): TLoginSlot => {
   return slot;
 };
 
+/** Providers whose logout is in flight (login uses {@link loginSlot}). */
+const logoutOps = new Set<string>();
+
+/** Mark logout as the owner of this provider's auth until verification ends. */
+export const beginProviderAuthOperation = (slug: string): void => {
+  logoutOps.add(slug);
+};
+
+export const endProviderAuthOperation = (slug: string): void => {
+  logoutOps.delete(slug);
+};
+
+/**
+ * True while this provider's login OR logout operation owns auth.
+ * Sticky post-logout signed_out is not included — that lives on status.
+ */
+export const providerAuthOperationActive = (slug: string): boolean =>
+  logoutOps.has(slug) || loginSlot(slug).inFlight();
+
+export const resetProviderAuthOperationsForTests = (): void => {
+  logoutOps.clear();
+};
+
+/** Wrap logout (or other auth mutation) so observers see an active operation. */
+export const runWithAuthOperation = async <T>(
+  slug: string,
+  work: () => Promise<T>,
+): Promise<T> => {
+  beginProviderAuthOperation(slug);
+  try {
+    return await work();
+  } finally {
+    endProviderAuthOperation(slug);
+  }
+};
+
 /**
  * Open the vendor auth URL on the daemon's box ONLY if the login wasn't
  * cancelled in the race window between parsing the prompt and this call. A
@@ -225,6 +264,7 @@ export const publishPendingAuth = (
 
 export const emitLoginSucceeded = (flow: TLoginFlowCtx): void => {
   noteUserAuthAction(flow.slug);
+  noteAuthStoreIdentityChange(flow.slug);
   emitAuth({
     event: "auth.login.succeeded",
     flow_id: flow.flowId,
@@ -376,8 +416,9 @@ export type TGuardOpts = {
 
 /**
  * Run the shared login preamble, then `run()` if it clears: not-installed →
- * `installHint`; already-signed-in short-circuit (clears any stale pending);
- * single-flight re-surface; otherwise start the flow.
+ * `installHint`; in-flight single-flight re-surface (before expensive
+ * connected verification); already-signed-in short-circuit (clears any stale
+ * pending); otherwise start the flow.
  */
 export const guard = async (
   opts: TGuardOpts,
@@ -392,15 +433,6 @@ export const guard = async (
       retryable: false,
     });
     return { connected: false, detail: opts.installHint };
-  }
-  if (
-    opts.shortCircuit !== undefined &&
-    (await opts.shortCircuit.connected())
-  ) {
-    clearPendingAuth(opts.provider);
-    const flow = resolveLoginFlow(opts.provider, mode);
-    emitLoginSucceeded(flow);
-    return { connected: true, detail: opts.shortCircuit.detail };
   }
   if (opts.slot?.inFlight() === true) {
     const pending = getPendingAuth(opts.provider);
@@ -418,6 +450,15 @@ export const guard = async (
           : (opts.inProgressDetail ??
             "Sign-in already in progress — this updates automatically."),
     };
+  }
+  if (
+    opts.shortCircuit !== undefined &&
+    (await opts.shortCircuit.connected())
+  ) {
+    clearPendingAuth(opts.provider);
+    const flow = resolveLoginFlow(opts.provider, mode);
+    emitLoginSucceeded(flow);
+    return { connected: true, detail: opts.shortCircuit.detail };
   }
   return run();
 };

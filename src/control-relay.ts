@@ -321,11 +321,12 @@ export const runCommandInner = async (
             listLocalSessionsCache.delete(key);
           }
         }
+        const deviceHosts = await discoverSessionHosts();
         const sessions = await readLocalSessions(cmd.payload.cli, {
           limit: cmd.payload.limit,
           deps: {
             deviceSessions: () =>
-              discoverSessionHosts().map((host) => ({
+              deviceHosts.map((host) => ({
                 id: host.id,
                 cli: host.cli,
                 live: true,

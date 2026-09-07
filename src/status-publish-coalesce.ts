@@ -65,6 +65,14 @@ const rejectWaiters = (waiters: readonly TWaiter[], err: unknown): void => {
   for (const waiter of waiters) waiter.reject(err);
 };
 
+/** Higher rank must not inherit late-probe reuse; command/auth always win. */
+const triggerFreshnessRank = (trigger: TStatusPublishTrigger): number => {
+  if (trigger === "command" || trigger === "auth-sink") return 3;
+  if (trigger === "welcome" || trigger === "bootstrap") return 2;
+  if (trigger === "watcher" || trigger === "presence") return 1;
+  return 0;
+};
+
 export const createStatusPublishCoalescer = (
   host: TStatusPublishCoalescerHost,
 ): {
@@ -109,6 +117,11 @@ export const createStatusPublishCoalescer = (
       followUp.collapsedCount += 1;
       followUp.skipUnchanged = followUp.skipUnchanged && req.skipUnchanged;
       if (req.active !== undefined) followUp.active = req.active;
+      if (
+        triggerFreshnessRank(req.trigger) > triggerFreshnessRank(followUp.trigger)
+      ) {
+        followUp.trigger = req.trigger;
+      }
       host.onCollapsed?.(snapshot());
     }
     return enqueueWaiter(followUp);

@@ -75,6 +75,18 @@ export const waitUntilExpired = (budget: TDeadlineBudget): Promise<void> => {
   });
 };
 
+/** Race work against the budget. Expired wins; work is not cancelled unless it honors `budget.signal`. */
+export const firstOfBudget = async <T>(
+  budget: TDeadlineBudget,
+  work: Promise<T>,
+): Promise<{ readonly kind: "value"; readonly value: T } | { readonly kind: "expired" }> => {
+  if (budget.expired()) return { kind: "expired" };
+  return Promise.race([
+    work.then((value) => ({ kind: "value" as const, value })),
+    waitUntilExpired(budget).then(() => ({ kind: "expired" as const })),
+  ]);
+};
+
 /**
  * How late a `setTimeout(delayMs)` callback ran relative to arming, using the
  * same `performance.now()` clock as {@link createDeadlineBudget}. Negative

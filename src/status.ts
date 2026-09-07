@@ -16,6 +16,7 @@ import type {
   TDaemonStatus,
 } from "@openllmsh/protocol";
 import { normalizeProviderConnection } from "@openllmsh/protocol";
+import { setAuthStoreIdentityChangeHook } from "./auth-user-action";
 import { autoUpdateEnabled } from "./auto-update-pref";
 import { getCloudState } from "./config";
 import type { TDeadlineBudget } from "./deadline-budget";
@@ -25,7 +26,14 @@ import {
   waitUntilExpired,
 } from "./deadline-budget";
 import { DELEGATES, getDelegate, isSubscriptionSlug } from "./delegation";
-import { loginSlot } from "./delegation/login-flow";
+import {
+  providerAuthOperationActive,
+  resetProviderAuthOperationsForTests,
+} from "./delegation/login-flow";
+import {
+  resetStoreIdentityEpochsForTests,
+  storeIdentityEpoch,
+} from "./delegation/observation-cache";
 import { DEFAULT_CAPTURE_TIMEOUT_MS } from "./delegation/spawn";
 import { STATUS_CHECK_FAILED_DETAIL } from "./delegation/util";
 import { getCliState } from "./device-state";
@@ -40,7 +48,10 @@ import { resolveOnPath } from "./path-utils";
 import { ptySessionsEnabled } from "./pty-sessions-pref";
 import { sandboxState } from "./sandbox/landlock";
 import { ptySupported, sessionStatusReport } from "./session-host";
-import type { TStatusPublishQueueSnapshot } from "./status-publish-coalesce";
+import type {
+  TStatusPublishQueueSnapshot,
+  TStatusPublishTrigger,
+} from "./status-publish-coalesce";
 import { cachedUsage, peekUsage } from "./usage-cache";
 import { DAEMON_VERSION } from "./version";
 
@@ -95,9 +106,78 @@ export const clearProviderSignedOut = (slug: string): void => {
  * an in-flight login: generation+fingerprint can still match while the vendor
  * still reports connected.
  */
+export {
+  beginProviderAuthOperation,
+  endProviderAuthOperation,
+} from "./delegation/login-flow";
+
+const providerAuthOwned = (slug: string): boolean =>
+  isSubscriptionSlug(slug) && providerAuthOperationActive(slug);
+
 export const lateProviderAdmitBlocked = (slug: string): boolean =>
-  signedOutByUser.has(slug) ||
-  (isSubscriptionSlug(slug) && loginSlot(slug).inFlight());
+  signedOutByUser.has(slug) || providerAuthOwned(slug);
+
+const PROBE_BACKOFF_AFTER = 2;
+const PROBE_BACKOFF_BASE_MS = 15_000;
+const PROBE_BACKOFF_MAX_MS = 60_000;
+
+type TProbeBackoff = {
+  consecutiveUnknown: number;
+  untilMs: number;
+  identityEpoch: number;
+};
+
+const probeBackoff = new Map<string, TProbeBackoff>();
+let statusNow = (): number => Date.now();
+
+/** Test-only clock for probe backoff. Pass `null` to restore. */
+export const setStatusClockForTests = (fn: (() => number) | null): void => {
+  statusNow = fn ?? (() => Date.now());
+};
+
+export const clearProviderProbeBackoff = (slug: string): void => {
+  probeBackoff.delete(slug);
+};
+
+setAuthStoreIdentityChangeHook(clearProviderProbeBackoff);
+
+const forceProbeTrigger = (trigger: TStatusPublishTrigger | undefined): boolean =>
+  trigger === "command" || trigger === "auth-sink";
+
+const noteProbeIndeterminate = (slug: string, indeterminate: boolean): void => {
+  if (!indeterminate) {
+    probeBackoff.delete(slug);
+    return;
+  }
+  const prev = probeBackoff.get(slug);
+  const consecutiveUnknown = (prev?.consecutiveUnknown ?? 0) + 1;
+  let untilMs = prev?.untilMs ?? 0;
+  if (consecutiveUnknown >= PROBE_BACKOFF_AFTER) {
+    const shift = Math.min(consecutiveUnknown - PROBE_BACKOFF_AFTER, 2);
+    untilMs =
+      statusNow() +
+      Math.min(PROBE_BACKOFF_BASE_MS * 2 ** shift, PROBE_BACKOFF_MAX_MS);
+  }
+  probeBackoff.set(slug, {
+    consecutiveUnknown,
+    untilMs,
+    identityEpoch: storeIdentityEpoch(slug),
+  });
+};
+
+const probeBackoffBlocks = (
+  slug: string,
+  force: boolean,
+): boolean => {
+  if (force) return false;
+  const entry = probeBackoff.get(slug);
+  if (entry === undefined) return false;
+  if (storeIdentityEpoch(slug) !== entry.identityEpoch) {
+    probeBackoff.delete(slug);
+    return false;
+  }
+  return entry.untilMs > statusNow();
+};
 
 /** Test-only: sticky logout flag after late-admit attempts. */
 export const providerSignedOutByUserForTests = (slug: string): boolean =>
@@ -108,7 +188,7 @@ const applyAuthLiteral = (
   conn: TDaemonProviderConnection,
 ): TDaemonProviderConnection => {
   const last = lastKnownConnections.get(slug);
-  const inFlight = isSubscriptionSlug(slug) && loginSlot(slug).inFlight();
+  const inFlight = providerAuthOwned(slug);
   const normalized = normalizeProviderConnection(conn);
   const indeterminate =
     normalized.observation === "unknown" ||
@@ -225,9 +305,13 @@ export const seedLastKnownConnectionForTests = (
 export const resetLastKnownConnectionsForTests = (): void => {
   lastKnownConnections.clear();
   signedOutByUser.clear();
+  resetProviderAuthOperationsForTests();
+  resetStoreIdentityEpochsForTests();
+  probeBackoff.clear();
   inFlightSlugProbes.clear();
   inFlightStatus = null;
   requestLateProbePush = defaultLateProbePush;
+  statusNow = () => Date.now();
 };
 
 const recordLateProbeOutcome = (
@@ -330,15 +414,41 @@ const awaitProducer = async (
   ]);
 };
 
+type TBoundedDelegateStatusOptions = {
+  readonly force?: boolean;
+};
+
+const overlayUnknownObservation = (
+  slug: string,
+): TDaemonProviderConnection => {
+  const lastKnown = lastKnownConnections.get(slug);
+  if (lastKnown !== undefined) {
+    return {
+      ...lastKnown,
+      detail: STATUS_CHECK_FAILED_DETAIL,
+      observation: "unknown",
+      reason_code: lastKnown.reason_code ?? "probe_failed",
+    };
+  }
+  return statusFailure(slug);
+};
+
 const boundedDelegateStatus = async (
   slug: string,
   status: (signal?: AbortSignal) => Promise<TDaemonProviderConnection>,
+  options?: TBoundedDelegateStatusOptions,
 ): Promise<TDaemonProviderConnection> => {
   const parentTick = opTickContext.getStore();
   const run = async (): Promise<TDaemonProviderConnection> => {
+    if (providerAuthOwned(slug)) {
+      return overlayUnknownObservation(slug);
+    }
     const existing = inFlightSlugProbes.get(slug);
     if (existing !== undefined) {
       return awaitProducer(slug, existing.promise, () => {}, undefined, true);
+    }
+    if (probeBackoffBlocks(slug, options?.force === true)) {
+      return overlayUnknownObservation(slug);
     }
     const ownerBudget = createDeadlineBudget(DELEGATE_STATUS_TIMEOUT_MS);
     let abandoned = false;
@@ -424,7 +534,7 @@ const rememberConnection = (
   if (
     conn.observation !== "unknown" &&
     conn.detail !== STATUS_CHECK_FAILED_DETAIL &&
-    !(isSubscriptionSlug(slug) && loginSlot(slug).inFlight()) &&
+    !(providerAuthOwned(slug)) &&
     // Overlaying signed_out on a still-connected vendor read (logout
     // in flight) must not rewrite last-known to signed_out, or the
     // next connected tick would look like a login rising edge.
@@ -459,21 +569,52 @@ export const readProviderStatus = async (
 ): Promise<TDaemonProviderConnection | null> => {
   const d = getDelegate(slug);
   if (d === null) return null;
-  const raw = await boundedDelegateStatus(d.slug, (signal) => d.status(signal));
+  const raw = await boundedDelegateStatus(
+    d.slug,
+    (signal) => d.status(signal),
+    { force: true },
+  );
   const conn = applyAuthLiteral(d.slug, raw);
   rememberConnection(d.slug, raw, conn);
+  noteProbeIndeterminate(
+    d.slug,
+    conn.observation === "unknown" || conn.detail === STATUS_CHECK_FAILED_DETAIL,
+  );
   return conn;
 };
 
-const computeStatusFreshInner = async (): Promise<TDaemonStatus> => {
+export type TComputeStatusFreshOptions = {
+  /**
+   * Late-probe publish must join the producer that just settled rather than
+   * spawn a second child. Watcher/command/login follow-ups omit this so a new
+   * tick drops settled flights and re-reads vendors.
+   */
+  readonly reuseSettledSlugProbes?: boolean;
+  /** Publication trigger — command/auth bypass observer backoff. */
+  readonly trigger?: TStatusPublishTrigger;
+};
+
+const computeStatusFreshInner = async (
+  options?: TComputeStatusFreshOptions,
+): Promise<TDaemonStatus> => {
+  const force = forceProbeTrigger(options?.trigger);
   const connections = await Promise.all(
     Object.values(DELEGATES).map(async (d) => {
       try {
-        const raw = await boundedDelegateStatus(d.slug, (signal) =>
-          d.status(signal),
+        const raw = await boundedDelegateStatus(
+          d.slug,
+          (signal) => d.status(signal),
+          { force },
         );
         const conn = applyAuthLiteral(d.slug, raw);
         rememberConnection(d.slug, raw, conn);
+        if (!providerAuthOwned(d.slug) && !probeBackoffBlocks(d.slug, force)) {
+          noteProbeIndeterminate(
+            d.slug,
+            conn.observation === "unknown" ||
+              conn.detail === STATUS_CHECK_FAILED_DETAIL,
+          );
+        }
         const published = attachUpstreamAuthCooldown(d.slug, conn);
         // Attach a metadata-only usage snapshot for connected providers so the
         // dashboard can show remaining quota (read locally; never a token).
@@ -536,17 +677,8 @@ const computeStatusFreshInner = async (): Promise<TDaemonStatus> => {
     // Device chat sessions (feature §2.2): whether this box can host a
     // PTY, and the sessions it currently holds (live/dormant).
     pty_supported: ptySupported(),
-    sessions: sessionStatusReport(),
+    sessions: await sessionStatusReport(),
   };
-};
-
-export type TComputeStatusFreshOptions = {
-  /**
-   * Late-probe publish must join the producer that just settled rather than
-   * spawn a second child. Watcher/command/login follow-ups omit this so a new
-   * tick drops settled flights and re-reads vendors.
-   */
-  readonly reuseSettledSlugProbes?: boolean;
 };
 
 export const computeStatusFresh = (
@@ -556,7 +688,7 @@ export const computeStatusFresh = (
     dropSettledSlugProbes();
   }
   const tick_id = nextStatusTickId();
-  return opTickContext.run({ tick_id }, computeStatusFreshInner);
+  return opTickContext.run({ tick_id }, () => computeStatusFreshInner(options));
 };
 
 export const computeStatus = async (): Promise<TDaemonStatus> => {

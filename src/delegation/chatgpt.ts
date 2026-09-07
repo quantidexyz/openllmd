@@ -50,6 +50,7 @@ import {
 import { jwtExpiryMs } from "./jwt";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
+import { runWithAuthOperation } from "./login-flow";
 import { waitFileStoreHint } from "./observation-cache";
 import type { TRefreshErrorClass } from "./refresh";
 import {
@@ -707,7 +708,8 @@ export const chatgptDelegate: TProviderDelegate = {
       };
     }),
 
-  logout: async () => {
+  logout: () =>
+    runWithAuthOperation(PROVIDER, async () => {
     // `codex logout` revokes the token server-side; then ensure the isolated
     // auth.json is gone regardless of CLI version.
     if ((await cliInstallState(PROVIDER)).installed) {
@@ -720,5 +722,5 @@ export const chatgptDelegate: TProviderDelegate = {
     return cleared
       ? { ok: true, detail: "signed out of Codex" }
       : { ok: false, detail: "credential still present after logout" };
-  },
+    }),
 };
