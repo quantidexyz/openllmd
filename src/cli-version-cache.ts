@@ -221,19 +221,29 @@ const persistEntry = (entry: TMemoryEntry): void => {
   flushPersist();
 };
 
+const settleShared = (shared: Promise<string | null>): Promise<string | null> =>
+  shared.then(
+    (value) => value,
+    () => null,
+  );
+
 const joinObserver = (
   shared: Promise<string | null>,
   signal: AbortSignal | undefined,
 ): Promise<string | null> => {
-  if (signal === undefined) return shared;
-  if (signal.aborted) return Promise.resolve(null);
+  const settled = settleShared(shared);
+  if (signal === undefined) return settled;
+  if (signal.aborted) {
+    void settled;
+    return Promise.resolve(null);
+  }
   return new Promise((resolve) => {
     const onAbort = (): void => {
       signal.removeEventListener("abort", onAbort);
       resolve(null);
     };
     signal.addEventListener("abort", onAbort, { once: true });
-    void shared.then((value) => {
+    void settled.then((value) => {
       signal.removeEventListener("abort", onAbort);
       resolve(value);
     });

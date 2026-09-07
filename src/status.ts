@@ -578,6 +578,11 @@ export const readProviderStatus = async (
 ): Promise<TDaemonProviderConnection | null> => {
   const d = getDelegate(slug);
   if (d === null) return null;
+  // Capture before the await: an overlay unknown from login/logout is not a
+  // probe failure and must not arm observer backoff. A login that starts
+  // after this point still ran a real probe (boundedDelegateStatus checks
+  // ownership again at start).
+  const authSuppressed = providerAuthOwned(d.slug);
   const raw = await boundedDelegateStatus(
     d.slug,
     (signal) => d.status(signal),
@@ -585,11 +590,13 @@ export const readProviderStatus = async (
   );
   const conn = applyAuthLiteral(d.slug, raw);
   rememberConnection(d.slug, raw, conn);
-  noteProbeIndeterminate(
-    d.slug,
-    conn.observation === "unknown" ||
-      conn.detail === STATUS_CHECK_FAILED_DETAIL,
-  );
+  if (!authSuppressed) {
+    noteProbeIndeterminate(
+      d.slug,
+      conn.observation === "unknown" ||
+        conn.detail === STATUS_CHECK_FAILED_DETAIL,
+    );
+  }
   return conn;
 };
 

@@ -201,18 +201,6 @@ const reapSessionHostDir = (directory: string): void => {
   }
 };
 
-const withinSpawnGrace = (directory: string, startedAtMs: number): boolean => {
-  let ageStart = startedAtMs;
-  try {
-    ageStart = Number.isFinite(startedAtMs)
-      ? startedAtMs
-      : statSync(directory).mtimeMs;
-  } catch {
-    return false;
-  }
-  return Date.now() - ageStart < SPAWN_SOCKET_TIMEOUT_MS;
-};
-
 let discoveryInFlight: Promise<readonly TLiveSessionHost[]> | null = null;
 
 const discoverSessionHostsOnce = async (): Promise<
@@ -256,24 +244,20 @@ const discoverSessionHostsOnce = async (): Promise<
     const identity = await sessionHostProcessIdentity(candidate.meta);
     if (identity === "unknown") {
       // Uncertainty never authorizes deletion. Surface a socket-ready host so
-      // attach/status keep the session; keep a grace-window host without a
-      // socket; otherwise leave the directory for a later observation.
+      // attach/status keep the session; otherwise leave the directory.
       if (candidate.socketReady) {
         hosts.push({ ...candidate.meta, socketPath: candidate.socketPath });
       }
       return;
     }
-    if (identity === "alive" && !candidate.socketReady) {
-      if (withinSpawnGrace(candidate.directory, candidate.meta.startedAtMs)) {
-        return;
-      }
+    if (identity === "dead") {
       reapSessionHostDir(candidate.directory);
       return;
     }
-    if (identity === "dead" || !candidate.socketReady) {
-      reapSessionHostDir(candidate.directory);
-      return;
-    }
+    // Alive process: never reap. A missing socket is not attachable yet
+    // (bind lag or a later recreate); keep the registry until the socket
+    // appears or identity later proves dead.
+    if (!candidate.socketReady) return;
     hosts.push({ ...candidate.meta, socketPath: candidate.socketPath });
   });
   return hosts.sort((a, b) => b.startedAtMs - a.startedAtMs);
