@@ -232,16 +232,15 @@ const parseExpiryMs = (iso: string | undefined): number | null => {
 // cli-chat-proxy.grok.com GATES on it: a request without `x-grok-client-version`
 // (or with an old one) is rejected 426 "Your Grok CLI version (none) is
 // outdated. Please update to version 0.1.202 or later". We send the INSTALLED
-// binary's real version, read once + memoized; fall back to a known-good floor
-// if `--version` can't be read. (Full OpenClaw parity would drop this header
-// too; that needs a live 426-gate test the audit never ran.)
+// binary's real version via the shared stamp-keyed `cliVersion` cache (no
+// process-local forever memo — a binary replacement must be visible); fall
+// back to a known-good floor if `--version` can't be read. (Full OpenClaw
+// parity would drop this header too; that needs a live 426-gate test the
+// audit never ran.)
 const OPENLLM_USER_AGENT = `openllm/${DAEMON_VERSION}`;
-let cachedVersion: string | null = null;
 const clientVersion = async (): Promise<string> => {
-  if (cachedVersion !== null) return cachedVersion;
   const v = await cliVersion(bin(), env());
-  cachedVersion = v?.match(/\d+\.\d+\.\d+/)?.[0] ?? "0.2.73";
-  return cachedVersion;
+  return v?.match(/\d+\.\d+\.\d+/)?.[0] ?? "0.2.73";
 };
 
 /**

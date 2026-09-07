@@ -13,6 +13,8 @@ import { platform } from "node:os";
 import { join } from "node:path";
 import type { TSuperviseSpawnOptions } from "../child-supervisor";
 import { superviseSpawn } from "../child-supervisor";
+import type { TCliVersionOpts } from "../cli-version-cache";
+import { cachedCliVersion } from "../cli-version-cache";
 import { spawnCommand } from "../command";
 import {
   budgetFromSignal,
@@ -154,6 +156,12 @@ export type TRunCaptureOpts = {
   readonly signal?: AbortSignal;
   /** Exit 0 with empty stdout is success (logout prints nothing). */
   readonly allowEmpty?: boolean;
+  /**
+   * When set, stop reading stdout after this many bytes and treat overflow
+   * as failure. Version probes pass a small cap so a hung printer cannot
+   * fill memory/disk.
+   */
+  readonly maxBytes?: number;
 };
 
 /** Subscribe to `signal` abort; invoke `onAbort` immediately if already aborted. */
@@ -175,7 +183,8 @@ export const bindAbort = (
 type TCaptureOutcome =
   | { readonly kind: "complete"; readonly out: string; readonly code: number }
   | { readonly kind: "timeout" }
-  | { readonly kind: "aborted" };
+  | { readonly kind: "aborted" }
+  | { readonly kind: "overflow" };
 
 type TCaptureCompleteHook = () => void;
 
@@ -271,17 +280,56 @@ export const runCaptureResult = async (
     });
     let unbindAbortWait = (): void => {};
     try {
+      const readStdout = async (): Promise<{
+        readonly out: string;
+        readonly overflow: boolean;
+      }> => {
+        const cap = opts?.maxBytes;
+        if (cap === undefined || cap <= 0) {
+          const out = await new Response(stdout).text();
+          return { out, overflow: false };
+        }
+        const reader = stdout.getReader();
+        const chunks: Uint8Array[] = [];
+        let n = 0;
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value === undefined) continue;
+            n += value.byteLength;
+            if (n > cap) {
+              return { out: "", overflow: true };
+            }
+            chunks.push(value);
+          }
+        } finally {
+          try {
+            reader.releaseLock();
+          } catch {
+            // already released
+          }
+        }
+        const merged = new Uint8Array(n);
+        let offset = 0;
+        for (const c of chunks) {
+          merged.set(c, offset);
+          offset += c.byteLength;
+        }
+        return { out: new TextDecoder().decode(merged), overflow: false };
+      };
       const complete = Promise.all([
-        new Response(stdout).text().finally(() => {
+        readStdout().finally(() => {
           stdoutClosed = true;
         }),
         proc.exited.then((code) => {
           rootExitCode = code;
           return code;
         }),
-      ]).then(
-        ([out, code]): TCaptureOutcome => ({ kind: "complete", out, code }),
-      );
+      ]).then(([read, code]): TCaptureOutcome => {
+        if (read.overflow) return { kind: "overflow" };
+        return { kind: "complete", out: read.out, code };
+      });
       const scheduleTimeout =
         captureTimeoutSchedulerForTests ??
         ((
@@ -368,6 +416,10 @@ export const runCaptureResult = async (
         await child.terminate(splitReapBudget(budget.remainingMs()));
         return { kind: "aborted" };
       }
+      if (outcome.kind === "overflow") {
+        await child.terminate(splitReapBudget(budget.remainingMs()));
+        return { kind: "failed" };
+      }
       // `probe:true` runs UNWRAPPED — a signal death there is not a sandbox
       // denial (this was the mislabeled `--version` status-probe drain).
       logIfKilled(redactSensitiveArgv(argv), proc, {
@@ -407,13 +459,13 @@ export const runCapture = async (
  *  but the `openllm` CLI's `--version` now spawns a nested `openllmd --version`
  *  child, and a confined caller spawning that child can be Seatbelt/Landlock
  *  denied (→ null → the CLI converger's "did not report a version" skip).
- *  Callers still gate this behind a stat-signature cache (`bin-signature.ts`)
- *  so it spawns only when the binary changed. */
+ *  Stamp-keyed via {@link cachedCliVersion}: success and completed failure
+ *  reuse until the resolved binary identity changes (no TTL). */
 export const cliVersion = (
   bin: string,
   env?: Record<string, string>,
-): Promise<string | null> =>
-  runCapture([bin, "--version"], env, { kind: "probe", probe: true });
+  opts?: TCliVersionOpts,
+): Promise<string | null> => cachedCliVersion(bin, env, opts);
 
 export type TLoginResult = {
   readonly code: number;

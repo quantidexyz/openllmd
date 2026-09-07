@@ -529,29 +529,6 @@ const runCaptureOnce = (
   return run;
 };
 
-// Memoized `--version` probe: `resolveIdentityHeaders` runs on EVERY
-// claude_code handrolled hop (via `credentialForUpstream`), and before the
-// identity fixture existed that path spawned NOTHING for claude — the
-// freshness check must not reintroduce a per-request `claude --version`
-// spawn. A short TTL keeps a CLI update visible within minutes (the fixture
-// TTL is 24h, so minute-level staleness here is irrelevant).
-const VERSION_MEMO_TTL_MS = 5 * 60_000;
-const versionMemo = new Map<
-  TCliProvider,
-  { readonly version: string | null; readonly atMs: number }
->();
-const memoizedCliVersion = async (
-  provider: TCliProvider,
-): Promise<string | null> => {
-  const hit = versionMemo.get(provider);
-  if (hit !== undefined && Date.now() - hit.atMs < VERSION_MEMO_TTL_MS) {
-    return hit.version;
-  }
-  const version = await cliVersion(cliBin(provider), cliEnv(provider));
-  versionMemo.set(provider, { version, atMs: Date.now() });
-  return version;
-};
-
 /** Version match + within TTL — the shared freshness of the last capture. */
 const captureFresh = (cfg: TAuthConfig, cliVer: string | null): boolean =>
   cfg.cli_version === (cliVer ?? "") &&
@@ -619,8 +596,9 @@ export const resolveIdentityHeaders = async (
   const cfg = (await readConfig(provider)) ?? {};
   const stored = cfg.identity_headers ?? null;
   if (opts?.force !== true && stored !== null) {
-    // Memoized — this runs per hop and must not spawn `--version` each time.
-    const ver = await memoizedCliVersion(provider);
+    // Stamp-keyed `cliVersion` — this runs per hop and must not spawn
+    // `--version` each time for an unchanged binary.
+    const ver = await cliVersion(cliBin(provider), cliEnv(provider));
     if (captureFresh(cfg, ver)) return stored;
   }
   const captured = await runCaptureOnce(provider);

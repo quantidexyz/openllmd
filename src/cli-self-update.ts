@@ -74,10 +74,11 @@ export const resolveOpenllmCli = (): string | null =>
   null;
 
 /**
- * The installed CLI's version, probed by spawning `openllm --version`
+ * The installed CLI's version via the shared stamp-keyed `cliVersion` cache
  * (output `openllm vX.Y.Z`; legacy binaries print `openllmc vX.Y.Z`). Null
  * when the binary is absent, won't run, or prints something unparseable —
- * the converger then leaves it alone.
+ * the converger then leaves it alone. Shares in-flight work with
+ * `device-state`; an unchanged binary is not re-spawned.
  */
 const installedCliVersion = async (bin: string): Promise<string | null> => {
   const out = await cliVersion(bin);

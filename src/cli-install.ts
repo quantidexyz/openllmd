@@ -24,7 +24,6 @@ import {
 } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { binarySignature } from "./bin-signature";
 import type { TCliProvider } from "./cli-paths";
 import {
   cliBin,
@@ -34,7 +33,7 @@ import {
   cliRoot,
   hostCliCandidates,
 } from "./cli-paths";
-import { runCapture } from "./delegation/util";
+import { cliVersion } from "./delegation/util";
 
 export type TCliInstallState = {
   readonly installed: boolean;
@@ -163,18 +162,17 @@ const reconcileIsolatedLink = async (
  * `codex`/`claude`/`kimi` self-update, brew, npm, etc.), so freshness cannot
  * assume a restart clears anything. Two paths defend against a frozen version:
  *   1. The isolated main symlink is RE-RECONCILED against the preferred host
- *      candidate on every probe (not only when absent) — an update that moves
- *      the binary to a different preferred path re-points the link.
- *   2. A real `--version` re-runs when the resolved binary's stat signature
- *      changes OR the cached version is older than `CLI_VERSION_HARD_MAX_MS`
- *      (catches a stable launcher/wrapper whose own stat never moves).
+ *      candidate on a throttled refresh (not only when absent) — an update that
+ *      moves the binary to a different preferred path re-points the link.
+ *   2. `--version` is owned by the shared stamp-keyed cache (`cliVersion`):
+ *      an unchanged resolved binary is never re-spawned, including after a
+ *      timeout. Cached timeout means installed / version unknown, not absent.
  * The short TTL only throttles how often periodic status observations re-stat /
- * re-reconcile; it never pins a version past a detected binary change.
+ * re-reconcile the isolated link; it never pins or expires a version.
  */
 
 /** Numeric env override (tests only) — returns `fallback` unless the var parses
- *  to a non-negative integer. Lets a test collapse the TTL / hard-max windows to
- *  drive the refresh/re-probe paths deterministically. */
+ *  to a non-negative integer. Lets a test collapse the reconcile TTL. */
 const envMs = (name: string, fallback: number): number => {
   const raw = process.env[name];
   if (raw === undefined) return fallback;
@@ -183,245 +181,67 @@ const envMs = (name: string, fallback: number): number => {
 };
 
 /** Cache TTL — 30 s throttles the re-stat / re-reconcile on the hot status
- *  path; a detected signature change re-probes even inside this window. */
+ *  path. Version identity is NOT gated here. */
 const CLI_INSTALL_STATE_TTL_MS = envMs("OPENLLM_CLI_STATE_TTL_MS", 30_000);
 
-/** Hard ceiling on version staleness: even with an unchanged stat signature
- *  (a stable launcher that execs a versioned binary without moving its own
- *  metadata), re-spawn `--version` at least this often so an out-of-band vendor
- *  update is picked up. Model discovery is version-gated (Codex), so this bounds
- *  how long a new vendor version can stay undetected. */
-const CLI_VERSION_HARD_MAX_MS = envMs(
-  "OPENLLM_CLI_VERSION_MAX_MS",
-  10 * 60_000,
-);
-
 /**
- * Per-spawn kill deadline for a `--version` probe — distinct from
- * {@link CLI_VERSION_HARD_MAX_MS} (a cache-staleness interval, NOT a process
- * timeout). A vendor CLI can wedge indefinitely under the isolated HOME/config
- * (a corrupt `.claude.json`, a first-run prompt with stdin ignored, a launcher
- * update/keychain probe), and a hung probe on the status sweep is what stalls a
- * boot. Resolved LAZILY on each call — NOT a module-level constant — because
- * `.env` is loaded by `daemonPort()` AFTER this module is first evaluated, so a
- * module-eval read would miss an `~/.openllm/.env` override (only a plist-injected
- * value would be visible that early). The 3s default is daemon-owned, so the
- * guard holds with no `.env` or plist edit at all. */
+ * Per-spawn kill deadline for a `--version` probe. A vendor CLI can wedge
+ * under the isolated HOME/config; the shared cache stores that completed
+ * timeout until the binary stamp changes. Resolved LAZILY because `.env` is
+ * loaded by `daemonPort()` AFTER this module is first evaluated.
+ */
 const cliVersionProbeTimeoutMs = (): number =>
   envMs("OPENLLM_CLI_VERSION_PROBE_TIMEOUT_MS", 3_000);
 
-interface CliInstallCacheEntry {
-  readonly result: TCliInstallState;
-  readonly expiresAt: number;
-  /** Stat signature of the resolved binary at probe time — an unchanged
-   *  signature reuses the version instead of re-spawning `--version` (see
-   *  {@link binarySignature}), unless {@link CLI_VERSION_HARD_MAX_MS} elapsed. */
-  readonly signature: string | null;
-  /** Wall-clock ms of the last real `--version` spawn (not a cache renewal) —
-   *  gates the {@link CLI_VERSION_HARD_MAX_MS} forced re-probe. */
-  readonly probedAt: number;
-  /**
-   * Internal only — not on {@link TCliInstallState}. True when the last spawn
-   * returned no parseable version (`runCapture` null / no semver match). Such
-   * an entry is still reusable while the binary signature is unchanged, so a
-   * timed-out `--version` does not re-spawn on every status tick.
-   */
-  readonly inconclusive: boolean;
-  /**
-   * TTL used for this entry. After a consecutive inconclusive probe this
-   * doubles (capped at {@link CLI_VERSION_HARD_MAX_MS}); a successful parse
-   * resets it to {@link CLI_INSTALL_STATE_TTL_MS}. The initial inconclusive TTL
-   * is also `min(base, hard-max)` so a configured hard-max below the base
-   * never lets the first cache window overshoot.
-   */
-  readonly ttlMs: number;
-}
+/** Per-provider last-reconcile throttle. Version spawns live in `cliVersion`. */
+const cliInstallReconcileUntil = new Map<TCliProvider, number>();
 
-/** Per-provider cache of `cliInstallState` results. */
-const cliInstallStateCache = new Map<TCliProvider, CliInstallCacheEntry>();
-
-/** In-flight `cliInstallState` probes — overlapping callers share one spawn. */
+/** In-flight `cliInstallState` probes — overlapping callers share one reconcile. */
 const cliInstallStateInFlight = new Map<
   TCliProvider,
   Promise<TCliInstallState>
 >();
 
 /**
- * Generation token to invalidate in-flight probes. Incremented on each clear
- * so concurrent probes that started before the clear do not write stale results.
- */
-let cacheGeneration = 0;
-
-const writeCacheEntry = (
-  provider: TCliProvider,
-  generation: number,
-  entry: CliInstallCacheEntry,
-): void => {
-  if (generation === cacheGeneration) {
-    cliInstallStateCache.set(provider, entry);
-  }
-};
-
-/**
- * Clear the `cliInstallState` cache — used by tests that change
- * `OPENLLM_DAEMON_STATE_DIR` between calls, and after the isolated link is
- * re-pointed at a moved host binary (so the next read re-probes `--version`).
- * Drops in-flight joiners so a post-clear caller does not share a pre-clear
- * probe (the generation guard still discards that probe's cache write).
+ * Clear the reconcile throttle — used by tests that change
+ * `OPENLLM_DAEMON_STATE_DIR`. Does NOT drop the shared version-stamp cache.
  */
 export const clearCliInstallStateCache = (): void => {
-  cliInstallStateCache.clear();
+  cliInstallReconcileUntil.clear();
   cliInstallStateInFlight.clear();
-  cacheGeneration++;
 };
 
-const nextInconclusiveTtlMs = (
-  cached: CliInstallCacheEntry | undefined,
-): number => {
-  if (cached?.inconclusive !== true) {
-    return Math.min(CLI_INSTALL_STATE_TTL_MS, CLI_VERSION_HARD_MAX_MS);
-  }
-  return Math.min(cached.ttlMs * 2, CLI_VERSION_HARD_MAX_MS);
-};
+const parseVendorVersion = (out: string | null): string | null =>
+  out?.match(/\d+\.\d+\.\d+/)?.[0] ?? null;
 
 const probeCliInstallState = async (
   provider: TCliProvider,
 ): Promise<TCliInstallState> => {
-  const cached = cliInstallStateCache.get(provider);
   const now = Date.now();
-
-  // Capture generation at probe start to guard against stale writes after clear.
-  const generation = cacheGeneration;
-
   const bin = cliBin(provider);
   if (!existsSync(bin)) {
-    // No isolated run-view yet — link it from the host binary if that exists.
     const host = hostCliCandidates(provider).find((c) => existsSync(c));
     if (host === undefined) {
-      const result: TCliInstallState = { installed: false, version: null };
-      writeCacheEntry(provider, generation, {
-        result,
-        expiresAt: now + CLI_INSTALL_STATE_TTL_MS,
-        signature: null,
-        probedAt: now,
-        inconclusive: false,
-        ttlMs: CLI_INSTALL_STATE_TTL_MS,
-      });
-      return result;
+      return { installed: false, version: null };
     }
     await linkIsolatedCli(provider, host);
-  } else if (cached !== undefined && cached.expiresAt <= now) {
-    // Link exists AND we've probed it before (a genuine mid-lifetime REFRESH,
-    // not a cold start): RE-RECONCILE it against the preferred host candidate so
-    // an out-of-band update that moved the binary re-points the link. Gated to
-    // the refresh path — a cold daemon trusts its existing link (whatever the
-    // user last linked), and a `realpath` compare per observation would be needless
-    // churn. A re-point changes the resolved target, forcing a `--version` probe.
-    await reconcileIsolatedLink(provider, bin);
-  }
-  const notInstalled: TCliInstallState = { installed: false, version: null };
-  if (!existsSync(bin)) {
-    writeCacheEntry(provider, generation, {
-      result: notInstalled,
-      expiresAt: now + CLI_INSTALL_STATE_TTL_MS,
-      signature: null,
-      probedAt: now,
-      inconclusive: false,
-      ttlMs: CLI_INSTALL_STATE_TTL_MS,
-    });
-    return notInstalled;
-  }
-
-  // The resolved binary's stat signature — the cheap change-detector. Computed
-  // even on the TTL-fresh path so a binary swap re-probes immediately instead of
-  // waiting out the TTL.
-  const signature = binarySignature(bin);
-  const reusable =
-    cached?.result.installed === true &&
-    (cached.result.version !== null || cached.inconclusive) &&
-    signature !== null &&
-    cached.signature === signature &&
-    generation === cacheGeneration;
-
-  // TTL-fresh AND the binary hasn't changed. Successful versions also stay
-  // inside the hard-max staleness ceiling; inconclusive entries honour only
-  // their (backing-off) TTL — the hard-max is the cap on that TTL, not a
-  // second forced re-probe clock.
-  if (cached !== undefined && cached.expiresAt > now && reusable) {
-    if (
-      cached.inconclusive ||
-      now - cached.probedAt < CLI_VERSION_HARD_MAX_MS
-    ) {
-      return cached.result;
+  } else {
+    const until = cliInstallReconcileUntil.get(provider);
+    if (until !== undefined && until <= now) {
+      await reconcileIsolatedLink(provider, bin);
     }
   }
+  if (!existsSync(bin)) {
+    return { installed: false, version: null };
+  }
 
-  // Self-heal SIDECARS for installs whose main link predates sidecar linking
-  // (the main link existing skips `linkIsolatedCli` above forever). Idempotent
-  // — an up-to-date link is a readlink+compare, so the 30s probe stays cheap.
   linkSidecars(bin);
+  cliInstallReconcileUntil.set(provider, now + CLI_INSTALL_STATE_TTL_MS);
 
-  // Past the TTL but the binary is unchanged AND still inside the hard-max
-  // window → reuse a SUCCESSFUL version without re-spawning `--version`, just
-  // renewing the TTL. Inconclusive entries must re-spawn when their TTL
-  // expires (that is the backoff clock) UNTIL that TTL has already reached
-  // the hard-max — then an unchanged hung binary is parked until a
-  // signature/link change or `clearCliInstallStateCache`.
-  if (
-    reusable &&
-    cached !== undefined &&
-    !cached.inconclusive &&
-    now - cached.probedAt < CLI_VERSION_HARD_MAX_MS
-  ) {
-    writeCacheEntry(provider, generation, {
-      result: cached.result,
-      expiresAt: now + CLI_INSTALL_STATE_TTL_MS,
-      signature,
-      probedAt: cached.probedAt,
-      inconclusive: false,
-      ttlMs: CLI_INSTALL_STATE_TTL_MS,
-    });
-    return cached.result;
-  }
-  if (
-    reusable &&
-    cached?.inconclusive === true &&
-    cached.ttlMs >= CLI_VERSION_HARD_MAX_MS
-  ) {
-    writeCacheEntry(provider, generation, {
-      result: cached.result,
-      expiresAt: now + cached.ttlMs,
-      signature,
-      probedAt: cached.probedAt,
-      inconclusive: true,
-      ttlMs: cached.ttlMs,
-    });
-    return cached.result;
-  }
-
-  // `--version` runs as a read-only probe: skip the sandbox shim so the version
-  // check can execute a deep release binary path directly (including symlinked
-  // release trees like Codex), while still only re-running on change / stale
-  // thresholds.
-  const out = await runCapture([bin, "--version"], cliEnv(provider), {
-    probe: true,
+  const out = await cliVersion(bin, cliEnv(provider), {
     timeoutMs: cliVersionProbeTimeoutMs(),
   });
-  const version = out?.match(/\d+\.\d+\.\d+/)?.[0] ?? null;
-  const inconclusive = version === null;
-  const ttlMs = inconclusive
-    ? nextInconclusiveTtlMs(cached)
-    : CLI_INSTALL_STATE_TTL_MS;
-  const result: TCliInstallState = { installed: true, version };
-  writeCacheEntry(provider, generation, {
-    result,
-    expiresAt: now + ttlMs,
-    signature,
-    probedAt: now,
-    inconclusive,
-    ttlMs,
-  });
-  return result;
+  return { installed: true, version: parseVendorVersion(out) };
 };
 
 export const cliInstallState = async (
