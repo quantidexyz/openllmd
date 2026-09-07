@@ -656,18 +656,26 @@ inference** — reading them on the status-push cadence 429'd them after ~5 min
 ("Claude usage is rate-limited right now") on a daemon **nobody was even looking
 at**. So `computeStatus()` — which runs on every status push (hello/reconnect,
 the ~2.5s flow watcher, post-command) — only **peeks** the cache (`peekUsage`,
-never a vendor call); it attaches whatever was last fetched, or nothing. The
-**only** path that hits the vendor is the `refresh` command (`control-relay.ts`
-→ `refreshUsage` in `status.ts`), and its two demand signals are the manual
-**"Refresh usage"** button and a **one-shot providers-page mount** for that
-device when a connected provider still has no snapshot. Age-out of a cached
-snapshot is not a demand signal — `peekUsage` keeps serving the last good
-figures stamped `stale`.
-`cachedUsage(slug, () => delegate.usage())` still wraps that on-demand read in a
-TTL + back-off (at most once per few minutes — the quota windows are 5h/7d, so
-minute-level staleness is irrelevant — shared in-flight fetch, last-good
-fallback stamped `stale` when a refresh fails) so rapid refreshes or several
-dashboards can't hammer the endpoint either.
+never a vendor call); it attaches whatever was last fetched, or nothing.
+Explicit reads use the `refresh` command (`control-relay.ts` → `refreshUsage`
+in `status.ts`): the manual **"Refresh usage"** button and a **one-shot
+providers-page mount** when a connected provider has no snapshot. Real
+requests also drive detached usage sampling after successful bursts or quota
+exhaustion. A routing read with a revalidation callback can refresh a passed
+reset or an exhausted snapshot beyond the freshness TTL, even if its reset
+is still ahead: an external tier upgrade may have restored capacity. The
+current request keeps its cached routing decision; subsequent demand sees
+the refreshed tier and quota. Passive status and `peekUsage` never schedule
+these reads, and mere age-out while idle is not a demand signal.
+
+`cachedUsage(slug, () => delegate.usage())` wraps demand reads in TTL,
+back-off and shared in-flight work; forced request samples use their existing
+sampling bounds. Successful quota reads stamp `as_of_ms` before caching and
+persistence so repeated status frames retain the original observation time.
+Legacy disk entries use their persisted observation time, never restart time.
+The live cache remains provider/account-scoped: a successful tier change
+replaces its snapshot, and routing never resurrects a historical tier bucket
+as current quota. Failed refreshes preserve last-good figures stamped `stale`.
 
 **Passive status does not refresh tokens or provision vendor config.** File-backed
 delegates (`chatgpt`, `kimi_code`, `grok`) derive `status()` from **one** typed

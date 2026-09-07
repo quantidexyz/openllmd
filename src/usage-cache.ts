@@ -31,10 +31,11 @@
  *   - while backing off after a failure, the last good snapshot keeps being
  *     served for up to {@link STALE_TTL_MS} (so the card shows the last known
  *     figures, not an error) — after that the failure reason surfaces;
- *   - the served snapshot is STAMPED (`stale` + `as_of_ms`) whenever it's a
- *     fallback rather than a this-instant read, so the dashboard shows the
- *     last-known figures under a "cached · updated Xm ago" badge instead of
- *     silently presenting old numbers as live (or a bare error);
+ *   - a successful live fetch stamps `as_of_ms` with that fetch's observation
+ *     time BEFORE cache/disk write. Repeated status frames reuse it (not a
+ *     new read). Hydration never rewrites missing observation time to now;
+ *     it uses persisted `atMs`. `stale` is still only set on a fallback past
+ *     {@link FRESH_TTL_MS};
  *   - the last good snapshot is PERSISTED to disk
  *     (`<stateDir>/usage-cache.json`, or `usage-cache.dev.json` in dev mode so
  *     a source-run dev daemon never shares a cache with the installed prod one)
@@ -52,11 +53,12 @@
  * The dashboard's display TTL is deliberately NOT the routing TTL. The walker
  * uses {@link peekUsageForQuotaGate}: after the UI has stopped showing an old
  * card, it may retain only an exhausted quota pool with a known future reset.
- * That pool is self-validating — it cannot refill before its own reset — and is
- * therefore safe evidence to skip a dead hop. When a cached reset has passed,
- * the routing reader asks only that provider/account to revalidate through this
- * cache's existing single-flight and back-off machinery; it never creates a
- * polling sweep or blocks an inference request on the vendor.
+ * That remains safe evidence to skip a dead hop for the immediate decision.
+ * An external upgrade may restore capacity before that reset, so an exhausted
+ * snapshot past {@link FRESH_TTL_MS} also schedules a detached, demand-driven
+ * revalidate (no `force`) even while the reset is still ahead. A passed reset
+ * does the same. The reader never creates a polling sweep or blocks an
+ * inference request on the vendor.
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -133,6 +135,26 @@ const requestSamples = new Map<string, TRequestSample>();
 const isUsable = (s: TProviderUsageSnapshot): boolean =>
   s.kind !== "unavailable";
 
+// Record when this process actually observed the vendor figures. Fresh
+// quota snapshots carry `as_of_ms` so later status frames preserve the
+// same observation rather than looking like a new read. Existing
+// `as_of_ms` (hydrate of a persisted file) is kept.
+const stampObservation = (
+  snapshot: TProviderUsageSnapshot,
+  atMs: number,
+): TProviderUsageSnapshot => {
+  if (snapshot.kind !== "quota") return snapshot;
+  return { ...snapshot, as_of_ms: snapshot.as_of_ms ?? atMs };
+};
+
+const stampLiveFetch = (
+  snapshot: TProviderUsageSnapshot,
+  atMs: number,
+): TProviderUsageSnapshot => {
+  if (snapshot.kind !== "quota") return snapshot;
+  return { ...snapshot, as_of_ms: atMs };
+};
+
 // ---------------------------------------------------------------------------
 // Disk persistence (opt-in; the daemon enables it at boot, unit tests don't).
 // ---------------------------------------------------------------------------
@@ -194,8 +216,15 @@ const hydrate = (): void => {
     for (const [slug, e] of Object.entries(parsed)) {
       if (cache.has(slug)) continue;
       if (e?.good?.snapshot === undefined) continue;
+      const atMs = e.good.atMs;
       cache.set(slug, {
-        good: e.good,
+        // Legacy files may omit `as_of_ms`. Provenance is the persisted
+        // observation time, never wall-clock "now" — hydrating an old
+        // snapshot must not look like a fresh vendor read.
+        good: {
+          snapshot: stampObservation(e.good.snapshot, atMs),
+          atMs,
+        },
         failure: null,
         lastAttemptAtMs:
           typeof e.lastAttemptAtMs === "number" ? e.lastAttemptAtMs : 0,
@@ -228,14 +257,16 @@ const persist = (): void => {
 
 // Stamp a snapshot served as a FALLBACK with its age so the UI can render a
 // "cached · updated Xm ago" badge instead of presenting old figures as live.
-// A fresh read (age < FRESH_TTL_MS) is returned untouched — it IS current.
+// A fresh read (age < FRESH_TTL_MS) keeps its observation time and is not
+// marked stale — it IS current.
 const stampStale = (
   snapshot: TProviderUsageSnapshot,
   atMs: number,
   now: number,
 ): TProviderUsageSnapshot => {
-  if (snapshot.kind !== "quota" || now - atMs < FRESH_TTL_MS) return snapshot;
-  return { ...snapshot, as_of_ms: atMs, stale: true };
+  const observed = stampObservation(snapshot, atMs);
+  if (observed.kind !== "quota" || now - atMs < FRESH_TTL_MS) return observed;
+  return { ...observed, as_of_ms: observed.as_of_ms ?? atMs, stale: true };
 };
 
 // What to serve right now without calling the vendor: the last good figures if
@@ -311,9 +342,10 @@ export const cachedUsage = async (
       return { kind: "unavailable", reason: "usage cache invalidated" };
     }
     const prev = cache.get(key);
+    const observed = isUsable(next) ? stampLiveFetch(next, at) : next;
     const updated: TUsageEntry = {
-      good: isUsable(next)
-        ? { snapshot: next, atMs: at }
+      good: isUsable(observed)
+        ? { snapshot: observed, atMs: at }
         : (prev?.good ?? null),
       failure: isUsable(next) ? null : next,
       lastAttemptAtMs: at,
@@ -364,14 +396,20 @@ export const peekUsage = (
 /**
  * PASSIVE routing read — retains a long-aged quota snapshot only when an
  * exhausted window or extra pool has a known reset still ahead. Unlike the UI
- * display reader, that fact remains valid regardless of snapshot age: the
- * exhausted pool cannot refill until its own reset instant. All other cases
- * preserve {@link peekUsage}'s exact display-TTL behavior.
+ * display reader, that skip is still the immediate routing decision regardless
+ * of snapshot age. An external upgrade is the exception: capacity may return
+ * before the cached reset, so a demand revalidate is scheduled when the
+ * snapshot is exhausted past {@link FRESH_TTL_MS} even with a future reset.
+ * All other cases preserve {@link peekUsage}'s exact display-TTL behavior.
  *
- * A passed reset proves the cached quota is expired. When a fetcher is supplied,
- * schedule one detached, provider/account-scoped cache read without `force`;
- * `cachedUsage` supplies the existing freshness, back-off, and single-flight
- * limits. The reader returns immediately and never lets a vendor failure throw.
+ * A passed reset proves the cached quota is expired. An exhausted snapshot
+ * past {@link FRESH_TTL_MS} is the same demand-driven recovery even when the
+ * reset is still in the future (an external upgrade may have restored
+ * capacity). When a fetcher is supplied, schedule one detached,
+ * provider/account-scoped cache read without `force`; `cachedUsage` supplies
+ * the existing freshness, back-off, and single-flight limits. The reader
+ * returns the cached routing decision immediately and never lets a vendor
+ * failure throw.
  */
 export const peekUsageForQuotaGate = (
   slug: string,
@@ -386,11 +424,16 @@ export const peekUsageForQuotaGate = (
   const snapshot = entry.good.snapshot;
   if (snapshot.kind !== "quota") return peekUsage(slug, accountHash);
   const pools = [...snapshot.windows, ...(snapshot.extra_pools ?? [])];
-  if (
-    revalidate !== undefined &&
-    pools.some((pool) => pool.reset_at_ms !== null && now >= pool.reset_at_ms)
-  ) {
-    void cachedUsage(slug, revalidate, { accountHash });
+  const resetPassed = pools.some(
+    (pool) => pool.reset_at_ms !== null && now >= pool.reset_at_ms,
+  );
+  const exhaustedPastFresh =
+    now - entry.good.atMs >= FRESH_TTL_MS &&
+    pools.some((pool) => pool.percent_used >= 100);
+  if (revalidate !== undefined && (resetPassed || exhaustedPastFresh)) {
+    // Detached: TTL / backoff / single-flight stay inside cachedUsage.
+    // Catch so a vendor rejection cannot surface as an unhandled promise.
+    void cachedUsage(slug, revalidate, { accountHash }).catch(() => {});
   }
   if (now - entry.good.atMs < STALE_TTL_MS) {
     return stampStale(snapshot, entry.good.atMs, now);
