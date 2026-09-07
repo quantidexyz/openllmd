@@ -45,7 +45,7 @@ type TJob = {
 export type TStatusPublishCoalescerHost = {
   readonly now: () => number;
   readonly epoch: () => number;
-  readonly computeFresh: () => Promise<{
+  readonly computeFresh: (trigger: TStatusPublishTrigger) => Promise<{
     status: { connections: ReadonlyArray<unknown> } & Record<string, unknown>;
     fingerprint: string;
   }>;
@@ -116,7 +116,7 @@ export const createStatusPublishCoalescer = (
 
   const runJob = async (job: TJob): Promise<void> => {
     try {
-      const computed = await host.computeFresh();
+      const computed = await host.computeFresh(job.trigger);
       if (!host.canSend(job.epoch)) {
         resolveWaiters(job.waiters);
         return;

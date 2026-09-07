@@ -155,11 +155,19 @@ const applyAuthLiteral = (
   };
 };
 
-const inFlightSlugProbes = new Map<
-  string,
-  Promise<TDaemonProviderConnection>
->();
+type TSlugProbe = {
+  readonly promise: Promise<TDaemonProviderConnection>;
+  settled: boolean;
+};
+
+const inFlightSlugProbes = new Map<string, TSlugProbe>();
 let inFlightStatus: Promise<TDaemonStatus> | null = null;
+
+const dropSettledSlugProbes = (): void => {
+  for (const [slug, probe] of inFlightSlugProbes) {
+    if (probe.settled) inFlightSlugProbes.delete(slug);
+  }
+};
 
 const connectionFingerprint = (conn: TDaemonProviderConnection): string =>
   JSON.stringify(conn);
@@ -330,7 +338,7 @@ const boundedDelegateStatus = async (
   const run = async (): Promise<TDaemonProviderConnection> => {
     const existing = inFlightSlugProbes.get(slug);
     if (existing !== undefined) {
-      return awaitProducer(slug, existing, () => {}, undefined, true);
+      return awaitProducer(slug, existing.promise, () => {}, undefined, true);
     }
     const ownerBudget = createDeadlineBudget(DELEGATE_STATUS_TIMEOUT_MS);
     let abandoned = false;
@@ -345,10 +353,11 @@ const boundedDelegateStatus = async (
         return statusFailure(slug);
       },
     );
-    inFlightSlugProbes.set(slug, producer);
+    const probe: TSlugProbe = { promise: producer, settled: false };
+    inFlightSlugProbes.set(slug, probe);
     void producer.finally(() => {
-      if (inFlightSlugProbes.get(slug) === producer) {
-        inFlightSlugProbes.delete(slug);
+      if (inFlightSlugProbes.get(slug) === probe) {
+        probe.settled = true;
       }
     });
     void producer.then((conn) => {
@@ -531,7 +540,21 @@ const computeStatusFreshInner = async (): Promise<TDaemonStatus> => {
   };
 };
 
-export const computeStatusFresh = (): Promise<TDaemonStatus> => {
+export type TComputeStatusFreshOptions = {
+  /**
+   * Late-probe publish must join the producer that just settled rather than
+   * spawn a second child. Watcher/command/login follow-ups omit this so a new
+   * tick drops settled flights and re-reads vendors.
+   */
+  readonly reuseSettledSlugProbes?: boolean;
+};
+
+export const computeStatusFresh = (
+  options?: TComputeStatusFreshOptions,
+): Promise<TDaemonStatus> => {
+  if (options?.reuseSettledSlugProbes !== true) {
+    dropSettledSlugProbes();
+  }
   const tick_id = nextStatusTickId();
   return opTickContext.run({ tick_id }, computeStatusFreshInner);
 };
