@@ -11,9 +11,11 @@ import { discoverSessionHosts } from "./session-host-proc";
 
 /**
  * Adopt live durable session-host directories and reap stale entries. Discovery
- * validates pid + socket asynchronously. Unknown process identity never
- * authorizes deletion. A confirmed-alive process is never reaped even if its
- * socket is missing; it is not listed as attachable until the socket exists.
+ * validates pid + socket asynchronously under a shared outer deadline. Unknown
+ * process identity never authorizes deletion. A confirmed-alive process is
+ * never reaped even if its socket is missing; it is not listed as attachable
+ * until the socket exists. Expiry returns the last complete scan for status
+ * and stops starting probes — it does not keep reaping in the background.
  */
 export const reapOrphanSessionProcs = async (): Promise<void> => {
   await discoverSessionHosts();

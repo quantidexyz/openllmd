@@ -82,12 +82,7 @@ type TPersistFile = {
   readonly records: readonly TPersistRecord[];
 };
 
-type TMemoryEntry = {
-  readonly path: string;
-  readonly stamp: string;
-  readonly output: string | null;
-  readonly probedAt: number;
-};
+type TMemoryEntry = TPersistRecord;
 
 const memory = new Map<string, TMemoryEntry>();
 const inflight = new Map<string, Promise<string | null>>();
@@ -152,27 +147,12 @@ const loadPersist = (): void => {
     return;
   }
   for (const rec of coerceFile(parsed)) {
-    memory.set(identityKey(rec.path, rec.stamp), {
-      path: rec.path,
-      stamp: rec.stamp,
-      output: rec.output,
-      probedAt: rec.probedAt,
-    });
+    memory.set(identityKey(rec.path, rec.stamp), rec);
   }
 };
 
-const recordsFromMemory = (): TPersistRecord[] => {
-  const records: TPersistRecord[] = [];
-  for (const entry of memory.values()) {
-    records.push({
-      path: entry.path,
-      stamp: entry.stamp,
-      output: entry.output,
-      probedAt: entry.probedAt,
-    });
-  }
-  return records.slice(-CLI_VERSION_CACHE_MAX_RECORDS);
-};
+const recordsFromMemory = (): TPersistRecord[] =>
+  [...memory.values()].slice(-CLI_VERSION_CACHE_MAX_RECORDS);
 
 const writePersistAtomic = (records: readonly TPersistRecord[]): void => {
   persistTmpSeq += 1;

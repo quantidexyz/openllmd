@@ -229,6 +229,7 @@ const probeCliInstallState = async (
     const until = cliInstallReconcileUntil.get(provider);
     if (until !== undefined && until <= now) {
       await reconcileIsolatedLink(provider, bin);
+      cliInstallReconcileUntil.set(provider, now + CLI_INSTALL_STATE_TTL_MS);
     }
   }
   if (!existsSync(bin)) {
@@ -236,7 +237,9 @@ const probeCliInstallState = async (
   }
 
   linkSidecars(bin);
-  cliInstallReconcileUntil.set(provider, now + CLI_INSTALL_STATE_TTL_MS);
+  if (!cliInstallReconcileUntil.has(provider)) {
+    cliInstallReconcileUntil.set(provider, now + CLI_INSTALL_STATE_TTL_MS);
+  }
 
   const out = await cliVersion(bin, cliEnv(provider), {
     timeoutMs: cliVersionProbeTimeoutMs(),

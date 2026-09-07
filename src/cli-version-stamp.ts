@@ -11,14 +11,19 @@
  */
 import { realpathSync, statSync } from "node:fs";
 
-/** High-res mtime as nanoseconds. Node exposes `mtimeNs`; Bun Stats may not. */
+/** High-res mtime as nanoseconds. Request bigint stats so `mtimeNs` is present. */
 const highResMtimeNs = (s: {
-  readonly mtimeMs: number;
-  readonly mtimeNs?: unknown;
+  readonly mtimeMs: number | bigint;
+  readonly mtimeNs?: number | bigint;
 }): string => {
   const ns = s.mtimeNs;
   if (typeof ns === "bigint") return ns.toString();
-  return Math.round(s.mtimeMs * 1e6).toString();
+  if (typeof ns === "number" && Number.isFinite(ns)) {
+    return Math.round(ns).toString();
+  }
+  const ms = s.mtimeMs;
+  if (typeof ms === "bigint") return (ms * 1_000_000n).toString();
+  return Math.round(ms * 1e6).toString();
 };
 
 /** Canonical path of `bin`, or `null` when it cannot be resolved. */
@@ -39,7 +44,7 @@ export const versionBinaryStamp = (path: string): string | null => {
   const resolved = resolveVersionBinary(path);
   if (resolved === null) return null;
   try {
-    const s = statSync(resolved);
+    const s = statSync(resolved, { bigint: true });
     return `${s.dev}:${s.ino}:${s.size}:${highResMtimeNs(s)}`;
   } catch {
     return null;

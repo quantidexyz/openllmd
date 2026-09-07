@@ -26,7 +26,11 @@ import { Schema as S } from "effect";
 import { resolveOpenllmCli } from "../cli-self-update";
 import { spawnCommand } from "../command";
 import type { TDeadlineBudget } from "../deadline-budget";
-import { createDeadlineBudget, firstOfBudget } from "../deadline-budget";
+import {
+  budgetFromSignal,
+  createDeadlineBudget,
+  firstOfBudget,
+} from "../deadline-budget";
 import { isDevMode, stateDir } from "../env";
 import type { TSessionStream } from "../session-core";
 import type { TSessionHostMeta } from "./main";
@@ -35,6 +39,13 @@ const SPAWN_SOCKET_TIMEOUT_MS = 2_000;
 /** Per-pid `ps` identity read. Expiry is unknown, never dead. */
 const PROCESS_IDENTITY_TIMEOUT_MS = 250;
 const DISCOVERY_CONCURRENCY = 4;
+/**
+ * Outer bound for one registry scan (and attach-path slot wait). Per-pid checks
+ * stay at {@link PROCESS_IDENTITY_TIMEOUT_MS}; this caps N slow probes so status
+ * and boot cannot wait N/concurrency waves. Shared with boot reconcile — the
+ * scan honors the budget (no abandoned post-expiry reap).
+ */
+const DISCOVERY_TIMEOUT_MS = 1_000;
 /** RS (0x1e) prefixes a JSON control line on the pipe-mode attach stdio. */
 const PIPE_CTRL = 0x1e;
 const PIPE_CTRL_MAX_BYTES = 512;
@@ -161,6 +172,7 @@ const forEachLimited = async <T>(
   values: readonly T[],
   limit: number,
   visit: (value: T) => Promise<void>,
+  shouldStop?: () => boolean,
 ): Promise<void> => {
   if (values.length === 0) return;
   const maxConcurrency = Math.max(1, Math.min(limit, values.length));
@@ -168,6 +180,7 @@ const forEachLimited = async <T>(
   await Promise.all(
     Array.from({ length: maxConcurrency }, async () => {
       for (;;) {
+        if (shouldStop?.()) return;
         const index = cursor;
         cursor += 1;
         if (index >= values.length) return;
@@ -175,6 +188,78 @@ const forEachLimited = async <T>(
       }
     }),
   );
+};
+
+type TProbeWaiter = {
+  granted: boolean;
+  settle: (granted: boolean) => void;
+};
+
+let probeActive = 0;
+const probeWaiters: TProbeWaiter[] = [];
+
+const acquireProbeSlot = async (budget: TDeadlineBudget): Promise<boolean> => {
+  if (budget.expired()) return false;
+  if (probeActive < DISCOVERY_CONCURRENCY) {
+    probeActive += 1;
+    return true;
+  }
+  const waiter: TProbeWaiter = {
+    granted: false,
+    settle: () => {},
+  };
+  const slot = new Promise<boolean>((resolve) => {
+    let settled = false;
+    waiter.settle = (granted) => {
+      if (settled) return;
+      settled = true;
+      waiter.granted = granted;
+      resolve(granted);
+    };
+    probeWaiters.push(waiter);
+  });
+  const waited = await firstOfBudget(budget, slot);
+  if (waited.kind === "value") {
+    if (!waited.value || budget.expired()) {
+      if (waited.value) releaseProbeSlot();
+      return false;
+    }
+    return true;
+  }
+  // Expired won the race. If release already granted this waiter (shifted it
+  // off the queue), the slot is held until we give it back.
+  const index = probeWaiters.indexOf(waiter);
+  if (index >= 0) {
+    probeWaiters.splice(index, 1);
+    return false;
+  }
+  releaseProbeSlot();
+  return false;
+};
+
+const releaseProbeSlot = (): void => {
+  const next = probeWaiters.shift();
+  if (next !== undefined) {
+    next.granted = true;
+    next.settle(true);
+    return;
+  }
+  probeActive = Math.max(0, probeActive - 1);
+};
+
+const boundedProcessIdentity = async (
+  meta: Pick<TSessionHostMeta, "pid" | "processStartTime">,
+  parent: AbortSignal,
+): Promise<TProcessIdentity> => {
+  const budget = budgetFromSignal(parent) ?? createDeadlineBudget(0, parent);
+  const acquired = await acquireProbeSlot(budget);
+  if (!acquired) return "unknown";
+  try {
+    if (parent.aborted) return "unknown";
+    return await sessionHostProcessIdentity(meta, parent);
+  } finally {
+    releaseProbeSlot();
+  }
 };
 
 const socketPresent = (path: string): boolean => {
@@ -201,31 +286,53 @@ const reapSessionHostDir = (directory: string): void => {
   }
 };
 
-let discoveryInFlight: Promise<readonly TLiveSessionHost[]> | null = null;
+type TDiscoveryOutcome = {
+  readonly hosts: readonly TLiveSessionHost[];
+  readonly complete: boolean;
+};
 
-const discoverSessionHostsOnce = async (): Promise<
-  readonly TLiveSessionHost[]
-> => {
+let discoveryInFlight: Promise<TDiscoveryOutcome> | null = null;
+let lastKnownLiveHosts: readonly TLiveSessionHost[] = [];
+
+const readSessionHostMeta = (id: string): TSessionHostMeta | null => {
+  if (!SESSION_ID_PATTERN.test(id)) return null;
+  const directory = sessionHostDir(id);
+  try {
+    const parsed: unknown = JSON.parse(
+      readFileSync(join(directory, "meta.json"), "utf8"),
+    );
+    return isSessionHostMeta(parsed) && parsed.id === id ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+const liveHostIfAttachable = (
+  meta: TSessionHostMeta,
+  identity: TProcessIdentity,
+  socketPath: string,
+  socketReady: boolean,
+): TLiveSessionHost | null => {
+  if (!socketReady) return null;
+  if (identity === "dead") return null;
+  return { ...meta, socketPath };
+};
+
+const discoverSessionHostsOnce = async (): Promise<TDiscoveryOutcome> => {
+  const budget = createDeadlineBudget(DISCOVERY_TIMEOUT_MS);
   let entries: string[];
   try {
     entries = readdirSync(sessionHostsRoot());
   } catch {
-    return [];
+    lastKnownLiveHosts = [];
+    return { hosts: lastKnownLiveHosts, complete: true };
   }
   const candidates: TDiscoveryCandidate[] = [];
   for (const id of entries) {
     if (!SESSION_ID_PATTERN.test(id)) continue;
     const directory = sessionHostDir(id);
     const socketPath = sessionHostSocketPath(id);
-    let meta: TSessionHostMeta | null = null;
-    try {
-      const parsed: unknown = JSON.parse(
-        readFileSync(join(directory, "meta.json"), "utf8"),
-      );
-      meta = isSessionHostMeta(parsed) && parsed.id === id ? parsed : null;
-    } catch {
-      meta = null;
-    }
+    const meta = readSessionHostMeta(id);
     if (meta === null) {
       reapSessionHostDir(directory);
       continue;
@@ -240,33 +347,53 @@ const discoverSessionHostsOnce = async (): Promise<
   }
 
   const hosts: TLiveSessionHost[] = [];
-  await forEachLimited(candidates, DISCOVERY_CONCURRENCY, async (candidate) => {
-    const identity = await sessionHostProcessIdentity(candidate.meta);
-    if (identity === "unknown") {
-      // Uncertainty never authorizes deletion. Surface a socket-ready host so
-      // attach/status keep the session; otherwise leave the directory.
-      if (candidate.socketReady) {
-        hosts.push({ ...candidate.meta, socketPath: candidate.socketPath });
+  await forEachLimited(
+    candidates,
+    DISCOVERY_CONCURRENCY,
+    async (candidate) => {
+      if (budget.expired()) return;
+      const identity = await boundedProcessIdentity(
+        candidate.meta,
+        budget.signal,
+      );
+      if (budget.expired()) return;
+      if (identity === "unknown") {
+        // Uncertainty never authorizes deletion. Surface a socket-ready host so
+        // attach/status keep the session; otherwise leave the directory.
+        const host = liveHostIfAttachable(
+          candidate.meta,
+          identity,
+          candidate.socketPath,
+          candidate.socketReady,
+        );
+        if (host !== null) hosts.push(host);
+        return;
       }
-      return;
-    }
-    if (identity === "dead") {
-      reapSessionHostDir(candidate.directory);
-      return;
-    }
-    // Alive process: never reap. A missing socket is not attachable yet
-    // (bind lag or a later recreate); keep the registry until the socket
-    // appears or identity later proves dead.
-    if (!candidate.socketReady) return;
-    hosts.push({ ...candidate.meta, socketPath: candidate.socketPath });
-  });
-  return hosts.sort((a, b) => b.startedAtMs - a.startedAtMs);
+      if (identity === "dead") {
+        reapSessionHostDir(candidate.directory);
+        return;
+      }
+      // Alive process: never reap. A missing socket is not attachable yet
+      // (bind lag or a later recreate); keep the registry until the socket
+      // appears or identity later proves dead.
+      const host = liveHostIfAttachable(
+        candidate.meta,
+        identity,
+        candidate.socketPath,
+        candidate.socketReady,
+      );
+      if (host !== null) hosts.push(host);
+    },
+    () => budget.expired(),
+  );
+  if (budget.expired()) {
+    return { hosts: lastKnownLiveHosts, complete: false };
+  }
+  lastKnownLiveHosts = hosts.sort((a, b) => b.startedAtMs - a.startedAtMs);
+  return { hosts: lastKnownLiveHosts, complete: true };
 };
 
-/** Scan, validate, and reap stale durable session-host registry entries. */
-export const discoverSessionHosts = async (): Promise<
-  readonly TLiveSessionHost[]
-> => {
+const discoverSessionHostOutcome = async (): Promise<TDiscoveryOutcome> => {
   if (discoveryInFlight !== null) return discoveryInFlight;
   const run = discoverSessionHostsOnce();
   discoveryInFlight = run;
@@ -276,11 +403,53 @@ export const discoverSessionHosts = async (): Promise<
   return run;
 };
 
+/** Scan, validate, and reap stale durable session-host registry entries. */
+export const discoverSessionHosts = async (): Promise<
+  readonly TLiveSessionHost[]
+> => (await discoverSessionHostOutcome()).hosts;
+
+/**
+ * Targeted attach lookup. A coalesced scan's last-known list never authorizes
+ * attach. A complete-scan hit still requires a live socket; a miss (or stale
+ * socket) rechecks only this id against identity + socket.
+ */
+export const findSessionHost = async (
+  id: string,
+): Promise<TLiveSessionHost | null> => {
+  const outcome = await discoverSessionHostOutcome();
+  if (outcome.complete) {
+    const hit = outcome.hosts.find((host) => host.id === id);
+    if (hit !== undefined && socketPresent(hit.socketPath)) return hit;
+  }
+  return lookupSessionHost(id);
+};
+
+const lookupSessionHost = async (
+  id: string,
+): Promise<TLiveSessionHost | null> => {
+  const budget = createDeadlineBudget(DISCOVERY_TIMEOUT_MS);
+  const meta = readSessionHostMeta(id);
+  if (meta === null) return null;
+  const socketPath = sessionHostSocketPath(id);
+  const socketReady = socketPresent(socketPath);
+  const identity = await boundedProcessIdentity(meta, budget.signal);
+  if (budget.expired()) return null;
+  // Attach never reaps. Unknown stays unknown; dead is a negative attach.
+  return liveHostIfAttachable(meta, identity, socketPath, socketReady);
+};
+
 /** Test seam: drop a coalesced scan so the next call starts a fresh one. */
 export const resetSessionHostDiscoveryForTests = (): void => {
   discoveryInFlight = null;
   processIdentityReaderForTests = null;
+  lastKnownLiveHosts = [];
+  probeActive = 0;
+  probeWaiters.length = 0;
 };
+
+/** Test seam: identity-probe semaphore used by discovery and targeted lookup. */
+export const acquireSessionHostProbeSlotForTests = acquireProbeSlot;
+export const releaseSessionHostProbeSlotForTests = releaseProbeSlot;
 
 const waitForSessionHostSocket = async (id: string): Promise<string | null> => {
   const socketPath = sessionHostSocketPath(id);

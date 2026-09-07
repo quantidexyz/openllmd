@@ -299,6 +299,11 @@ export const runCaptureResult = async (
             if (value === undefined) continue;
             n += value.byteLength;
             if (n > cap) {
+              try {
+                await reader.cancel();
+              } catch {
+                // already closed
+              }
               return { out: "", overflow: true };
             }
             chunks.push(value);
@@ -318,18 +323,17 @@ export const runCaptureResult = async (
         }
         return { out: new TextDecoder().decode(merged), overflow: false };
       };
-      const complete = Promise.all([
-        readStdout().finally(() => {
-          stdoutClosed = true;
-        }),
-        proc.exited.then((code) => {
-          rootExitCode = code;
-          return code;
-        }),
-      ]).then(([read, code]): TCaptureOutcome => {
-        if (read.overflow) return { kind: "overflow" };
-        return { kind: "complete", out: read.out, code };
+      void proc.exited.then((code) => {
+        rootExitCode = code;
       });
+      const complete = (async (): Promise<TCaptureOutcome> => {
+        const read = await readStdout().finally(() => {
+          stdoutClosed = true;
+        });
+        if (read.overflow) return { kind: "overflow" };
+        const code = await proc.exited;
+        return { kind: "complete", out: read.out, code };
+      })();
       const scheduleTimeout =
         captureTimeoutSchedulerForTests ??
         ((

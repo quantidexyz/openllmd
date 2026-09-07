@@ -16,7 +16,7 @@ import { ptySessionsEnabled } from "./pty-sessions-pref";
 import type { TSessionStream } from "./session-core";
 import {
   attachSessionHostViaCli,
-  discoverSessionHosts,
+  findSessionHost,
   spawnSessionHostProc,
 } from "./session-host-proc";
 import { admitMuxTunnel, serveMuxTunnel } from "./tunnel-server";
@@ -479,11 +479,7 @@ export const serveMuxOnStream = serveStream({
         stream.reset(encodeJsonPayload({ code: "spawn_failed" }));
         return;
       }
-    } else if (
-      !(await discoverSessionHosts()).some(
-        (host) => host.id === open.session_id,
-      )
-    ) {
+    } else if ((await findSessionHost(open.session_id)) === null) {
       stream.reset(encodeJsonPayload({ code: "session_not_found" }));
       return;
     }
