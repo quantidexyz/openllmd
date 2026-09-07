@@ -26,7 +26,7 @@ import { Schema as S } from "effect";
 import { resolveOpenllmCli } from "../cli-self-update";
 import { spawnCommand } from "../command";
 import type { TDeadlineBudget } from "../deadline-budget";
-import { createDeadlineBudget, waitUntilExpired } from "../deadline-budget";
+import { createDeadlineBudget, firstOfBudget } from "../deadline-budget";
 import { isDevMode, stateDir } from "../env";
 import type { TSessionStream } from "../session-core";
 import type { TSessionHostMeta } from "./main";
@@ -119,15 +119,13 @@ const readProcessStartTime = async (
       stdout: "pipe",
       stderr: "ignore",
     });
-    const complete = Promise.all([
-      new Response(proc.stdout).text(),
-      proc.exited,
-    ]).then(([out, code]) => ({ kind: "done" as const, out, code }));
-    const timeout = waitUntilExpired(budget).then(() => ({
-      kind: "timeout" as const,
-    }));
-    const raced = await Promise.race([complete, timeout]);
-    if (raced.kind === "timeout") {
+    const raced = await firstOfBudget(
+      budget,
+      Promise.all([new Response(proc.stdout).text(), proc.exited]).then(
+        ([out, code]) => ({ out, code }),
+      ),
+    );
+    if (raced.kind === "expired") {
       try {
         proc.kill();
       } catch {
@@ -135,8 +133,8 @@ const readProcessStartTime = async (
       }
       return undefined;
     }
-    if (raced.code !== 0) return null;
-    const value = raced.out.trim();
+    if (raced.value.code !== 0) return null;
+    const value = raced.value.out.trim();
     return value.length > 0 ? value : null;
   } catch {
     return undefined;
@@ -159,25 +157,24 @@ const sessionHostProcessIdentity = async (
   return reader(meta, budget);
 };
 
-const mapLimited = async <T, R>(
+const forEachLimited = async <T>(
   values: readonly T[],
   limit: number,
-  visit: (value: T) => Promise<R>,
-): Promise<R[]> => {
-  const results: R[] = new Array(values.length);
-  if (values.length === 0) return results;
+  visit: (value: T) => Promise<void>,
+): Promise<void> => {
+  if (values.length === 0) return;
   const maxConcurrency = Math.max(1, Math.min(limit, values.length));
   let cursor = 0;
-  const workers = Array.from({ length: maxConcurrency }, async () => {
-    for (;;) {
-      const index = cursor;
-      cursor += 1;
-      if (index >= values.length) return;
-      results[index] = await visit(values[index] as T);
-    }
-  });
-  await Promise.all(workers);
-  return results;
+  await Promise.all(
+    Array.from({ length: maxConcurrency }, async () => {
+      for (;;) {
+        const index = cursor;
+        cursor += 1;
+        if (index >= values.length) return;
+        await visit(values[index] as T);
+      }
+    }),
+  );
 };
 
 const socketPresent = (path: string): boolean => {
@@ -255,7 +252,7 @@ const discoverSessionHostsOnce = async (): Promise<
   }
 
   const hosts: TLiveSessionHost[] = [];
-  await mapLimited(candidates, DISCOVERY_CONCURRENCY, async (candidate) => {
+  await forEachLimited(candidates, DISCOVERY_CONCURRENCY, async (candidate) => {
     const identity = await sessionHostProcessIdentity(candidate.meta);
     if (identity === "unknown") {
       // Uncertainty never authorizes deletion. Surface a socket-ready host so

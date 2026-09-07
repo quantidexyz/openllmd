@@ -33,9 +33,9 @@ import type {
   TProviderUsageSnapshot,
 } from "@openllmsh/protocol";
 import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
+import { noteAuthStoreIdentityChange } from "../auth-user-action";
 import { cliInstallState } from "../cli-install";
 import { cliConfigDir, cliHome } from "../cli-paths";
-import { noteAuthStoreIdentityChange } from "../auth-user-action";
 import { createDeadlineBudget, firstOfBudget } from "../deadline-budget";
 import { logWarn } from "../logger";
 import {
@@ -62,7 +62,6 @@ import {
 import { makePasteBackDevice } from "./login-device";
 import { makeBlockingConnect } from "./login-direct";
 import type { TLoginVerify } from "./login-flow";
-import { runWithAuthOperation } from "./login-flow";
 import {
   createPassiveObservationCache,
   fileStoreIdentity,
@@ -98,7 +97,6 @@ import {
   observeKeychainReady,
   readIsolatedKeychain,
   readJsonStore,
-  runCapture,
   runCaptureResult,
   STATUS_CHECK_FAILED_DETAIL,
   storeReadValue,
@@ -1176,55 +1174,54 @@ export const claudeCodeDelegate: TProviderDelegate = {
       };
     }),
 
-  logout: () =>
-    runWithAuthOperation(PROVIDER, async () => {
-      const budget = createDeadlineBudget(logoutTimeoutMs());
-      // The credential is about to disappear — drop the cached status so no
-      // caller can read a stale "connected" for up to the TTL.
-      clearAuthStatusCache();
-      let capture: TClaudeLogoutCapture = { kind: "skipped" };
-      const timedOut = async (): Promise<{
-        readonly ok: boolean;
-        readonly detail: string;
-      }> =>
-        classifyClaudeLogout({
-          capture: { kind: "timeout" },
-          store: await loadStore(budget.signal),
-        });
-      // `claude auth logout` clears the isolated login credential. Do not
-      // spawn it after the operation deadline, and do not delete the store
-      // as a fallback if the CLI times out or fails.
-      const installed = await firstOfBudget(budget, cliInstallState(PROVIDER));
-      if (installed.kind === "expired") return timedOut();
-      if (installed.value.installed) {
-        const ready = await firstOfBudget(
-          budget,
-          ensureKeychainReady(cliHome(PROVIDER), budget.signal),
-        );
-        if (ready.kind === "expired") return timedOut();
-        if (ready.value.kind !== "present") {
-          return {
-            ok: false,
-            detail: "could not reach the credential store to sign out",
-          };
-        }
-        if (budget.expired()) return timedOut();
-        capture = await runCaptureResult([bin(), "auth", "logout"], env(), {
-          probe: unwrapKeychainSpawn(PROVIDER),
-          timeoutMs: budget.remainingMs(),
-          signal: budget.signal,
-          allowEmpty: true,
-        });
+  logout: async () => {
+    const budget = createDeadlineBudget(logoutTimeoutMs());
+    // The credential is about to disappear — drop the cached status so no
+    // caller can read a stale "connected" for up to the TTL.
+    clearAuthStatusCache();
+    let capture: TClaudeLogoutCapture = { kind: "skipped" };
+    const timedOut = async (): Promise<{
+      readonly ok: boolean;
+      readonly detail: string;
+    }> =>
+      classifyClaudeLogout({
+        capture: { kind: "timeout" },
+        store: await loadStore(budget.signal),
+      });
+    // `claude auth logout` clears the isolated login credential. Do not
+    // spawn it after the operation deadline, and do not delete the store
+    // as a fallback if the CLI times out or fails.
+    const installed = await firstOfBudget(budget, cliInstallState(PROVIDER));
+    if (installed.kind === "expired") return timedOut();
+    if (installed.value.installed) {
+      const ready = await firstOfBudget(
+        budget,
+        ensureKeychainReady(cliHome(PROVIDER), budget.signal),
+      );
+      if (ready.kind === "expired") return timedOut();
+      if (ready.value.kind !== "present") {
+        return {
+          ok: false,
+          detail: "could not reach the credential store to sign out",
+        };
       }
-      if (budget.expired() && capture.kind !== "timeout") {
-        capture = { kind: "timeout" };
-      }
-      // Invalidate AGAIN after the mutation: a probe that raced the pre-logout
-      // clear could have completed mid-logout and installed a "connected"
-      // result under the new generation. The post-clear leaves the cache empty
-      // so the next read re-probes against the now-cleared credential.
-      clearAuthStatusCache();
-      const store = await loadStore(budget.signal);
-      return classifyClaudeLogout({ capture, store });
-    }),
+      if (budget.expired()) return timedOut();
+      capture = await runCaptureResult([bin(), "auth", "logout"], env(), {
+        probe: unwrapKeychainSpawn(PROVIDER),
+        timeoutMs: budget.remainingMs(),
+        signal: budget.signal,
+        allowEmpty: true,
+      });
+    }
+    if (budget.expired() && capture.kind !== "timeout") {
+      capture = { kind: "timeout" };
+    }
+    // Invalidate AGAIN after the mutation: a probe that raced the pre-logout
+    // clear could have completed mid-logout and installed a "connected"
+    // result under the new generation. The post-clear leaves the cache empty
+    // so the next read re-probes against the now-cleared credential.
+    clearAuthStatusCache();
+    const store = await loadStore(budget.signal);
+    return classifyClaudeLogout({ capture, store });
+  },
 };

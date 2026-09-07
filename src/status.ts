@@ -16,7 +16,6 @@ import type {
   TDaemonStatus,
 } from "@openllmsh/protocol";
 import { normalizeProviderConnection } from "@openllmsh/protocol";
-import { setAuthStoreIdentityChangeHook } from "./auth-user-action";
 import { autoUpdateEnabled } from "./auto-update-pref";
 import { getCloudState } from "./config";
 import type { TDeadlineBudget } from "./deadline-budget";
@@ -45,6 +44,7 @@ import { logWarn } from "./logger";
 import { currentDaemonCaps } from "./mux-host";
 import { currentTickId, nextStatusTickId, opTickContext } from "./op-context";
 import { resolveOnPath } from "./path-utils";
+import { getPendingAuth } from "./pending-auth";
 import { ptySessionsEnabled } from "./pty-sessions-pref";
 import { sandboxState } from "./sandbox/landlock";
 import { ptySupported, sessionStatusReport } from "./session-host";
@@ -139,10 +139,9 @@ export const clearProviderProbeBackoff = (slug: string): void => {
   probeBackoff.delete(slug);
 };
 
-setAuthStoreIdentityChangeHook(clearProviderProbeBackoff);
-
-const forceProbeTrigger = (trigger: TStatusPublishTrigger | undefined): boolean =>
-  trigger === "command" || trigger === "auth-sink";
+const forceProbeTrigger = (
+  trigger: TStatusPublishTrigger | undefined,
+): boolean => trigger === "command" || trigger === "auth-sink";
 
 const noteProbeIndeterminate = (slug: string, indeterminate: boolean): void => {
   if (!indeterminate) {
@@ -165,10 +164,7 @@ const noteProbeIndeterminate = (slug: string, indeterminate: boolean): void => {
   });
 };
 
-const probeBackoffBlocks = (
-  slug: string,
-  force: boolean,
-): boolean => {
+const probeBackoffBlocks = (slug: string, force: boolean): boolean => {
   if (force) return false;
   const entry = probeBackoff.get(slug);
   if (entry === undefined) return false;
@@ -216,15 +212,26 @@ const applyAuthLiteral = (
   }
   if (!determinate) {
     const preserved: TDaemonProviderAuthStatus = last?.status ?? conn.status;
+    const stored = getPendingAuth(slug);
+    const livePending =
+      conn.pending_auth ??
+      (stored === null
+        ? undefined
+        : {
+            url: stored.url,
+            code: stored.code,
+            ...(stored.mode !== undefined ? { mode: stored.mode } : {}),
+            started_at_ms: stored.startedAt,
+            ...(stored.flowId !== undefined ? { flow_id: stored.flowId } : {}),
+          });
+    const base = last !== undefined ? last : conn;
     return {
-      ...(last !== undefined ? last : conn),
-      detail: conn.detail,
+      ...base,
+      detail: conn.detail ?? base.detail,
       status: preserved,
       observation: "unknown",
       reason_code: normalized.reason_code ?? "probe_failed",
-      ...(conn.pending_auth !== undefined
-        ? { pending_auth: conn.pending_auth }
-        : {}),
+      ...(livePending !== undefined ? { pending_auth: livePending } : {}),
     };
   }
   return {
@@ -416,11 +423,10 @@ const awaitProducer = async (
 
 type TBoundedDelegateStatusOptions = {
   readonly force?: boolean;
+  readonly reuseSettled?: boolean;
 };
 
-const overlayUnknownObservation = (
-  slug: string,
-): TDaemonProviderConnection => {
+const overlayUnknownObservation = (slug: string): TDaemonProviderConnection => {
   const lastKnown = lastKnownConnections.get(slug);
   if (lastKnown !== undefined) {
     return {
@@ -444,7 +450,10 @@ const boundedDelegateStatus = async (
       return overlayUnknownObservation(slug);
     }
     const existing = inFlightSlugProbes.get(slug);
-    if (existing !== undefined) {
+    if (
+      existing !== undefined &&
+      (options?.reuseSettled === true || !existing.settled)
+    ) {
       return awaitProducer(slug, existing.promise, () => {}, undefined, true);
     }
     if (probeBackoffBlocks(slug, options?.force === true)) {
@@ -534,7 +543,7 @@ const rememberConnection = (
   if (
     conn.observation !== "unknown" &&
     conn.detail !== STATUS_CHECK_FAILED_DETAIL &&
-    !(providerAuthOwned(slug)) &&
+    !providerAuthOwned(slug) &&
     // Overlaying signed_out on a still-connected vendor read (logout
     // in flight) must not rewrite last-known to signed_out, or the
     // next connected tick would look like a login rising edge.
@@ -578,7 +587,8 @@ export const readProviderStatus = async (
   rememberConnection(d.slug, raw, conn);
   noteProbeIndeterminate(
     d.slug,
-    conn.observation === "unknown" || conn.detail === STATUS_CHECK_FAILED_DETAIL,
+    conn.observation === "unknown" ||
+      conn.detail === STATUS_CHECK_FAILED_DETAIL,
   );
   return conn;
 };
@@ -604,7 +614,7 @@ const computeStatusFreshInner = async (
         const raw = await boundedDelegateStatus(
           d.slug,
           (signal) => d.status(signal),
-          { force },
+          { force, reuseSettled: options?.reuseSettledSlugProbes === true },
         );
         const conn = applyAuthLiteral(d.slug, raw);
         rememberConnection(d.slug, raw, conn);

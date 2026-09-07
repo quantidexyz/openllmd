@@ -53,6 +53,7 @@ import type {
   TProviderUsageWindow,
 } from "@openllmsh/protocol";
 import { MODEL_LIST_FETCH_TIMEOUT_MS } from "@openllmsh/protocol";
+import { noteAuthStoreIdentityChange } from "../auth-user-action";
 import { cliInstallState } from "../cli-install";
 import { cliConfigDir } from "../cli-paths";
 import { logError, logInfo, logWarn } from "../logger";
@@ -76,7 +77,6 @@ import {
 } from "./fetch-model-list";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
-import { runWithAuthOperation } from "./login-flow";
 import { waitFileStoreHint } from "./observation-cache";
 import type { TRefreshErrorClass } from "./refresh";
 import {
@@ -972,17 +972,17 @@ export const grokDelegate: TProviderDelegate = {
       }),
     ),
 
-  logout: () =>
-    runWithAuthOperation(PROVIDER, async () => {
+  logout: async () => {
     // `grok logout` clears the cached credentials; then ensure the isolated
     // auth.json is gone regardless of CLI version.
     if ((await cliInstallState(PROVIDER)).installed) {
       await runCapture([bin(), "logout"], env());
     }
     await rm(authPath(), { force: true }).catch(() => {});
+    noteAuthStoreIdentityChange(PROVIDER);
     const cleared = (await readToken()) === null;
     return cleared
       ? { ok: true, detail: "signed out of Grok" }
       : { ok: false, detail: "credential still present after logout" };
-    }),
+  },
 };

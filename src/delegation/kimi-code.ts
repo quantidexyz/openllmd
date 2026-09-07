@@ -36,6 +36,7 @@ import { arch, hostname, release, type } from "node:os";
 import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllmsh/protocol";
 import { QUOTA_REJECT_PERCENT, QUOTA_WARN_PERCENT } from "@openllmsh/protocol";
+import { noteAuthStoreIdentityChange } from "../auth-user-action";
 import { cliInstallState } from "../cli-install";
 import { cliConfigDir } from "../cli-paths";
 import { logWarn } from "../logger";
@@ -57,7 +58,7 @@ import {
 } from "./fetch-model-list";
 import type { TDeviceAuth, TDevicePoll } from "./login-direct";
 import { makeDeviceCodeConnect } from "./login-direct";
-import { makeCancelConnect, runWithAuthOperation } from "./login-flow";
+import { makeCancelConnect } from "./login-flow";
 import type { TRefreshErrorClass } from "./refresh";
 import {
   credentialUnrefreshable,
@@ -958,14 +959,14 @@ export const kimiCodeDelegate: TProviderDelegate = {
       };
     }),
 
-  logout: () =>
-    runWithAuthOperation(PROVIDER, async () => {
+  logout: async () => {
     // Kimi's CLI has no spawnable logout (device-code only) — clear the
     // isolated credential file. The device_id is kept (stable per box).
     await rm(credentialPath(), { force: true }).catch(() => {});
+    noteAuthStoreIdentityChange(PROVIDER);
     const cleared = (await readToken()) === null;
     return cleared
       ? { ok: true, detail: "removed Kimi Code credential" }
       : { ok: false, detail: "credential still present after logout" };
-    }),
+  },
 };

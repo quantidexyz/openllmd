@@ -40,7 +40,7 @@ import { resolveProviderUrl, resolveUpstreamUrl } from "./auth-config";
 import { cliLaunch, loginWiring, nativeRefresher } from "./delegate-shared";
 import { jwtExpiryMs, jwtSubject } from "./jwt";
 import { makeStreamConnect } from "./login-direct";
-import { makeCancelConnect, runWithAuthOperation } from "./login-flow";
+import { makeCancelConnect } from "./login-flow";
 import {
   createPassiveObservationCache,
   fileStoreIdentity,
@@ -826,8 +826,7 @@ export const cursorDelegate: TProviderDelegate = {
       );
     }),
 
-  logout: () =>
-    runWithAuthOperation(PROVIDER, async () => {
+  logout: async () => {
     clearCursorStatusObservationCache();
     if ((await cliInstallState(PROVIDER)).installed) {
       await runCapture([bin(), "logout"], env(), {
@@ -840,5 +839,5 @@ export const cursorDelegate: TProviderDelegate = {
     return cleared
       ? { ok: true, detail: "signed out of Cursor" }
       : { ok: false, detail: "credential still present after logout" };
-    }),
+  },
 };

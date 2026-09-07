@@ -17,7 +17,10 @@ import { autoUpdateEnabled, setAutoUpdate } from "./auto-update-pref";
 import { maybeUpdateCli } from "./cli-self-update";
 import { latestCliVersion, latestVersion, refreshBootstrap } from "./config";
 import { getDelegate } from "./delegation";
-import { runWithLoginCommand } from "./delegation/login-flow";
+import {
+  runWithAuthOperation,
+  runWithLoginCommand,
+} from "./delegation/login-flow";
 import { daemonApiKeyId } from "./env";
 import { openSealed } from "./keypair";
 import { clampLimit, readLocalSessions } from "./local-sessions";
@@ -26,7 +29,7 @@ import { maybeReportModels, resetModelReportThrottle } from "./model-report";
 import { clearPendingAuth } from "./pending-auth";
 import { clearPlanCache } from "./plan-cache";
 import { maybeSelfUpdate } from "./self-update";
-import { discoverSessionHosts } from "./session-host-proc";
+import { deviceSessionsForList } from "./session-host";
 import {
   clearProviderSignedOut,
   markProviderSignedOut,
@@ -163,7 +166,9 @@ export const runCommandInner = async (
         markProviderSignedOut(cmd.payload.slug);
         let r: Awaited<ReturnType<typeof delegate.logout>>;
         try {
-          r = await delegate.logout();
+          r = await runWithAuthOperation(cmd.payload.slug, () =>
+            delegate.logout(),
+          );
         } catch (err) {
           clearProviderSignedOut(cmd.payload.slug);
           throw err;
@@ -321,20 +326,11 @@ export const runCommandInner = async (
             listLocalSessionsCache.delete(key);
           }
         }
-        const deviceHosts = await discoverSessionHosts();
+        const deviceHosts = await deviceSessionsForList();
         const sessions = await readLocalSessions(cmd.payload.cli, {
           limit: cmd.payload.limit,
           deps: {
-            deviceSessions: () =>
-              deviceHosts.map((host) => ({
-                id: host.id,
-                cli: host.cli,
-                live: true,
-                title: host.title,
-                vendor_session_id: host.vendorSessionId,
-                cwd: host.cwd,
-                started_at_ms: host.startedAtMs,
-              })),
+            deviceSessions: () => deviceHosts,
           },
         });
         listLocalSessionsCache.set(cacheKey, { at: now, sessions });

@@ -118,7 +118,8 @@ export const createStatusPublishCoalescer = (
       followUp.skipUnchanged = followUp.skipUnchanged && req.skipUnchanged;
       if (req.active !== undefined) followUp.active = req.active;
       if (
-        triggerFreshnessRank(req.trigger) > triggerFreshnessRank(followUp.trigger)
+        triggerFreshnessRank(req.trigger) >
+        triggerFreshnessRank(followUp.trigger)
       ) {
         followUp.trigger = req.trigger;
       }
@@ -157,17 +158,11 @@ export const createStatusPublishCoalescer = (
     try {
       while (active !== null) {
         const job = active;
-        const jobEpoch = job.epoch;
         await runJob(job);
-        if (jobEpoch !== host.epoch()) {
-          if (active === job) {
-            active = followUp;
-            followUp = null;
-          }
-          continue;
+        if (active === job) {
+          active = followUp;
+          followUp = null;
         }
-        active = followUp;
-        followUp = null;
       }
     } finally {
       pumpRunning = false;

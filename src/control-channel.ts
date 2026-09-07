@@ -296,6 +296,9 @@ let ticket = "";
  *  deploy that moved the relay to a new content-addressed sandbox. */
 let connectedWssOrigin: string | null = null;
 let lastFingerprint = "";
+/** Monotonic connection counter. Each `onopen` bumps this; stale hello/status
+ *  continuations whose captured generation no longer matches simply bail. */
+let connectionGeneration = 0;
 /** True once this socket has completed one ping/pong round-trip. */
 let probesArmed = false;
 /** Welcome arrived before the first pong — flush `pushStatus` on arm. */
@@ -306,10 +309,9 @@ let daemonSessionId: string | null = null;
 /** Null while handshake is pending; false for an older relay welcome. */
 let supportsOrderedStatus: boolean | null = null;
 let statusSeq = 0;
-let statusPublishEpoch = 0;
 const statusPublishCoalescer = createStatusPublishCoalescer({
   now: () => Date.now(),
-  epoch: () => statusPublishEpoch,
+  epoch: () => connectionGeneration,
   computeFresh: async (trigger) => {
     const status = await computeStatusFresh({
       trigger,
@@ -318,7 +320,6 @@ const statusPublishCoalescer = createStatusPublishCoalescer({
     return { status, fingerprint: statusChangeKey(status) };
   },
   canSend: (jobEpoch) =>
-    jobEpoch === statusPublishEpoch &&
     jobEpoch === connectionGeneration &&
     supportsOrderedStatus !== null &&
     ws !== null &&
@@ -367,13 +368,6 @@ let binaryFrameTail: Promise<void> = Promise.resolve();
  *  hello is out; the dropped status is lossless (the hello carries a fresh
  *  snapshot, and the periodic observer re-pushes on change). */
 let helloSent = false;
-/** Monotonic connection counter. The hello continuation awaits
- *  `computeStatus()`, and the socket can close + reopen while that's pending —
- *  the STALE continuation would then send an old-ticket hello on the NEW
- *  connection (which the relay 4003-rejects) and prematurely open the
- *  `helloSent` gate. Each `onopen` bumps this; a continuation whose captured
- *  generation no longer matches simply bails. */
-let connectionGeneration = 0;
 /** Whether the socket has opened at least once — lets `onopen` log a first
  *  "connected" vs a recovery "reconnected", so the log shows the channel coming
  *  back, not just dropping. */
@@ -1108,7 +1102,6 @@ export const startControlChannel = (): void => {
     lastCloseLine = "";
     helloSent = false; // a fresh connection — nothing may precede ITS hello
     connectionGeneration += 1;
-    statusPublishEpoch = connectionGeneration;
     statusPublishCoalescer.abandon();
     // Re-assert on every open: partysocket re-applies its cached binaryType
     // to the native socket in _handleOpen, but be explicit after reconnect.
@@ -1127,24 +1120,21 @@ export const startControlChannel = (): void => {
     // Same for binary frames: a late Blob conversion from the prior socket
     // must not sit ahead of this connection's first mux bytes.
     binaryFrameTail = Promise.resolve();
-    const generation = connectionGeneration;
     probesArmed = false;
     pendingWelcomeStatus = false;
     // Do not block registration on provider/CLI probes. The relay needs identity
     // first; welcome supplies this connection's session before status starts.
     // Ping only AFTER hello is on the wire — `send` drops non-hello frames until
     // then. Watcher + welcome `pushStatus` wait for the first pong (P1-A).
-    if (generation === connectionGeneration) {
-      helloSent = true;
-      send({
-        type: "hello",
-        ticket,
-        protocol_version: RELAY_PROTOCOL_VERSION,
-        caps: currentDaemonCaps(),
-      });
-      flushAuthGap();
-      heartbeat.start();
-    }
+    helloSent = true;
+    send({
+      type: "hello",
+      ticket,
+      protocol_version: RELAY_PROTOCOL_VERSION,
+      caps: currentDaemonCaps(),
+    });
+    flushAuthGap();
+    heartbeat.start();
   };
   socket.onmessage = (ev: MessageEvent): void => {
     onMessage(ev.data);

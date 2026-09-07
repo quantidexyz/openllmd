@@ -480,8 +480,8 @@ export const serveMuxOnStream = serveStream({
         return;
       }
     } else if (
-      (await discoverSessionHosts()).every(
-        (host) => host.id !== open.session_id,
+      !(await discoverSessionHosts()).some(
+        (host) => host.id === open.session_id,
       )
     ) {
       stream.reset(encodeJsonPayload({ code: "session_not_found" }));

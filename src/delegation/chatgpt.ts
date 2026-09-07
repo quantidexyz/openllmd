@@ -27,6 +27,7 @@
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { TProviderUsageSnapshot } from "@openllmsh/protocol";
+import { noteAuthStoreIdentityChange } from "../auth-user-action";
 import { cliInstallState } from "../cli-install";
 import { cliConfigDir } from "../cli-paths";
 import { logError, logInfo, logWarn } from "../logger";
@@ -50,7 +51,6 @@ import {
 import { jwtExpiryMs } from "./jwt";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
-import { runWithAuthOperation } from "./login-flow";
 import { waitFileStoreHint } from "./observation-cache";
 import type { TRefreshErrorClass } from "./refresh";
 import {
@@ -708,8 +708,7 @@ export const chatgptDelegate: TProviderDelegate = {
       };
     }),
 
-  logout: () =>
-    runWithAuthOperation(PROVIDER, async () => {
+  logout: async () => {
     // `codex logout` revokes the token server-side; then ensure the isolated
     // auth.json is gone regardless of CLI version.
     if ((await cliInstallState(PROVIDER)).installed) {
@@ -718,9 +717,10 @@ export const chatgptDelegate: TProviderDelegate = {
     await rm(join(cliConfigDir(PROVIDER), "auth.json"), {
       force: true,
     }).catch(() => {});
+    noteAuthStoreIdentityChange(PROVIDER);
     const cleared = (await readToken()) === null;
     return cleared
       ? { ok: true, detail: "signed out of Codex" }
       : { ok: false, detail: "credential still present after logout" };
-    }),
+  },
 };

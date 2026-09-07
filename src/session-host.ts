@@ -19,9 +19,7 @@ export const reapOrphanSessionProcs = async (): Promise<void> => {
 };
 
 /** Reconcile without touching live sibling session-host processes. */
-export const reconcileSessionHostsAtBoot = async (): Promise<void> => {
-  await reapOrphanSessionProcs();
-};
+export const reconcileSessionHostsAtBoot = reapOrphanSessionProcs;
 
 /** Durable discovery rows for compatibility consumers and picker merges. */
 export const sessionStatusReport = async (): Promise<
