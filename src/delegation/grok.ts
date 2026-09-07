@@ -76,10 +76,12 @@ import {
 } from "./fetch-model-list";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
+import { waitFileStoreHint } from "./observation-cache";
 import type { TRefreshErrorClass } from "./refresh";
 import {
   credentialUnrefreshable,
   isStaleRefresh,
+  refreshCredentialSnapshot,
   resolveToken,
   spawnRefresh,
   withRefreshCaller,
@@ -188,6 +190,9 @@ export const resolveGrokSession = (
 
 const authPath = (): string => join(cliConfigDir(PROVIDER), "auth.json");
 
+const waitAuthStoreHint = (signal: AbortSignal): Promise<void> =>
+  waitFileStoreHint(authPath(), signal);
+
 const loadStore = (): Promise<TStoreRead<TGrokStore>> =>
   // Isolated HOME → <home>/.grok/auth.json (cliConfigDir).
   readJsonStore<TGrokStore>(authPath());
@@ -244,7 +249,16 @@ const clientVersion = async (): Promise<string> => {
  * token to `auth.json` when it's near expiry; the daemon never writes the store.
  */
 const triggerRefresh = async (): Promise<void> => {
-  await spawnRefresh([bin(), "models"], env());
+  await spawnRefresh([bin(), "models"], env(), {
+    readStore: async () => {
+      const session = newestSessionFromStore(storeReadValue(await loadStore()));
+      return refreshCredentialSnapshot({
+        accessToken: session?.key,
+        refreshToken: session?.refresh_token,
+        accountId: session?.user_id ?? null,
+      });
+    },
+  });
 };
 
 // Within leeway → refresh in the background (token still valid, no stall);
@@ -387,6 +401,7 @@ const connectDirect = makeStreamConnect({
   inProgressDetail: IN_PROGRESS_DETAIL,
   argv: () => [bin(), "login"],
   env,
+  waitStoreHint: waitAuthStoreHint,
   parse: (buf) => {
     const url = parseAuthUrl(buf);
     return url !== null ? { url, code: "" } : null;
@@ -429,6 +444,7 @@ const deviceLogin = makeStreamDeviceConnect({
   inProgressDetail: IN_PROGRESS_DETAIL,
   argv: () => [bin(), "login", "--device-auth"],
   env,
+  waitStoreHint: waitAuthStoreHint,
   stream: "stderr",
   parse: parseDevicePrompt,
   onConnected: refreshConfig,

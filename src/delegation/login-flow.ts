@@ -288,7 +288,7 @@ export const finalizeLoginTerminal = (opts: {
     }
   }
   if (opts.clearPending) {
-    clearPendingAuth(opts.provider);
+    clearPendingAuth(opts.provider, opts.flow?.flowId);
   }
   requestStatusPush();
 };
@@ -424,28 +424,77 @@ export const guard = async (
 
 // ─── Background-exit cleanup ─────────────────────────────────────────────
 
-/** One bounded re-read after a miss so a token written just after exit lands. */
-const CONNECTED_REREAD_MS = 400;
+/** Verification watchdog after child exit — matches Claude `AUTH_STATUS_TIMEOUT_MS`. */
+export const LOGIN_VERIFY_WATCHDOG_MS = 4_000;
 
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Typed login observation: never collapse timeout/throw to signed-out. */
+export type TLoginVerify = {
+  readonly state: "connected" | "absent" | "unavailable";
+};
+
+export const booleanLoginVerify = async (
+  check: () => Promise<boolean>,
+): Promise<TLoginVerify> => {
+  try {
+    return { state: (await check()) ? "connected" : "absent" };
+  } catch {
+    return { state: "unavailable" };
+  }
+};
+
+const sampleVerify = async (
+  verify: () => Promise<TLoginVerify>,
+): Promise<TLoginVerify> => {
+  try {
+    return await verify();
+  } catch {
+    return { state: "unavailable" };
+  }
+};
+
+/** Race a store-lifecycle hint against a finite watchdog, then abort the hint. */
+export const waitLoginVerifyHint = async (opts: {
+  readonly waitStoreHint?: (signal: AbortSignal) => Promise<void>;
+  readonly verifyWatchdogMs: number;
+}): Promise<void> => {
+  const ac = new AbortController();
+  const watchdog = sleep(opts.verifyWatchdogMs);
+  const hint =
+    opts.waitStoreHint !== undefined
+      ? opts.waitStoreHint(ac.signal).then(
+          () => undefined,
+          () => undefined,
+        )
+      : watchdog;
+  await Promise.race([watchdog, hint]);
+  ac.abort();
+};
+
 /**
  * The cleanup a background login runs when its process exits / its poll ends:
- * clear single-flight, then — if a credential landed — run `onConnected`
- * (e.g. refresh the auth config), else drop the stale pending code so the card
- * stops showing a dead one. `alwaysClearPending` also drops it on success
- * (claude's paste-back clears unconditionally; codex/kimi rely on `status()`).
+ * keep the slot in verifying phase until terminal classify, then — if a
+ * credential landed — run `onConnected` (e.g. refresh the auth config), else
+ * drop the stale pending code so the card stops showing a dead one.
+ * `alwaysClearPending` also drops it on success (claude's paste-back clears
+ * unconditionally; codex/kimi rely on `status()`).
  *
- * Samples `isConnected` once, then ONE bounded re-read if false. Emits
- * `auth.login.succeeded` or `auth.login.failed` and triggers a status push —
- * the connect command has already acked, so without this the card waits for
- * the next periodic status observation.
+ * Typed verify: `connected` / `absent` / `unavailable`. Unavailable after
+ * child exit waits for a store-identity hint or a finite watchdog, then one
+ * reread — not a 400ms sleep as truth. Emits `auth.login.succeeded` or
+ * `auth.login.failed` and triggers a status push. Explicit cancellation
+ * always wins; a superseded `flowId` must not clear a newer pending.
  */
 export const finishInBackground = async (opts: {
   readonly provider: string;
   readonly slot: TLoginSlot;
-  readonly isConnected: () => Promise<boolean>;
+  readonly verify: () => Promise<TLoginVerify>;
+  /** Resolves when the credential store identity changes (hint, not truth). */
+  readonly waitStoreHint?: (signal: AbortSignal) => Promise<void>;
+  /** Finite verification watchdog. Default {@link LOGIN_VERIFY_WATCHDOG_MS}. */
+  readonly verifyWatchdogMs?: number;
   /** Runs after a credential lands. Returning `false` marks the login FAILED
    *  (e.g. the keychain partition-list grant was refused) — see below. */
   readonly onConnected?: () =>
@@ -454,30 +503,56 @@ export const finishInBackground = async (opts: {
     | Promise<boolean>
     | Promise<void>;
   readonly alwaysClearPending?: boolean;
-  /** Child exit code when known. Non-zero + not-connected → `cli_crash`;
-   *  zero + not-connected → `poll_expired`. */
+  /** Child exit code when known. Non-zero + absent → `cli_crash`;
+   *  unavailable after a live child is retryable, never `cli_crash` from unread store. */
   readonly exitCode?: number | null;
 }): Promise<void> => {
   const flow = opts.slot.flow();
-  const cancelled = opts.slot.wasCancelled();
-  opts.slot.end();
+  const flowId = flow?.flowId;
+  const stillThisFlow = (): boolean =>
+    flowId !== undefined && opts.slot.flow()?.flowId === flowId;
+  const watchdogMs = opts.verifyWatchdogMs ?? LOGIN_VERIFY_WATCHDOG_MS;
+
+  const settleNone = (clearPending: boolean): void => {
+    if (stillThisFlow()) opts.slot.end();
+    finalizeLoginTerminal({
+      flow,
+      event: { kind: "none" },
+      provider: opts.provider,
+      clearPending,
+    });
+  };
+
   // Both callbacks are BEST-EFFORT: this runs from a `void proc.exited.then(...)`
   // / `void login.done.then(...)`, so a throw here would be an unhandled
-  // rejection AND could skip `clearPendingAuth`. A failed connection check is
-  // treated as not-connected (so pending still clears); a failed `onConnected`
-  // (e.g. the auth-config refresh) is swallowed.
-  let connected = false;
-  try {
-    connected = await opts.isConnected();
-  } catch {
-    // treat as not-connected — pending clears below, the next status corrects it
+  // rejection AND could skip `clearPendingAuth`.
+  let sampled = await sampleVerify(opts.verify);
+  if (opts.slot.wasCancelled()) {
+    settleNone(true);
+    return;
   }
-  if (!connected) {
-    await sleep(CONNECTED_REREAD_MS);
-    try {
-      connected = await opts.isConnected();
-    } catch {
-      // still treat as not-connected
+  if (!stillThisFlow()) {
+    return;
+  }
+  if (sampled.state === "unavailable") {
+    await waitLoginVerifyHint({
+      waitStoreHint: opts.waitStoreHint,
+      verifyWatchdogMs: watchdogMs,
+    });
+    if (opts.slot.wasCancelled()) {
+      settleNone(true);
+      return;
+    }
+    if (!stillThisFlow()) {
+      return;
+    }
+    sampled = await sampleVerify(opts.verify);
+    if (opts.slot.wasCancelled()) {
+      settleNone(true);
+      return;
+    }
+    if (!stillThisFlow()) {
+      return;
     }
   }
   // An `onConnected` that returns `false` is an OBSERVED refusal (the keychain
@@ -486,43 +561,61 @@ export const finishInBackground = async (opts: {
   // than reported as succeeded. A THROW stays best-effort (swallowed) so cleanup
   // still runs and `clearPendingAuth` is never skipped.
   let grantDenied = false;
-  if (connected && opts.onConnected !== undefined) {
+  if (sampled.state === "connected" && opts.onConnected !== undefined) {
     try {
       grantDenied = (await opts.onConnected()) === false;
     } catch {
       // best-effort — a failed onConnected must not reject the cleanup
     }
   }
+  if (opts.slot.wasCancelled()) {
+    settleNone(true);
+    return;
+  }
+  if (!stillThisFlow()) {
+    return;
+  }
   // Only a definite non-zero exit code is a crash. `null` (killed by signal,
   // no exit code) and `undefined` (unknown) are NOT crashes — keep the
   // retryable poll_expired outcome rather than asserting a crash from an
-  // ambiguous exit.
+  // ambiguous exit. Unreadable/timeout store is unavailable, not a crash.
   const crashed = typeof opts.exitCode === "number" && opts.exitCode !== 0;
   const event: TLoginTerminalEvent =
-    cancelled || flow === null
+    flow === null
       ? { kind: "none" }
-      : connected && grantDenied
+      : sampled.state === "connected" && grantDenied
         ? {
             kind: "failed",
             code: "spawn_denied",
             message: KEYCHAIN_NOT_READY_DETAIL,
             retryable: true,
           }
-        : connected
+        : sampled.state === "connected"
           ? { kind: "succeeded" }
-          : {
-              kind: "failed",
-              code: crashed ? "cli_crash" : "poll_expired",
-              message: crashed
-                ? "sign-in process exited before a credential landed"
-                : "sign-in ended without a stored credential",
-              retryable: !crashed,
-            };
+          : sampled.state === "unavailable"
+            ? {
+                kind: "failed",
+                code: "poll_expired",
+                message: "sign-in could not be verified",
+                retryable: true,
+              }
+            : {
+                kind: "failed",
+                code: crashed ? "cli_crash" : "poll_expired",
+                message: crashed
+                  ? "sign-in process exited before a credential landed"
+                  : "sign-in ended without a stored credential",
+                retryable: !crashed,
+              };
+  opts.slot.end();
   finalizeLoginTerminal({
     flow,
     event,
     provider: opts.provider,
-    clearPending: opts.alwaysClearPending === true || !connected || grantDenied,
+    clearPending:
+      opts.alwaysClearPending === true ||
+      sampled.state !== "connected" ||
+      grantDenied,
   });
 };
 
@@ -551,8 +644,10 @@ export type TStreamLoginOpts<T> = {
    *  a "still waiting" line, never kills. Overridable so a test can assert the
    *  no-kill behaviour without a 30s wait. */
   readonly warnMs?: number;
-  /** Already-signed-in check for the background-exit cleanup. */
-  readonly isConnected: () => Promise<boolean>;
+  /** Typed connection check for the background-exit cleanup. */
+  readonly verify: () => Promise<TLoginVerify>;
+  readonly waitStoreHint?: (signal: AbortSignal) => Promise<void>;
+  readonly verifyWatchdogMs?: number;
   /** Runs in the background-exit cleanup when a credential landed. Returning
    *  `false` fails the login (see {@link finishInBackground}). */
   readonly onConnected?: () =>
@@ -803,7 +898,7 @@ export const spawnStreamLogin = async <T>(
   // the login ceiling. A reap is an EXPIRY, not a crash, so report `exitCode: 0`
   // → `finishInBackground` emits `poll_expired` (not `cli_crash`); a login that
   // DID land a credential in the last moment still reports succeeded, since
-  // `finishInBackground` checks `isConnected()` before the exit code.
+  // `finishInBackground` checks typed verify before the exit code.
   let reaped = false;
   const reaper = setTimeout(() => {
     reaped = true;
@@ -818,7 +913,9 @@ export const spawnStreamLogin = async <T>(
     return finishInBackground({
       provider: opts.provider,
       slot: opts.slot,
-      isConnected: opts.isConnected,
+      verify: opts.verify,
+      waitStoreHint: opts.waitStoreHint,
+      verifyWatchdogMs: opts.verifyWatchdogMs,
       onConnected: opts.onConnected,
       exitCode: reaped ? 0 : exitCode,
     });

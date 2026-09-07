@@ -251,7 +251,7 @@ export const fetchChannel = async (): Promise<TRelayChannelResponse> => {
  */
 const pushIdentityConflictIfChanged = async (): Promise<void> => {
   const { pushStatusIfChanged } = await import("./control-channel");
-  await pushStatusIfChanged();
+  await pushStatusIfChanged("bootstrap");
 };
 
 /**

@@ -45,12 +45,14 @@ import {
   fileStoreIdentity,
   fingerprintStoreIdentity,
   rememberIfFingerprintStable,
+  waitFileStoreHint,
 } from "./observation-cache";
 import type { TRefreshErrorClass } from "./refresh";
 import {
   credentialUnrefreshable,
   isStaleRefresh,
   keychainRefreshSpawnAllowed,
+  refreshCredentialSnapshot,
   resolveToken,
   spawnRefresh,
   withRefreshCaller,
@@ -267,6 +269,20 @@ const triggerRefresh = async (): Promise<void> => {
   await spawnRefresh([bin(), "status"], env(), {
     probe: unwrapKeychainSpawn(PROVIDER),
     timeoutMs: 10_000,
+    ...(platform() === "darwin"
+      ? {}
+      : {
+          readStore: async () => {
+            const store = await readJsonStore<TCursorFileStore>(
+              join(cliConfigDir(PROVIDER), "auth.json"),
+            );
+            const value = storeReadValue(store);
+            return refreshCredentialSnapshot({
+              accessToken: value?.access_token ?? value?.accessToken,
+              refreshToken: value?.refresh_token ?? value?.refreshToken,
+            });
+          },
+        }),
   });
   clearCursorStatusObservationCache();
 };
@@ -548,6 +564,11 @@ const connectDirect = makeStreamConnect({
   inProgressDetail: IN_PROGRESS_DETAIL,
   argv: () => [bin(), "login"],
   env,
+  waitStoreHint:
+    platform() === "darwin"
+      ? undefined
+      : (signal) =>
+          waitFileStoreHint(join(cliConfigDir(PROVIDER), "auth.json"), signal),
   beforeLogin: () => ensureIsolatedKeychain(cliHome(PROVIDER)),
   stream: "stdout",
   parse: (buffer) => {

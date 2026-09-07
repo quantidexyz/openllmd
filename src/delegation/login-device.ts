@@ -18,8 +18,9 @@
 
 import { pendingAuthDetail } from "../pending-auth";
 import { unwrapKeychainSpawn } from "../sandbox/policy";
-import type { TConnectResult, TLoginSlot } from "./login-flow";
+import type { TConnectResult, TLoginSlot, TLoginVerify } from "./login-flow";
 import {
+  booleanLoginVerify,
   emitLoginFailed,
   emitLoginStarted,
   finishInBackground,
@@ -62,9 +63,13 @@ export type TPasteBackConfig = {
   /** Runs after a code is accepted (claude: grant keychain tool access). */
   readonly onCodeAccepted?: () => Promise<boolean | undefined>;
   /** Authoritative connection check after a submitted code. */
-  readonly verifyAfterSubmit: () => Promise<boolean>;
+  readonly verifyAfterSubmit: () => Promise<TLoginVerify>;
+  /** Typed verify for background-exit cleanup. Defaults to wrapping `connected`. */
+  readonly verify?: () => Promise<TLoginVerify>;
   /** The submit success `detail` (refreshable-aware). */
   readonly submitSuccessDetail: () => Promise<string>;
+  /** File-store identity hint after child exit (not Darwin keychain). */
+  readonly waitStoreHint?: (signal: AbortSignal) => Promise<void>;
 };
 
 export type TPasteBackDevice = {
@@ -151,7 +156,8 @@ export const makePasteBackDevice = (
           await finishInBackground({
             provider: cfg.provider,
             slot: cfg.slot,
-            isConnected: cfg.connected,
+            verify: cfg.verify ?? (() => booleanLoginVerify(cfg.connected)),
+            waitStoreHint: cfg.waitStoreHint,
             onConnected: cfg.onConnected,
             alwaysClearPending: true,
           });
@@ -184,12 +190,15 @@ export const makePasteBackDevice = (
       if (granted === false) {
         return { ok: false, detail: KEYCHAIN_NOT_READY_DETAIL };
       }
-      if (!(await cfg.verifyAfterSubmit())) {
+      const submitted = await cfg.verifyAfterSubmit();
+      if (submitted.state === "absent") {
         return {
           ok: false,
           detail: "code accepted but no credential was stored.",
         };
       }
+      // unavailable must not fail a paste whose code was accepted — finishInBackground
+      // re-reads with a store hint / watchdog.
       return { ok: true, detail: await cfg.submitSuccessDetail() };
     })();
     submitting = work;
@@ -234,6 +243,7 @@ export type TStreamDeviceConfig = {
     readonly cancelled: string;
     readonly none: string;
   };
+  readonly waitStoreHint?: (signal: AbortSignal) => Promise<void>;
 };
 
 export type TStreamDevice = {
@@ -269,7 +279,8 @@ export const makeStreamDeviceConnect = (
           env: cfg.env(),
           stream: cfg.stream ?? "stdout",
           parse: cfg.parse,
-          isConnected: cfg.connected,
+          verify: () => booleanLoginVerify(cfg.connected),
+          waitStoreHint: cfg.waitStoreHint,
           onConnected: cfg.onConnected,
           // codex/grok device-code login is file-backed → stays confined
           // (`sandbox/policy.ts`); the predicate returns false for them.

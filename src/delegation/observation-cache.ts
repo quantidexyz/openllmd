@@ -7,7 +7,10 @@
  * only — never unlock-state or vendor-validity proof, and never a substitute
  * for live `credentialForUpstream` / `readToken`.
  */
-import { statSync } from "node:fs";
+
+import type { FSWatcher } from "node:fs";
+import { statSync, watch } from "node:fs";
+import { basename, dirname } from "node:path";
 
 export type TFileStoreIdentity = {
   readonly path: string;
@@ -50,6 +53,72 @@ export const fileStoreIdentity = (path: string): TFileStoreIdentity => {
     };
   }
 };
+
+/**
+ * File-store lifecycle hint for login verify. Resolves when inode/mtime/size
+ * identity changes (create, write, or atomic replace). A watcher event is never
+ * truth — callers must re-read and validate identity. Cancellation closes
+ * watchers. Platforms that cannot watch (or Darwin keychain stores) should omit
+ * this and keep the finite verify watchdog.
+ */
+export const waitFileStoreHint = (
+  path: string,
+  signal: AbortSignal,
+): Promise<void> =>
+  new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const start = fingerprintStoreIdentity(fileStoreIdentity(path));
+    const name = basename(path);
+    const watchers: FSWatcher[] = [];
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      for (const watcher of watchers) {
+        try {
+          watcher.close();
+        } catch {
+          // already closed
+        }
+      }
+      resolve();
+    };
+    const onAbort = (): void => {
+      finish();
+    };
+    const check = (): void => {
+      const next = fingerprintStoreIdentity(fileStoreIdentity(path));
+      if (next !== start) finish();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    const attach = (target: string, filterName?: string): void => {
+      try {
+        const watcher = watch(target, (_event, filename) => {
+          if (
+            filterName !== undefined &&
+            typeof filename === "string" &&
+            filename !== filterName
+          ) {
+            return;
+          }
+          check();
+        });
+        watcher.on("error", () => {
+          // Keep waiting for abort/watchdog; do not treat watch errors as persist.
+        });
+        watchers.push(watcher);
+      } catch {
+        // Unsupported target — watchdog in the caller is the fallback.
+      }
+    };
+    attach(dirname(path), name);
+    attach(path);
+    check();
+  });
 
 export const fingerprintStoreIdentity = (id: TFileStoreIdentity): string => {
   if (!id.statOk) return `${id.path}\0unreadable`;

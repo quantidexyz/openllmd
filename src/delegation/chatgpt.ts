@@ -50,11 +50,13 @@ import {
 import { jwtExpiryMs } from "./jwt";
 import { makeStreamDeviceConnect } from "./login-device";
 import { makeStreamConnect } from "./login-direct";
+import { waitFileStoreHint } from "./observation-cache";
 import type { TRefreshErrorClass } from "./refresh";
 import {
   credentialUnrefreshable,
   isStaleRefresh,
   lastRefreshErrorClass,
+  refreshCredentialSnapshot,
   resolveToken,
   spawnRefresh,
   withRefreshCaller,
@@ -154,6 +156,9 @@ type TCodexStore = {
 
 const authPath = (): string => join(cliConfigDir(PROVIDER), "auth.json");
 
+const waitAuthStoreHint = (signal: AbortSignal): Promise<void> =>
+  waitFileStoreHint(authPath(), signal);
+
 const loadStore = (): Promise<TStoreRead<TCodexStore>> =>
   // Isolated CODEX_HOME → auth.json lives there.
   readJsonStore<TCodexStore>(authPath());
@@ -166,7 +171,16 @@ const loadStore = (): Promise<TStoreRead<TCodexStore>> =>
  * token. Output ignored; bounded.
  */
 const triggerRefresh = async (): Promise<void> => {
-  await spawnRefresh([bin(), "doctor"], env());
+  await spawnRefresh([bin(), "doctor"], env(), {
+    readStore: async () => {
+      const tokens = storeReadValue(await loadStore())?.tokens;
+      return refreshCredentialSnapshot({
+        accessToken: tokens?.access_token,
+        refreshToken: tokens?.refresh_token,
+        accountId: tokens?.account_id ?? null,
+      });
+    },
+  });
 };
 
 // Within the leeway window → fire the CLI refresh in the background (still
@@ -333,6 +347,7 @@ const connectDirect = makeStreamConnect({
   inProgressDetail: IN_PROGRESS_DETAIL,
   argv: () => [bin(), "login"],
   env,
+  waitStoreHint: waitAuthStoreHint,
   parse: (buf) => {
     const url = parseAuthUrl(buf);
     return url !== null ? { url, code: "" } : null;
@@ -376,6 +391,7 @@ const deviceLogin = makeStreamDeviceConnect({
   inProgressDetail: IN_PROGRESS_DETAIL,
   argv: () => [bin(), "login", "--device-auth"],
   env,
+  waitStoreHint: waitAuthStoreHint,
   parse: parseDevicePrompt,
   onConnected: refreshConfig,
   pendingDetail: (found) => pendingAuthDetail(found),

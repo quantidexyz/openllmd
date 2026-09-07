@@ -75,6 +75,17 @@ export const waitUntilExpired = (budget: TDeadlineBudget): Promise<void> => {
   });
 };
 
+/**
+ * How late a `setTimeout(delayMs)` callback ran relative to arming, using the
+ * same `performance.now()` clock as {@link createDeadlineBudget}. Negative
+ * (early fire) is preserved; callers must not treat this as host-sleep proof.
+ */
+export const timeoutCallbackLatenessMs = (
+  timerArmedAtMs: number,
+  timerFiredAtMs: number,
+  delayMs: number,
+): number => timerFiredAtMs - timerArmedAtMs - delayMs;
+
 export const splitReapBudget = (
   remainingMs: number,
 ): { graceMs: number; finalReapMs: number } => {

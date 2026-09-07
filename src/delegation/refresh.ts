@@ -23,8 +23,8 @@ import {
   refreshCallerBag,
   refreshSpawnBag,
 } from "../op-context";
+import { DEADLINE_CHECK_CAP_MS, spawnLogin, spawnLoginPty } from "./spawn";
 import type { TLoginResult, TStoreRead } from "./util";
-import { spawnLogin, spawnLoginPty } from "./util";
 
 export type { TRefreshCaller } from "../op-context";
 
@@ -38,6 +38,92 @@ export const withRefreshCaller = <T>(
  *  a wedged child is reaped (the refresh already landed mid-request before the
  *  child's slow exit, so the timeout never costs correctness). */
 export const REFRESH_SPAWN_TIMEOUT_MS = 60_000;
+
+/**
+ * Finite, operation-owned wait after a deadline when a validated newer store is
+ * already visible. Chosen to stay well under the 10s/60s refresh watchdogs: long
+ * enough for atexit flush, short enough that supervision still SIGTERM/SIGKILLs.
+ * Child exit during this window is a clean settle; timeout still terminates.
+ */
+export const REFRESH_PERSISTENCE_GRACE_MS = 2_000;
+
+/** Cap for every spawnRefresh store observation (pre-spawn, onDeadline, post-kill). */
+export const REFRESH_STORE_OBSERVE_CAP_MS = DEADLINE_CHECK_CAP_MS;
+
+const observeRefreshStore = async (
+  read: () => Promise<TRefreshCredentialSnapshot | null>,
+): Promise<TRefreshCredentialSnapshot | null> => {
+  try {
+    return await Promise.race([
+      read(),
+      new Promise<TRefreshCredentialSnapshot | null>((resolve) => {
+        setTimeout(() => resolve(null), REFRESH_STORE_OBSERVE_CAP_MS);
+      }),
+    ]);
+  } catch {
+    return null;
+  }
+};
+
+/** Pre/post spawn credential view. mtime is intentionally absent. */
+export type TRefreshCredentialSnapshot = {
+  readonly accessToken: string;
+  readonly refreshToken: string;
+  readonly generation?: number;
+  readonly accountId?: string | null;
+};
+
+export const refreshCredentialSnapshot = (opts: {
+  readonly accessToken?: string | null;
+  readonly refreshToken?: string | null;
+  readonly generation?: number | null;
+  readonly accountId?: string | null;
+}): TRefreshCredentialSnapshot | null => {
+  const accessToken = opts.accessToken ?? "";
+  const refreshToken = opts.refreshToken ?? "";
+  if (accessToken.length === 0) return null;
+  return {
+    accessToken,
+    refreshToken,
+    ...(opts.generation !== undefined &&
+    opts.generation !== null &&
+    Number.isFinite(opts.generation)
+      ? { generation: opts.generation }
+      : {}),
+    ...(opts.accountId !== undefined ? { accountId: opts.accountId } : {}),
+  };
+};
+
+/**
+ * A persisted rotation is proven only with required fields, a newer generation
+ * (or a changed access token when generation is unavailable), and account
+ * continuity when both sides carry an account id. Partial access-only writes
+ * and mtime bumps are not success.
+ */
+export const isVerifiedRefreshPersist = (
+  prior: TRefreshCredentialSnapshot | null,
+  next: TRefreshCredentialSnapshot | null,
+): boolean => {
+  if (prior === null || next === null) return false;
+  if (next.accessToken.length === 0 || next.refreshToken.length === 0) {
+    return false;
+  }
+  const priorAccount = prior.accountId ?? null;
+  const nextAccount = next.accountId ?? null;
+  if (
+    priorAccount !== null &&
+    priorAccount.length > 0 &&
+    nextAccount !== null &&
+    nextAccount.length > 0 &&
+    priorAccount !== nextAccount
+  ) {
+    return false;
+  }
+  if (prior.generation !== undefined && next.generation !== undefined) {
+    return next.generation > prior.generation;
+  }
+  return next.accessToken !== prior.accessToken;
+};
 
 /**
  * Post-spawn refresh cooldown shared by every delegate. It prevents periodic
@@ -329,10 +415,8 @@ const inspectRefreshResult = (
   // diagnostic-style (`codex doctor`, `grok models`, `cursor status`) that can
   // exit non-zero on a benign warning while still rotating the token as a side
   // effect. Classifying that as failure would escalate the backoff and serve
-  // stale tokens on every tick. The persistence-aware grace (Stage 8 / T12 —
-  // "store credential is newer than pre-spawn ⇒ success regardless of exit
-  // code") is the tracked follow-up; until then a non-zero exit resolves as
-  // `"awaited"` and the store re-read decides, exactly as before this change.
+  // stale tokens on every tick. Persistence-aware success is decided by
+  // {@link isVerifiedRefreshPersist} in {@link spawnRefresh}, not by exit code.
 };
 
 /**
@@ -348,19 +432,55 @@ export const spawnRefresh = async (
     readonly pty?: boolean;
     readonly probe?: boolean;
     readonly timeoutMs?: number;
+    /**
+     * Observer abort is accepted for API compatibility and ignored for the
+     * child. Shared refresh must not die when a status waiter aborts (T11).
+     */
     readonly signal?: AbortSignal;
+    readonly readStore?: () => Promise<TRefreshCredentialSnapshot | null>;
+    readonly persistenceGraceMs?: number;
   },
 ): Promise<void> => {
   const run = opts?.pty === true ? spawnLoginPty : spawnLogin;
   const timeoutMs = opts?.timeoutMs ?? REFRESH_SPAWN_TIMEOUT_MS;
+  const graceMs = opts?.persistenceGraceMs ?? REFRESH_PERSISTENCE_GRACE_MS;
+  const prior =
+    opts?.readStore === undefined
+      ? null
+      : await observeRefreshStore(opts.readStore);
   const result = await run([...argv], env, {
     timeoutMs,
     probe: opts?.probe,
-    ...(opts?.signal !== undefined ? { signal: opts.signal } : {}),
+    ...(opts?.readStore !== undefined
+      ? {
+          persistenceGraceMs: graceMs,
+          onDeadline: async (): Promise<boolean> => {
+            const readStore = opts.readStore;
+            if (readStore === undefined) return false;
+            const next = await observeRefreshStore(readStore);
+            return isVerifiedRefreshPersist(prior, next);
+          },
+        }
+      : {}),
   });
   // spawnLogin intentionally resolves after its deadline/non-zero child exit.
   // A refresh must turn those resolved outcomes into a classified rejection so
-  // makeRefresher cannot record a killed rotation as a clean success.
+  // makeRefresher cannot record a killed rotation as a clean success — unless
+  // a fenced store re-read proves a newer complete credential.
+  if (result.abandoned && opts?.readStore !== undefined) {
+    const next = await observeRefreshStore(opts.readStore);
+    if (isVerifiedRefreshPersist(prior, next)) {
+      const bagOk = refreshSpawnBag.getStore();
+      if (bagOk !== undefined) {
+        bagOk.meta = {
+          spawned_at_ms: result.spawned_at_ms,
+          child_pid: result.child_pid,
+        };
+        bagOk.timeoutMs = timeoutMs;
+      }
+      return;
+    }
+  }
   inspectRefreshResult(result, timeoutMs);
   // T4 pins spawnRefresh resolving to `undefined`. Stamp clocks onto the
   // in-flight fire() bag so the success path still carries them.

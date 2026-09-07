@@ -60,17 +60,20 @@ import {
 } from "./fetch-model-list";
 import { makePasteBackDevice } from "./login-device";
 import { makeBlockingConnect } from "./login-direct";
+import type { TLoginVerify } from "./login-flow";
 import {
   createPassiveObservationCache,
   fileStoreIdentity,
   fingerprintStoreIdentity,
   rememberIfFingerprintStable,
+  waitFileStoreHint,
 } from "./observation-cache";
 import type { TRefreshErrorClass } from "./refresh";
 import {
   credentialUnrefreshable,
   isStaleRefresh,
   keychainRefreshSpawnAllowed,
+  refreshCredentialSnapshot,
   resolveToken,
   spawnRefresh,
   withRefreshCaller,
@@ -229,6 +232,20 @@ const triggerRefresh = async (): Promise<void> => {
   await spawnRefresh([bin(), "-p", "ping"], env(), {
     probe: unwrapKeychainSpawn(PROVIDER),
     timeoutMs: 10_000,
+    // Darwin keychain snapshots are not a verified generation/account fence
+    // without extra security(1) work; retain bounded abandoned failure there.
+    ...(platform() === "darwin"
+      ? {}
+      : {
+          readStore: async () => {
+            const oauth = storeReadValue(await loadStore())?.claudeAiOauth;
+            return refreshCredentialSnapshot({
+              accessToken: oauth?.accessToken,
+              refreshToken: oauth?.refreshToken,
+              accountId: await readAccountHash(),
+            });
+          },
+        }),
   });
   clearAuthStatusCache();
 };
@@ -347,8 +364,60 @@ type TAuthStatusProbe =
 
 let authStatusInFlight: {
   readonly generation: number;
+  readonly startFingerprint: string;
   readonly work: Promise<TAuthStatusProbe>;
 } | null = null;
+
+/**
+ * After the only observer aborted, a determinate inner `auth status` may still
+ * settle. Admit only with matching generation + start/end store fingerprint so
+ * logout, a newer login, or a replaced store cannot be overwritten. Cached
+ * first so a follow-up status push cannot spawn an unbounded re-probe loop.
+ * Keychain late `present` re-admit is deferred (shared unlock already ignores
+ * observer abort; no fenced status re-entry in source).
+ */
+const admitInnerAuthLate = (opts: {
+  readonly probe: TAuthStatusProbe;
+  readonly generation: number;
+  readonly startFingerprint: string;
+}): void => {
+  if (opts.generation !== claudeStatusCache.generation()) return;
+  const end = claudePassiveReuseAllowed();
+  if (end.fingerprint !== opts.startFingerprint) return;
+  const probe = opts.probe;
+  if (probe.kind !== "value") return;
+  let connected: boolean;
+  if (probe.result === true) {
+    connected = true;
+  } else if (probe.result === false && end.absentStore) {
+    connected = false;
+  } else {
+    return;
+  }
+  void (async (): Promise<void> => {
+    const { admitLateProviderConnection, lateProviderAdmitBlocked } =
+      await import("../status");
+    if (opts.generation !== claudeStatusCache.generation()) return;
+    if (lateProviderAdmitBlocked(PROVIDER)) return;
+    if (
+      fingerprintStoreIdentity(claudePassiveStoreIdentity()) !==
+      opts.startFingerprint
+    ) {
+      return;
+    }
+    rememberIfFingerprintStable(
+      claudeStatusCache,
+      opts.startFingerprint,
+      end.fingerprint,
+      { connected },
+      opts.generation,
+    );
+    if (claudeStatusCache.get(end.fingerprint) === undefined) return;
+    const { version } = await cliInstallState(PROVIDER);
+    const raw = await claudeStatusPayload(connected, version);
+    admitLateProviderConnection(PROVIDER, raw);
+  })().catch(() => {});
+};
 
 /**
  * Drop cached idle status. Called on every auth MUTATION (login, logout,
@@ -375,6 +444,26 @@ type TAuthStatusWait =
   | { readonly kind: "timeout" }
   | { readonly kind: "value"; readonly result: boolean | null };
 
+/**
+ * Typed login verify shared by blocking connect, paste-back, and finishInBackground.
+ * `loggedIn:false` + present store is unavailable (matches `status()`). Timeout
+ * with a live token is connected so an unread CLI probe cannot fail a landed login.
+ */
+export const classifyClaudeLoginVerify = (opts: {
+  readonly viaAuth: TAuthStatusWait;
+  readonly tokenPresent: boolean;
+}): TLoginVerify => {
+  const { viaAuth, tokenPresent } = opts;
+  if (viaAuth.kind !== "value") {
+    return { state: tokenPresent ? "connected" : "unavailable" };
+  }
+  if (viaAuth.result === true) return { state: "connected" };
+  if (viaAuth.result === false) {
+    return { state: tokenPresent ? "unavailable" : "absent" };
+  }
+  return { state: tokenPresent ? "connected" : "unavailable" };
+};
+
 const awaitAuthStatus = async (
   work: Promise<TAuthStatusProbe>,
   signal?: AbortSignal,
@@ -399,6 +488,7 @@ const authStatusLoggedIn = async (
   signal?: AbortSignal,
 ): Promise<TAuthStatusWait> => {
   const generation = claudeStatusCache.generation();
+  const startFingerprint = claudePassiveReuseAllowed().fingerprint;
   let flight = authStatusInFlight;
   if (flight === null || flight.generation !== generation) {
     if (signal?.aborted === true) return { kind: "aborted" };
@@ -424,12 +514,19 @@ const authStatusLoggedIn = async (
         return { kind: "value", result: null };
       }
     })();
-    flight = { generation, work };
+    flight = { generation, startFingerprint, work };
     authStatusInFlight = flight;
     const clearFlight = (): void => {
       if (authStatusInFlight?.work === work) authStatusInFlight = null;
     };
-    void work.then(clearFlight, clearFlight);
+    void work.then((probe) => {
+      clearFlight();
+      admitInnerAuthLate({
+        probe,
+        generation,
+        startFingerprint,
+      });
+    }, clearFlight);
   }
 
   const result = await awaitAuthStatus(flight.work, signal);
@@ -568,14 +665,17 @@ const {
     "Claude Code CLI not found — re-run the OpenLLM daemon installer to add it.",
   connectedDetail: "signed in via Claude Code",
   readToken,
-  isConnected: async (): Promise<boolean> => {
-    const viaAuth = await authStatusLoggedIn();
-    if (viaAuth.kind !== "value") return (await readToken()) !== null;
-    return viaAuth.result !== null
-      ? viaAuth.result
-      : (await readToken()) !== null;
-  },
+  isConnected: async (): Promise<boolean> =>
+    (await verifyClaudeLogin()).state === "connected",
 });
+
+const verifyClaudeLogin = async (): Promise<TLoginVerify> => {
+  const viaAuth = await authStatusLoggedIn();
+  return classifyClaudeLoginVerify({
+    viaAuth,
+    tokenPresent: (await readToken()) !== null,
+  });
+};
 // The success `detail`: a credential with no refresh token works now but can't
 // be renewed — log `warning` + return the persistent NO_REFRESH_HINT so the
 // dashboard shows a "re-sign in" hint instead of a card that dies at expiry.
@@ -604,7 +704,16 @@ const connectDirect = makeBlockingConnect({
     clearAuthStatusCache();
     return grantKeychainToolAccess(cliHome(PROVIDER));
   },
-  verifyConnected: isConnected,
+  verifyConnected: verifyClaudeLogin,
+  // Darwin credentials live in the isolated keychain — no safe file event.
+  waitStoreHint:
+    platform() === "darwin"
+      ? undefined
+      : (signal) =>
+          waitFileStoreHint(
+            join(cliConfigDir(PROVIDER), ".credentials.json"),
+            signal,
+          ),
   onConnected: refreshConfig,
   successDetail: () =>
     signedInDetail(
@@ -627,6 +736,7 @@ const device = makePasteBackDevice({
   // Authoritative check: `claude auth status` first, the (fragile, macOS-shape-
   // sensitive) store read only as fallback — same as `status()`/`connect()`.
   connected: isConnected,
+  verify: verifyClaudeLogin,
   connectedDetail: CONNECTED_DETAIL,
   inProgressDetail:
     "Claude sign-in already in progress — finish in your browser, then paste the code.",
@@ -646,13 +756,17 @@ const device = makePasteBackDevice({
   // Same ordering rule as the browser flow: invalidate first, so the verify
   // below observes the post-paste credential rather than a stale signed-out
   // answer cached by the pre-login `connected` probe.
+  waitStoreHint:
+    platform() === "darwin"
+      ? undefined
+      : (signal) =>
+          waitFileStoreHint(
+            join(cliConfigDir(PROVIDER), ".credentials.json"),
+            signal,
+          ),
   verifyAfterSubmit: async () => {
     clearAuthStatusCache();
-    const viaAuth = await authStatusLoggedIn();
-    return (
-      (viaAuth.kind === "value" && viaAuth.result === true) ||
-      (await readToken()) !== null
-    );
+    return verifyClaudeLogin();
   },
   submitSuccessDetail: () =>
     signedInDetail(

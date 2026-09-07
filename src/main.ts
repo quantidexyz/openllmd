@@ -210,7 +210,7 @@ const main = async (): Promise<void> => {
       // watcher re-pushes when the cache lands. Re-walked after install/uninstall
       // and on a whole-daemon refresh (control-relay.ts).
       void refreshCliState()
-        .then(() => pushStatusIfChanged())
+        .then(() => pushStatusIfChanged("bootstrap"))
         .catch((err) => logError("main", err));
     }
   };
@@ -225,12 +225,12 @@ const main = async (): Promise<void> => {
         // the relay socket immediately on change (the channel's own watcher
         // would catch it within a couple seconds anyway).
         const changed = await refreshBootstrap();
-        if (changed) await pushStatusIfChanged();
+        if (changed) await pushStatusIfChanged("bootstrap");
         // A bootstrap that just recovered to `ok` (boot-time unreachable, or a
         // newly-set key) is the first chance to run the device-state walk.
         if (changed && getCloudState() === "ok") {
           void refreshCliState()
-            .then(() => pushStatusIfChanged())
+            .then(() => pushStatusIfChanged("bootstrap"))
             .catch((err) => logError("main", err));
         }
         // Periodic version check — picks up a release published while running.

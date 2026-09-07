@@ -1,0 +1,194 @@
+/**
+ * Status publication coalescer: one active compute + at most one dirty
+ * follow-up. Extra push requests collapse into the follow-up; awaiting a
+ * collapsed request waits for that follow-up (fresh compute), not the
+ * in-flight snapshot. Commands are not coalesced here.
+ */
+
+export type TStatusPublishTrigger =
+  | "watcher"
+  | "command"
+  | "welcome"
+  | "auth-sink"
+  | "presence"
+  | "bootstrap"
+  | "late-probe";
+
+export type TStatusPublishQueueSnapshot = {
+  readonly queued_publish_depth: number;
+  readonly collapsed_count: number;
+  readonly oldest_queued_publish_age_ms: number;
+  readonly status_trigger: TStatusPublishTrigger | undefined;
+};
+
+export type TStatusPublishRequest = {
+  readonly skipUnchanged: boolean;
+  readonly active?: boolean;
+  readonly trigger: TStatusPublishTrigger;
+};
+
+type TWaiter = {
+  readonly resolve: () => void;
+  readonly reject: (err: unknown) => void;
+};
+
+type TJob = {
+  skipUnchanged: boolean;
+  active: boolean | undefined;
+  trigger: TStatusPublishTrigger;
+  startedAtMs: number;
+  collapsedCount: number;
+  waiters: TWaiter[];
+  epoch: number;
+};
+
+export type TStatusPublishCoalescerHost = {
+  readonly now: () => number;
+  readonly epoch: () => number;
+  readonly computeFresh: () => Promise<{
+    status: { connections: ReadonlyArray<unknown> } & Record<string, unknown>;
+    fingerprint: string;
+  }>;
+  readonly canSend: (jobEpoch: number) => boolean;
+  readonly lastFingerprint: () => string;
+  readonly setLastFingerprint: (fingerprint: string) => void;
+  readonly observe: (connections: ReadonlyArray<unknown>) => void;
+  readonly send: (status: unknown, active: boolean | undefined) => void;
+  readonly onCollapsed?: (snapshot: TStatusPublishQueueSnapshot) => void;
+};
+
+const resolveWaiters = (waiters: readonly TWaiter[]): void => {
+  for (const waiter of waiters) waiter.resolve();
+};
+
+const rejectWaiters = (waiters: readonly TWaiter[], err: unknown): void => {
+  for (const waiter of waiters) waiter.reject(err);
+};
+
+export const createStatusPublishCoalescer = (
+  host: TStatusPublishCoalescerHost,
+): {
+  request: (req: TStatusPublishRequest) => Promise<void>;
+  abandon: () => void;
+  snapshot: () => TStatusPublishQueueSnapshot;
+} => {
+  let active: TJob | null = null;
+  let followUp: TJob | null = null;
+  let pumpRunning = false;
+
+  const snapshot = (): TStatusPublishQueueSnapshot => {
+    const now = host.now();
+    const oldest = followUp ?? active;
+    return {
+      queued_publish_depth:
+        (active !== null ? 1 : 0) + (followUp !== null ? 1 : 0),
+      collapsed_count: followUp?.collapsedCount ?? 0,
+      oldest_queued_publish_age_ms:
+        oldest === null ? 0 : Math.max(0, now - oldest.startedAtMs),
+      status_trigger: followUp?.trigger ?? active?.trigger,
+    };
+  };
+
+  const enqueueWaiter = (job: TJob): Promise<void> =>
+    new Promise((resolve, reject) => {
+      job.waiters.push({ resolve, reject });
+    });
+
+  const mergeFollowUp = (req: TStatusPublishRequest): Promise<void> => {
+    if (followUp === null) {
+      followUp = {
+        skipUnchanged: req.skipUnchanged,
+        active: req.active,
+        trigger: req.trigger,
+        startedAtMs: host.now(),
+        collapsedCount: 0,
+        waiters: [],
+        epoch: host.epoch(),
+      };
+    } else {
+      followUp.collapsedCount += 1;
+      followUp.skipUnchanged = followUp.skipUnchanged && req.skipUnchanged;
+      if (req.active !== undefined) followUp.active = req.active;
+      host.onCollapsed?.(snapshot());
+    }
+    return enqueueWaiter(followUp);
+  };
+
+  const runJob = async (job: TJob): Promise<void> => {
+    try {
+      const computed = await host.computeFresh();
+      if (!host.canSend(job.epoch)) {
+        resolveWaiters(job.waiters);
+        return;
+      }
+      if (
+        job.skipUnchanged &&
+        host.lastFingerprint() !== "" &&
+        computed.fingerprint === host.lastFingerprint()
+      ) {
+        resolveWaiters(job.waiters);
+        return;
+      }
+      host.observe(computed.status.connections);
+      host.send(computed.status, job.active);
+      host.setLastFingerprint(computed.fingerprint);
+      resolveWaiters(job.waiters);
+    } catch (err) {
+      rejectWaiters(job.waiters, err);
+    }
+  };
+
+  const pump = async (): Promise<void> => {
+    if (pumpRunning) return;
+    pumpRunning = true;
+    try {
+      while (active !== null) {
+        const job = active;
+        const jobEpoch = job.epoch;
+        await runJob(job);
+        if (jobEpoch !== host.epoch()) {
+          if (active === job) {
+            active = followUp;
+            followUp = null;
+          }
+          continue;
+        }
+        active = followUp;
+        followUp = null;
+      }
+    } finally {
+      pumpRunning = false;
+      if (active !== null) void pump();
+    }
+  };
+
+  const request = (req: TStatusPublishRequest): Promise<void> => {
+    if (active !== null && active.epoch === host.epoch()) {
+      return mergeFollowUp(req);
+    }
+    const job: TJob = {
+      skipUnchanged: req.skipUnchanged,
+      active: req.active,
+      trigger: req.trigger,
+      startedAtMs: host.now(),
+      collapsedCount: 0,
+      waiters: [],
+      epoch: host.epoch(),
+    };
+    active = job;
+    const waiter = enqueueWaiter(job);
+    void pump();
+    return waiter;
+  };
+
+  const abandon = (): void => {
+    resolveWaiters(followUp?.waiters ?? []);
+    followUp = null;
+    if (active !== null && !pumpRunning) {
+      resolveWaiters(active.waiters);
+      active = null;
+    }
+  };
+
+  return { request, abandon, snapshot };
+};

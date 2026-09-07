@@ -60,7 +60,21 @@ export const getPendingAuth = (slug: string): TPendingAuth | null => {
   return auth;
 };
 
-export const clearPendingAuth = (slug: string): void => {
+/**
+ * Drop pending auth for `slug`. When `flowId` is set, leave a newer overlapping
+ * flow's snapshot in place — stale finalizers must not wipe a retry.
+ */
+export const clearPendingAuth = (slug: string, flowId?: string): void => {
+  if (flowId !== undefined) {
+    const auth = pending.get(slug);
+    if (
+      auth !== undefined &&
+      auth.flowId !== undefined &&
+      auth.flowId !== flowId
+    ) {
+      return;
+    }
+  }
   pending.delete(slug);
 };
 

@@ -22,18 +22,22 @@ import type {
   TLoginFlowCtx,
   TLoginSlot,
   TLoginTerminalEvent,
+  TLoginVerify,
 } from "./login-flow";
 import {
+  booleanLoginVerify,
   emitLoginFailed,
   emitLoginStarted,
   emitLoginSucceeded,
   finalizeLoginTerminal,
   guard,
+  LOGIN_VERIFY_WATCHDOG_MS,
   openAuthUrlUnlessCancelled,
   publishPendingAuth,
   resolveLoginFlow,
   spawnStreamLogin,
   streamLoginFail,
+  waitLoginVerifyHint,
 } from "./login-flow";
 import { KEYCHAIN_NOT_READY_DETAIL, loginReady } from "./login-readiness";
 import type { TLoginResult, TStoreRead } from "./util";
@@ -52,7 +56,9 @@ export type TBlockingConnectConfig = {
   /** Runs after the login spawn (claude: grant keychain tool access). */
   readonly afterLogin?: () => Promise<boolean | undefined>;
   /** Authoritative connection check after the login completes. */
-  readonly verifyConnected: () => Promise<boolean>;
+  readonly verifyConnected: () => Promise<TLoginVerify>;
+  readonly waitStoreHint?: (signal: AbortSignal) => Promise<void>;
+  readonly verifyWatchdogMs?: number;
   /** Fire-and-forget side effect on success (claude: refresh the auth config). */
   readonly onConnected?: () => void | Promise<void>;
   /** The success `detail` — provider-computed so it can flag a credential that
@@ -97,7 +103,22 @@ export const makeBlockingConnect = (
           probe: unwrapKeychainSpawn(cfg.provider),
         });
         const granted = await cfg.afterLogin?.();
-        if (await cfg.verifyConnected()) {
+        const sample = async (): Promise<TLoginVerify> => {
+          try {
+            return await cfg.verifyConnected();
+          } catch {
+            return { state: "unavailable" };
+          }
+        };
+        let verified = await sample();
+        if (verified.state === "unavailable") {
+          await waitLoginVerifyHint({
+            waitStoreHint: cfg.waitStoreHint,
+            verifyWatchdogMs: cfg.verifyWatchdogMs ?? LOGIN_VERIFY_WATCHDOG_MS,
+          });
+          verified = await sample();
+        }
+        if (verified.state === "connected") {
           if (granted === false) {
             emitLoginFailed(flow, {
               code: "spawn_denied",
@@ -111,10 +132,19 @@ export const makeBlockingConnect = (
           return { connected: true, detail: await cfg.successDetail() };
         }
         const detail = cfg.failDetail(result);
+        if (verified.state === "unavailable") {
+          emitLoginFailed(flow, {
+            code: "poll_expired",
+            message: detail,
+            retryable: true,
+          });
+          return { connected: false, detail };
+        }
+        const crashed = typeof result.code === "number" && result.code !== 0;
         emitLoginFailed(flow, {
-          code: "cli_crash",
+          code: crashed ? "cli_crash" : "poll_expired",
           message: detail,
-          retryable: false,
+          retryable: !crashed,
         });
         return { connected: false, detail };
       },
@@ -161,6 +191,8 @@ export type TStreamConnectConfig = {
    *  A retry can't fix a deterministic crash, so surface the captured error
    *  instead of `failDetail`. Optional — omit to keep the generic message. */
   readonly crashDetail?: (captured: string, exitCode: number | null) => string;
+  /** File-store identity hint after child exit (not Darwin keychain). */
+  readonly waitStoreHint?: (signal: AbortSignal) => Promise<void>;
 };
 
 /**
@@ -202,7 +234,8 @@ export const makeStreamConnect = (
           env: cfg.env(),
           stream: cfg.stream ?? "stderr",
           parse: cfg.parse,
-          isConnected: cfg.connected,
+          verify: () => booleanLoginVerify(cfg.connected),
+          waitStoreHint: cfg.waitStoreHint,
           onConnected: cfg.onConnected,
           // cursor's store is the macOS keychain → unconfined on mac; codex is
           // file-backed → stays confined (`sandbox/policy.ts`).

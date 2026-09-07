@@ -19,7 +19,11 @@ import { normalizeProviderConnection } from "@openllmsh/protocol";
 import { autoUpdateEnabled } from "./auto-update-pref";
 import { getCloudState } from "./config";
 import type { TDeadlineBudget } from "./deadline-budget";
-import { createDeadlineBudget, waitUntilExpired } from "./deadline-budget";
+import {
+  createDeadlineBudget,
+  timeoutCallbackLatenessMs,
+  waitUntilExpired,
+} from "./deadline-budget";
 import { DELEGATES, getDelegate, isSubscriptionSlug } from "./delegation";
 import { loginSlot } from "./delegation/login-flow";
 import { DEFAULT_CAPTURE_TIMEOUT_MS } from "./delegation/spawn";
@@ -36,6 +40,7 @@ import { resolveOnPath } from "./path-utils";
 import { ptySessionsEnabled } from "./pty-sessions-pref";
 import { sandboxState } from "./sandbox/landlock";
 import { ptySupported, sessionStatusReport } from "./session-host";
+import type { TStatusPublishQueueSnapshot } from "./status-publish-coalesce";
 import { cachedUsage, peekUsage } from "./usage-cache";
 import { DAEMON_VERSION } from "./version";
 
@@ -84,6 +89,19 @@ export const markProviderSignedOut = (slug: string): void => {
 export const clearProviderSignedOut = (slug: string): void => {
   signedOutByUser.delete(slug);
 };
+
+/**
+ * Late inner/outer determinate results must not publish across user logout or
+ * an in-flight login: generation+fingerprint can still match while the vendor
+ * still reports connected.
+ */
+export const lateProviderAdmitBlocked = (slug: string): boolean =>
+  signedOutByUser.has(slug) ||
+  (isSubscriptionSlug(slug) && loginSlot(slug).inFlight());
+
+/** Test-only: sticky logout flag after late-admit attempts. */
+export const providerSignedOutByUserForTests = (slug: string): boolean =>
+  signedOutByUser.has(slug);
 
 const applyAuthLiteral = (
   slug: string,
@@ -148,11 +166,28 @@ const connectionFingerprint = (conn: TDaemonProviderConnection): string =>
 
 const defaultLateProbePush = (): void => {
   void import("./control-channel")
-    .then((mod) => mod.pushStatusIfChanged())
+    .then((mod) => mod.pushStatusIfChanged("late-probe"))
     .catch(() => {});
 };
 
 let requestLateProbePush: () => void = defaultLateProbePush;
+
+const emptyPublishQueueSnapshot = (): TStatusPublishQueueSnapshot => ({
+  queued_publish_depth: 0,
+  collapsed_count: 0,
+  oldest_queued_publish_age_ms: 0,
+  status_trigger: undefined,
+});
+
+let readPublishQueueSnapshot: () => TStatusPublishQueueSnapshot =
+  emptyPublishQueueSnapshot;
+
+/** Control-channel coalescer registers here so observer timeouts can log D0 queue fields. */
+export const setStatusPublishQueueSnapshot = (
+  fn: (() => TStatusPublishQueueSnapshot) | null,
+): void => {
+  readPublishQueueSnapshot = fn ?? emptyPublishQueueSnapshot;
+};
 
 /** Test-only: intercept the late-probe status push. Pass `null` to restore. */
 export const setLateProbeStatusPushForTests = (
@@ -205,6 +240,19 @@ const recordLateProbeOutcome = (
   requestLateProbePush();
 };
 
+/**
+ * Inner shared-auth (or equivalent) determinate result after the outer observer
+ * already returned unknown. Same last-known + push rules as an abandoned outer
+ * producer. Callers must fence generation + store identity before invoking.
+ */
+export const admitLateProviderConnection = (
+  slug: string,
+  raw: TDaemonProviderConnection,
+): void => {
+  if (lateProviderAdmitBlocked(slug)) return;
+  recordLateProbeOutcome(slug, raw);
+};
+
 const statusFailure = (slug: string): TDaemonProviderConnection => {
   const lastKnown = lastKnownConnections.get(slug);
   if (lastKnown !== undefined) {
@@ -236,7 +284,9 @@ const awaitProducer = async (
 ): Promise<TDaemonProviderConnection> => {
   const observerBudget =
     ownerBudget ?? createDeadlineBudget(DELEGATE_STATUS_TIMEOUT_MS);
-  const observerStarted = Date.now();
+  const observerStartedWall = Date.now();
+  const timerArmedAtMs = performance.now();
+  const observerDelayMs = observerBudget.remainingMs();
   let settled = false;
   return Promise.race([
     producer.then((conn) => {
@@ -244,16 +294,28 @@ const awaitProducer = async (
       return conn;
     }),
     waitUntilExpired(observerBudget).then((): TDaemonProviderConnection => {
+      const timerFiredAtMs = performance.now();
       if (settled) return statusFailure(slug);
       markAbandoned();
       logWarn("status", "delegate status probe timed out", {
         slug,
         phase: "delegate_status",
         timeout_ms: DELEGATE_STATUS_TIMEOUT_MS,
-        elapsed_ms: Date.now() - observerStarted,
+        elapsed_ms: Date.now() - observerStartedWall,
+        observer_started_at_ms: timerArmedAtMs,
+        timer_armed_at_ms: timerArmedAtMs,
+        timer_fired_at_ms: timerFiredAtMs,
+        timeout_callback_lateness_ms: timeoutCallbackLatenessMs(
+          timerArmedAtMs,
+          timerFiredAtMs,
+          observerDelayMs,
+        ),
+        clock_elapsed: "Date.now",
+        clock_timer: "performance.now",
         joined,
         cancellable: getDelegate(slug)?.statusCancellable === true,
         tick_id: currentTickId(),
+        ...readPublishQueueSnapshot(),
       });
       return statusFailure(slug);
     }),
@@ -469,7 +531,7 @@ const computeStatusFreshInner = async (): Promise<TDaemonStatus> => {
   };
 };
 
-const computeStatusFresh = (): Promise<TDaemonStatus> => {
+export const computeStatusFresh = (): Promise<TDaemonStatus> => {
   const tick_id = nextStatusTickId();
   return opTickContext.run({ tick_id }, computeStatusFreshInner);
 };

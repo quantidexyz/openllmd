@@ -62,6 +62,7 @@ import type { TRefreshErrorClass } from "./refresh";
 import {
   credentialUnrefreshable,
   isStaleRefresh,
+  refreshCredentialSnapshot,
   resolveToken,
   spawnRefresh,
   withRefreshCaller,
@@ -238,7 +239,18 @@ const ensureModelConfig = async (accessToken: string): Promise<void> => {
  * `readToken` from the native `/models` list. Output ignored; bounded.
  */
 const triggerRefresh = async (): Promise<void> => {
-  await spawnRefresh([bin(), "-p", "ping"], env(), { pty: true });
+  await spawnRefresh([bin(), "-p", "ping"], env(), {
+    pty: true,
+    readStore: async () => {
+      const tok = storeReadValue(
+        await readJsonStore<TKimiToken>(credentialPath()),
+      );
+      return refreshCredentialSnapshot({
+        accessToken: tok?.access_token,
+        refreshToken: tok?.refresh_token,
+      });
+    },
+  });
 };
 
 // Within the leeway window → fire the CLI refresh in the background (still

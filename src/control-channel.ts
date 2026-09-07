@@ -69,7 +69,9 @@ import {
   handleRtcOffer,
   resetUnmountedRtcSessions,
 } from "./rtc-host";
-import { computeStatus } from "./status";
+import { computeStatusFresh, setStatusPublishQueueSnapshot } from "./status";
+import type { TStatusPublishTrigger } from "./status-publish-coalesce";
+import { createStatusPublishCoalescer } from "./status-publish-coalesce";
 import { createSupersedeBackoff, isSupersededClose } from "./supersede-backoff";
 
 const decodeFrame = Schema.decodeUnknownEither(RelayFrame);
@@ -304,7 +306,51 @@ let daemonSessionId: string | null = null;
 /** Null while handshake is pending; false for an older relay welcome. */
 let supportsOrderedStatus: boolean | null = null;
 let statusSeq = 0;
-let statusPublishTail: Promise<void> = Promise.resolve();
+let statusPublishEpoch = 0;
+const statusPublishCoalescer = createStatusPublishCoalescer({
+  now: () => Date.now(),
+  epoch: () => statusPublishEpoch,
+  computeFresh: async () => {
+    const status = await computeStatusFresh();
+    return { status, fingerprint: statusChangeKey(status) };
+  },
+  canSend: (jobEpoch) =>
+    jobEpoch === statusPublishEpoch &&
+    jobEpoch === connectionGeneration &&
+    supportsOrderedStatus !== null &&
+    ws !== null &&
+    ws.readyState === ws.OPEN,
+  lastFingerprint: () => lastFingerprint,
+  setLastFingerprint: (fingerprint) => {
+    lastFingerprint = fingerprint;
+  },
+  observe: (connections) => {
+    observeNotificationTransitions(
+      connections as ReadonlyArray<TDaemonProviderConnection>,
+    );
+  },
+  send: (status, active) => {
+    const ordered = supportsOrderedStatus === true && daemonSessionId !== null;
+    if (ordered) statusSeq += 1;
+    send({
+      type: "status",
+      ...(active === undefined ? {} : { active }),
+      status,
+      ...(ordered && daemonSessionId !== null
+        ? { daemon_session_id: daemonSessionId, status_seq: statusSeq }
+        : {}),
+    });
+  },
+  onCollapsed: (queue) => {
+    if (queue.collapsed_count !== 1) return;
+    logDebug("control-channel", "status publish coalesced", {
+      queued_publish_depth: queue.queued_publish_depth,
+      collapsed_count: queue.collapsed_count,
+      oldest_queued_publish_age_ms: queue.oldest_queued_publish_age_ms,
+      status_trigger: queue.status_trigger,
+    });
+  },
+});
 /** Binary WebSocket frames can arrive as a mix of Blobs and ArrayBuffers. Blob
  * conversion is async, so queue all binary delivery to preserve wire order. */
 let binaryFrameTail: Promise<void> = Promise.resolve();
@@ -484,39 +530,11 @@ export const resetRelayScopedState = (): void => {
   resetUnmountedRtcClientSessions();
 };
 
-const enqueueStatusPublish = (
-  compute: () => Promise<{ status: unknown; fingerprint: string } | null>,
-  active?: boolean,
-): Promise<void> => {
-  const generation = connectionGeneration;
-  statusPublishTail = statusPublishTail
-    .catch(() => {})
-    .then(async () => {
-      const snapshot = await compute();
-      if (snapshot === null) return;
-      // A reconnect or an un-negotiated legacy session cannot receive ordered
-      // state from work that began on a prior socket.
-      if (
-        generation !== connectionGeneration ||
-        supportsOrderedStatus === null ||
-        ws === null ||
-        ws.readyState !== ws.OPEN
-      )
-        return;
-      const ordered = supportsOrderedStatus && daemonSessionId !== null;
-      if (ordered) statusSeq += 1;
-      send({
-        type: "status",
-        ...(active === undefined ? {} : { active }),
-        status: snapshot.status,
-        ...(ordered && daemonSessionId !== null
-          ? { daemon_session_id: daemonSessionId, status_seq: statusSeq }
-          : {}),
-      });
-      lastFingerprint = snapshot.fingerprint;
-    });
-  return statusPublishTail;
-};
+const enqueueStatusPublish = (opts: {
+  skipUnchanged: boolean;
+  active?: boolean;
+  trigger: TStatusPublishTrigger;
+}): Promise<void> => statusPublishCoalescer.request(opts);
 
 /**
  * Shared observer choreography for a computed status snapshot: local
@@ -532,12 +550,15 @@ const observeNotificationTransitions = (
   }
 };
 
-const pushStatus = async (active?: boolean): Promise<void> =>
-  enqueueStatusPublish(async () => {
-    const status = await computeStatus();
-    observeNotificationTransitions(status.connections);
-    return { status, fingerprint: statusChangeKey(status) };
-  }, active);
+const pushStatus = async (
+  active?: boolean,
+  trigger: TStatusPublishTrigger = "welcome",
+): Promise<void> =>
+  enqueueStatusPublish({
+    skipUnchanged: false,
+    active,
+    trigger,
+  });
 
 /** Throttle for `notePresenceActivity` — traffic-driven presence refreshes are
  *  a liveness signal, not telemetry, so one per minute is ample (the routing
@@ -560,7 +581,7 @@ export const notePresenceActivity = (): void => {
   const now = Date.now();
   if (now - lastPresenceRefreshAt < PRESENCE_REFRESH_MS) return;
   lastPresenceRefreshAt = now;
-  void pushStatus().catch(() => {
+  void pushStatus(undefined, "presence").catch(() => {
     // best-effort: presence also self-heals on the relay keepalive
   });
 };
@@ -568,18 +589,13 @@ export const notePresenceActivity = (): void => {
 /** Send a fresh snapshot only when it changed — surfaces out-of-band flips
  *  (a device-code login completing) while a command isn't in flight. Exported
  *  so the bootstrap scheduler can push a `cloud_state` change immediately. */
-export const pushStatusIfChanged = async (): Promise<void> =>
-  enqueueStatusPublish(async () => {
-    const status = await computeStatus();
-    observeNotificationTransitions(status.connections);
-    const plan = planWatcherSnapshot(lastFingerprint, status);
-    // Check inside the serialized publisher so concurrent probes cannot both
-    // decide they are the next changed snapshot. Unchanged ticks skip the
-    // full-snapshot stringify (it already ran inside `planWatcherSnapshot`
-    // only when the cheap key moved).
-    if (plan.skipSerialize) return null;
-    return { status, fingerprint: plan.key };
-  }).then(() => {});
+export const pushStatusIfChanged = async (
+  trigger: TStatusPublishTrigger = "watcher",
+): Promise<void> =>
+  enqueueStatusPublish({
+    skipUnchanged: true,
+    trigger,
+  });
 
 const startWatcher = (): void => {
   if (watchTimer !== null) return;
@@ -598,7 +614,7 @@ armProbesAfterPong = (): void => {
   startWatcher();
   if (pendingWelcomeStatus) {
     pendingWelcomeStatus = false;
-    void pushStatus();
+    void pushStatus(undefined, "welcome");
   }
 };
 
@@ -767,7 +783,7 @@ const onCommand = async (command: TRelayFrame): Promise<void> => {
     });
     send({ type: "ack", ack });
     // Carry a fresh snapshot back so the dashboard reflects the result.
-    await pushStatus();
+    await pushStatus(undefined, "command");
   };
   commandTail = commandTail.catch(() => {}).then(run);
   await commandTail;
@@ -803,7 +819,7 @@ const dispatchFrame = (frame: TRelayFrame): void => {
       statusSeq = 1;
       startMigrationCheck();
       if (probesArmed) {
-        void pushStatus();
+        void pushStatus(undefined, "welcome");
       } else {
         pendingWelcomeStatus = true;
       }
@@ -1054,10 +1070,11 @@ export const migrateIfRelayMoved = async (
 
 /** Start the WebSocket control loop (idempotent). */
 export const startControlChannel = (): void => {
+  setStatusPublishQueueSnapshot(() => statusPublishCoalescer.snapshot());
   setAuthSink({
     emit: emitAuthFrame,
     pushStatus: () => {
-      void pushStatus();
+      void pushStatus(undefined, "auth-sink");
     },
   });
   if (ws !== null) return;
@@ -1088,6 +1105,8 @@ export const startControlChannel = (): void => {
     lastCloseLine = "";
     helloSent = false; // a fresh connection — nothing may precede ITS hello
     connectionGeneration += 1;
+    statusPublishEpoch = connectionGeneration;
+    statusPublishCoalescer.abandon();
     // Re-assert on every open: partysocket re-applies its cached binaryType
     // to the native socket in _handleOpen, but be explicit after reconnect.
     socket.binaryType = "arraybuffer";
@@ -1099,10 +1118,9 @@ export const startControlChannel = (): void => {
     // local request after a reconnect should be able to republish presence
     // rather than sit out the remainder of the previous socket's throttle.
     lastPresenceRefreshAt = 0;
-    // Drop the previous generation's publish queue: a slow probe it queued can
-    // no longer send (its captured generation mismatches), so keeping it as
-    // the tail would only delay this session's first status behind dead work.
-    statusPublishTail = Promise.resolve();
+    // Drop the previous generation's publish follow-up so a slow probe cannot
+    // delay this session's first status behind dead work. In-flight compute
+    // is generation-fenced in the coalescer (`canSend`).
     // Same for binary frames: a late Blob conversion from the prior socket
     // must not sit ahead of this connection's first mux bytes.
     binaryFrameTail = Promise.resolve();
@@ -1200,4 +1218,5 @@ export const stopControlChannel = async (): Promise<void> => {
   ws.close(); // partysocket: a manual close() disables further reconnection
   ws = null;
   setAuthSink(null);
+  setStatusPublishQueueSnapshot(null);
 };
