@@ -15,6 +15,8 @@
  * valid (within the leeway window) and only AWAITS it once the token is already
  * hard-expired — exactly "no latency unless the refresh is close".
  */
+import type { TDoctorProvider } from "@openllmsh/protocol";
+import type { TDoctorObservationInput } from "../doctor-report";
 import { logDebug, logInfo, logWarn } from "../logger";
 import type { TRefreshCaller } from "../op-context";
 import {
@@ -743,6 +745,54 @@ export const makeRefresher = (opts: {
             tick_id: currentTickId(),
             caller,
           });
+          if (lastErrorClass !== "abandoned") {
+            const mapped =
+              lastErrorClass === "timeout"
+                ? {
+                    error_class: "timeout" as const,
+                    outcome: "timeout" as const,
+                  }
+                : lastErrorClass === "spawn_failed"
+                  ? {
+                      error_class: "spawn_denied" as const,
+                      outcome: "failure" as const,
+                    }
+                  : {
+                      error_class: "unclassified" as const,
+                      outcome: "failure" as const,
+                    };
+            const provider: TDoctorProvider | undefined =
+              opts.slug === "claude_code" ||
+              opts.slug === "chatgpt" ||
+              opts.slug === "kimi_code" ||
+              opts.slug === "grok" ||
+              opts.slug === "cursor"
+                ? opts.slug
+                : undefined;
+            const observation: TDoctorObservationInput = {
+              code: "refresh_failure",
+              producer: "refresh",
+              trigger: "refresh",
+              outcome: mapped.outcome,
+              operation: "refresh",
+              error_class: mapped.error_class,
+              ...(provider !== undefined ? { provider } : {}),
+              timings: {
+                ...(clocks.spawn_elapsed_ms !== null
+                  ? { elapsed_ms: clocks.spawn_elapsed_ms }
+                  : {}),
+                configured_timeout_ms: timeout_ms,
+                ...(typeof triggerError?.exitCode === "number"
+                  ? { root_exit_code: triggerError.exitCode }
+                  : {}),
+              },
+            };
+            queueMicrotask(() => {
+              void import("../doctor-report")
+                .then((m) => m.observeDoctorEvent(observation))
+                .catch(() => {});
+            });
+          }
         })
         .finally(() => {
           inFlight = null;

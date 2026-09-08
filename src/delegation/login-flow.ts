@@ -21,6 +21,7 @@
 import type { TAuthLoginFailedCode, TAuthLoginMode } from "@openllmsh/protocol";
 import { emitAuth, requestStatusPush } from "../auth-events";
 import { noteAuthStoreIdentityChange } from "../auth-user-action";
+import { noteLoginTerminal } from "../doctor-report/hooks";
 import { logWarn } from "../logger";
 import type { TPendingAuth } from "../pending-auth";
 import {
@@ -310,6 +311,12 @@ export const finalizeLoginTerminal = (opts: {
   readonly provider: string;
   readonly clearPending: boolean;
 }): void => {
+  if (opts.event.kind === "failed") {
+    noteLoginTerminal({
+      code: opts.event.code,
+      provider: opts.provider,
+    });
+  }
   if (opts.flow !== null) {
     if (opts.event.kind === "succeeded") {
       emitLoginSucceeded(opts.flow);

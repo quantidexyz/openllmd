@@ -34,6 +34,7 @@ import {
   hostCliCandidates,
 } from "./cli-paths";
 import { cliVersion } from "./delegation/util";
+import { noteCliInstallProbeResult } from "./doctor-report/hooks";
 
 export type TCliInstallState = {
   readonly installed: boolean;
@@ -244,7 +245,13 @@ const probeCliInstallState = async (
   const out = await cliVersion(bin, cliEnv(provider), {
     timeoutMs: cliVersionProbeTimeoutMs(),
   });
-  return { installed: true, version: parseVendorVersion(out) };
+  const state = { installed: true, version: parseVendorVersion(out) };
+  noteCliInstallProbeResult({
+    provider,
+    version: state.version,
+    installed: state.installed,
+  });
+  return state;
 };
 
 export const cliInstallState = async (

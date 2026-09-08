@@ -25,6 +25,7 @@ import { emitAuth } from "./auth-events";
 import { isSubscriptionSlug } from "./delegation";
 import { loginSlot } from "./delegation/login-flow";
 import { STATUS_CHECK_FAILED_DETAIL } from "./delegation/util";
+import { observeDoctorEvent } from "./doctor-report";
 import { daemonApiKeyId } from "./env";
 import { logWarn } from "./logger";
 
@@ -155,6 +156,15 @@ const noteUnknownLiveness = (conn: TDaemonProviderConnection): void => {
     const consecutive = (unknownStreak.get(slug) ?? 0) + 1;
     unknownStreak.set(slug, consecutive);
     if (consecutive !== UNKNOWN_ESCALATION_TICKS) return;
+    observeDoctorEvent({
+      code: "liveness_degraded",
+      producer: "auth_session_lost",
+      trigger: "session_lost",
+      outcome: "degraded",
+      operation: "probe",
+      provider: slug,
+      timings: { unknown_probe_streak: consecutive },
+    });
     emitAuth({
       event: "auth.liveness.degraded",
       key_id: daemonApiKeyId() ?? "local",
@@ -178,6 +188,14 @@ export const noteConnectionsForSessionLost = (
     if (edge === null) continue;
     if (edge.lost) {
       const diagnostic_code = edge.diagnostic_code ?? "unclassified";
+      observeDoctorEvent({
+        code: "session_lost",
+        producer: "auth_session_lost",
+        trigger: "session_lost",
+        outcome: "disconnect",
+        operation: "probe",
+        provider: edge.slug,
+      });
       logWarn("auth-session-lost", "subscription session lost", {
         slug: edge.slug,
         diagnostic_code,

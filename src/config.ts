@@ -19,6 +19,7 @@ import type {
   TContextOverflowStrategy,
   TDaemonBootstrap,
   TDaemonCatalogEntry,
+  TDaemonReportingPolicy,
   TSubMethod,
 } from "@openllmsh/protocol";
 import { resolveContextOverflowStrategy } from "@openllmsh/wire";
@@ -54,6 +55,22 @@ let cloudState: TCloudState = "no_key";
 
 export const getCloudState = (): TCloudState => cloudState;
 
+/** Last bootstrap reporting policy. Absent/old clouds → null (upload off). */
+export const getReportingPolicy = (): TDaemonReportingPolicy | null =>
+  snapshot.reporting_policy ?? null;
+
+/** Test-only: inject bootstrap reporting policy without a cloud fetch. */
+export const setReportingPolicyForTests = (
+  policy: TDaemonReportingPolicy | null,
+): void => {
+  snapshot = {
+    ...snapshot,
+    ...(policy === null
+      ? { reporting_policy: undefined }
+      : { reporting_policy: policy }),
+  };
+};
+
 /**
  * Refresh the cloud snapshot, recording the outcome in `cloudState`.
  * Never throws — classifies the failure instead so the control surface
@@ -72,6 +89,9 @@ export const refreshBootstrap = async (): Promise<boolean> => {
     snapshot = await fetchBootstrap();
     byModelId = new Map(snapshot.catalog.map((e) => [e.model_id, e]));
     cloudState = "ok";
+    void import("./doctor-report")
+      .then((m) => m.onBootstrapReportingPolicy())
+      .catch(() => {});
     // A fresh snapshot may carry new routing config — drop any cached signed
     // plans so a stale chain never outlives the config that produced it.
     clearPlanCache();

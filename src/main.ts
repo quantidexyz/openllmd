@@ -60,6 +60,13 @@ import { isSurvivableTransportError } from "./crash-policy";
 import { requireServiceApiKey } from "./credential-gate";
 import { refreshCliState } from "./device-state";
 import {
+  handleDoctorLocal,
+  initDoctorCursorAtTail,
+  isDoctorLocalPath,
+  mintDoctorCapability,
+  recordDoctorObservation,
+} from "./doctor-report";
+import {
   daemonEnv,
   daemonPort,
   deviceId,
@@ -100,6 +107,8 @@ const main = async (): Promise<void> => {
   // `daemonPort()` loads the env file, so the kill-switch / opt-in vars are
   // resolved before the sandbox decision.
   const port = daemonPort();
+  mintDoctorCapability();
+  initDoctorCursorAtTail();
 
   // Crash-loop circuit breaker. The supervisor (systemd `Restart=always` /
   // launchd `KeepAlive`) relaunches us on every exit, so a persistent boot
@@ -171,9 +180,17 @@ const main = async (): Promise<void> => {
       return;
     }
     logError("uncaughtException", err);
+    recordDoctorObservation({
+      code: "fatal_process",
+      producer: "process",
+      trigger: "fatal",
+      outcome: "failure",
+      error_class: "unclassified",
+    });
     // Durable local session hosts are detached sibling processes. A daemon
     // fatal exit must never terminate their vendor PTYs; attached browser
     // clients simply lose their transport until Phase 2 reconnects them.
+    // Do not wait on network reporting.
     exitAfterDisposableDrain(1);
   });
   process.on("unhandledRejection", (reason) => {
@@ -182,7 +199,13 @@ const main = async (): Promise<void> => {
       return;
     }
     logError("unhandledRejection", reason);
-    // See uncaughtException: session-host processes own their own lifecycle.
+    recordDoctorObservation({
+      code: "fatal_process",
+      producer: "process",
+      trigger: "fatal",
+      outcome: "failure",
+      error_class: "unclassified",
+    });
     exitAfterDisposableDrain(1);
   });
 
@@ -386,6 +409,9 @@ const main = async (): Promise<void> => {
         // and it carries the real sandbox posture this process applied at boot —
         // which `openllmd status` can't compute itself. Secret-free subset of
         // `computeStatus()`; see `health.ts`. Shares the loopback CORS grant.
+        if (isDoctorLocalPath(url.pathname)) {
+          return handleDoctorLocal(req);
+        }
         if (url.pathname === "/status") {
           if (isPreflight(req)) return preflightResponse(req);
           const headers = new Headers(corsHeaders(req));

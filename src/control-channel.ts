@@ -41,6 +41,10 @@ import {
   createDeviceLimitBackoff,
   deviceLimitBackoffConfig,
 } from "./device-limit-backoff";
+import {
+  noteControlChannelClose,
+  noteControlChannelProtocolFailure,
+} from "./doctor-report/hooks";
 import { daemonApiKeyId, daemonEnv } from "./env";
 import { createHeartbeat } from "./heartbeat";
 import { logDebug, logError, logInfo, logWarn } from "./logger";
@@ -797,6 +801,7 @@ const onFrame = (frame: TRelayFrame): void => {
       frameType: frame.type,
       err: err instanceof Error ? err.message : String(err),
     });
+    noteControlChannelProtocolFailure();
   }
 };
 
@@ -1176,10 +1181,10 @@ export const startControlChannel = (): void => {
       );
       return;
     }
+    const clean = ev.code === 1000 || ev.code === 1001;
     // 4003 = relay rejected our ticket (usually a NEON_AUTH_COOKIE_SECRET
     // mismatch); 1006 = relay unreachable. 1000/1001 = relay cycling. partysocket
     // reconnects automatically in all cases.
-    const clean = ev.code === 1000 || ev.code === 1001;
     const line = `socket closed code=${ev.code}${ev.reason ? ` reason=${ev.reason}` : ""}${clean ? "" : " (reconnecting)"}`;
     // A clean close (relay cycling its box, or our own graceful stop) is routine
     // → debug. An abnormal close (1006 unreachable, 4003 rejected ticket) is a
@@ -1190,6 +1195,11 @@ export const startControlChannel = (): void => {
     } else if (line !== lastCloseLine) {
       lastCloseLine = line;
       logWarn("control-channel", line);
+      noteControlChannelClose({
+        code: ev.code,
+        superseded: false,
+        clean: false,
+      });
     }
   };
 };

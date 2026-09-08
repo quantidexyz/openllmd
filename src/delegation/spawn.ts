@@ -23,6 +23,51 @@ import {
   timeoutCallbackLatenessMs,
 } from "../deadline-budget";
 import { logDebug, logError, logWarn } from "../logger";
+
+const noteNativeAuthTimeout = (input: {
+  readonly trigger: "native_login" | "capture";
+  readonly operation: "native_auth" | "capture";
+  readonly timings: {
+    readonly configured_timeout_ms: number;
+    readonly spawn_elapsed_ms: number;
+    readonly budget_remaining_ms_at_spawn: number;
+    readonly timeout_callback_lateness_ms: number;
+    readonly cleanup_ms: number;
+    readonly stdout_closed: boolean;
+    readonly root_exited: boolean;
+    readonly root_exit_code?: number;
+    readonly stderr_closed?: boolean;
+  };
+}): void => {
+  queueMicrotask(() => {
+    void import("../doctor-report")
+      .then((m) => {
+        m.observeDoctorEvent({
+          code: "native_auth_timeout",
+          producer: "spawn",
+          trigger: input.trigger,
+          outcome: "timeout",
+          operation: input.operation,
+          error_class: "timeout",
+          timings: {
+            ...input.timings,
+            timeout_callback_lateness_ms: Math.max(
+              0,
+              input.timings.timeout_callback_lateness_ms,
+            ),
+            spawn_elapsed_ms: Math.max(0, input.timings.spawn_elapsed_ms),
+            cleanup_ms: Math.max(0, input.timings.cleanup_ms),
+            budget_remaining_ms_at_spawn: Math.max(
+              0,
+              input.timings.budget_remaining_ms_at_spawn,
+            ),
+          },
+        });
+      })
+      .catch(() => {});
+  });
+};
+
 import { currentTickId } from "../op-context";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { daemonTempDir } from "../sandbox/working-set";
@@ -458,6 +503,26 @@ export const runCaptureResult = async (
             ? { argv: redactSensitiveArgv(argv) }
             : {}),
         });
+        noteNativeAuthTimeout({
+          trigger: opts?.producer !== undefined ? "native_login" : "capture",
+          operation: opts?.producer !== undefined ? "native_auth" : "capture",
+          timings: {
+            configured_timeout_ms: configuredTimeoutMs,
+            spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
+            budget_remaining_ms_at_spawn: remainingAtSpawn,
+            timeout_callback_lateness_ms: timeoutCallbackLatenessMs(
+              armed,
+              fired,
+              timerDelayMs,
+            ),
+            cleanup_ms: cleanupMs,
+            stdout_closed: stdoutClosedAtRace,
+            root_exited: rootExitedAtRace,
+            ...(typeof rootExitCodeAtRace === "number"
+              ? { root_exit_code: rootExitCodeAtRace }
+              : {}),
+          },
+        });
         return { kind: "timeout" };
       }
       if (outcome.kind === "aborted") {
@@ -751,6 +816,27 @@ export const spawnLogin = async (
       ...(loginOpts?.operationId !== undefined
         ? { operation_id: loginOpts.operationId }
         : {}),
+    });
+    noteNativeAuthTimeout({
+      trigger: "native_login",
+      operation: "native_auth",
+      timings: {
+        configured_timeout_ms: timeoutMs,
+        spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
+        budget_remaining_ms_at_spawn: remainingAtSpawn,
+        timeout_callback_lateness_ms: timeoutCallbackLatenessMs(
+          armed,
+          fired,
+          timerDelayMs,
+        ),
+        cleanup_ms: opts.cleanupMs,
+        stdout_closed: opts.stdoutClosed,
+        stderr_closed: opts.stderrClosed,
+        root_exited: opts.rootExited,
+        ...(typeof opts.rootExitCode === "number"
+          ? { root_exit_code: opts.rootExitCode }
+          : {}),
+      },
     });
   };
 
