@@ -22,52 +22,8 @@ import {
   splitReapBudget,
   timeoutCallbackLatenessMs,
 } from "../deadline-budget";
+import { noteNativeAuthTimeout } from "../doctor-report/hooks";
 import { logDebug, logError, logWarn } from "../logger";
-
-const noteNativeAuthTimeout = (input: {
-  readonly trigger: "native_login" | "capture" | "refresh" | "status_poll";
-  readonly operation: "native_auth" | "capture" | "refresh" | "probe";
-  readonly timings: {
-    readonly configured_timeout_ms: number;
-    readonly spawn_elapsed_ms: number;
-    readonly budget_remaining_ms_at_spawn: number;
-    readonly timeout_callback_lateness_ms: number;
-    readonly cleanup_ms: number;
-    readonly stdout_closed: boolean;
-    readonly root_exited: boolean;
-    readonly root_exit_code?: number;
-    readonly stderr_closed?: boolean;
-  };
-}): void => {
-  queueMicrotask(() => {
-    void import("../doctor-report")
-      .then((m) => {
-        m.observeDoctorEvent({
-          code: "native_auth_timeout",
-          producer: "spawn",
-          trigger: input.trigger,
-          outcome: "timeout",
-          operation: input.operation,
-          error_class: "timeout",
-          timings: {
-            ...input.timings,
-            timeout_callback_lateness_ms: Math.max(
-              0,
-              input.timings.timeout_callback_lateness_ms,
-            ),
-            spawn_elapsed_ms: Math.max(0, input.timings.spawn_elapsed_ms),
-            cleanup_ms: Math.max(0, input.timings.cleanup_ms),
-            budget_remaining_ms_at_spawn: Math.max(
-              0,
-              input.timings.budget_remaining_ms_at_spawn,
-            ),
-          },
-        });
-      })
-      .catch(() => {});
-  });
-};
-
 import { currentTickId } from "../op-context";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { daemonTempDir } from "../sandbox/working-set";

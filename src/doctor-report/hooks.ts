@@ -197,3 +197,83 @@ export const runDoctorHookPromise = (work: Promise<unknown>): Promise<void> =>
     () => undefined,
     () => undefined,
   );
+
+export const noteNativeAuthTimeout = (input: {
+  readonly trigger: "native_login" | "capture" | "refresh" | "status_poll";
+  readonly operation: "native_auth" | "capture" | "refresh" | "probe";
+  readonly timings: {
+    readonly configured_timeout_ms: number;
+    readonly spawn_elapsed_ms: number;
+    readonly budget_remaining_ms_at_spawn: number;
+    readonly timeout_callback_lateness_ms: number;
+    readonly cleanup_ms: number;
+    readonly stdout_closed: boolean;
+    readonly root_exited: boolean;
+    readonly root_exit_code?: number;
+    readonly stderr_closed?: boolean;
+  };
+}): void => {
+  try {
+    observeDoctorEvent({
+      code: "native_auth_timeout",
+      producer: "spawn",
+      trigger: input.trigger,
+      outcome: "timeout",
+      operation: input.operation,
+      error_class: "timeout",
+      timings: {
+        ...input.timings,
+        timeout_callback_lateness_ms: Math.max(
+          0,
+          input.timings.timeout_callback_lateness_ms,
+        ),
+        spawn_elapsed_ms: Math.max(0, input.timings.spawn_elapsed_ms),
+        cleanup_ms: Math.max(0, input.timings.cleanup_ms),
+        budget_remaining_ms_at_spawn: Math.max(
+          0,
+          input.timings.budget_remaining_ms_at_spawn,
+        ),
+      },
+    });
+  } catch {
+    // Diagnostics must not affect native authentication.
+  }
+};
+
+export const noteRefreshFailure = (opts: {
+  readonly provider: string;
+  readonly errorClass: string;
+  readonly spawnElapsedMs: number | null;
+  readonly timeoutMs: number;
+  readonly exitCode: number | undefined;
+}): void => {
+  if (opts.errorClass === "abandoned") return;
+  const provider = asDoctorProvider(opts.provider);
+  try {
+    observeDoctorEvent({
+      code: "refresh_failure",
+      producer: "refresh",
+      trigger: "refresh",
+      outcome: opts.errorClass === "timeout" ? "timeout" : "failure",
+      operation: "refresh",
+      error_class:
+        opts.errorClass === "timeout"
+          ? "timeout"
+          : opts.errorClass === "spawn_failed"
+            ? "spawn_denied"
+            : "unclassified",
+      ...(provider !== undefined ? { provider } : {}),
+      timings: {
+        ...(opts.spawnElapsedMs !== null
+          ? { spawn_elapsed_ms: opts.spawnElapsedMs }
+          : {}),
+        configured_timeout_ms: opts.timeoutMs,
+        ...(typeof opts.exitCode === "number"
+          ? { root_exit_code: opts.exitCode }
+          : {}),
+      },
+    });
+  } catch {
+    // Diagnostics must not affect credential refresh.
+  }
+};

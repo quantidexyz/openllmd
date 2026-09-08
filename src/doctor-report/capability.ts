@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import {
   DOCTOR_LOCAL_CAPABILITY_FILENAME,
   DOCTOR_LOCAL_CAPABILITY_HEADER,
@@ -51,12 +51,10 @@ export const readDoctorCapability = (): string | null => {
 export const capabilityMatches = (presented: string | null): boolean => {
   const expected = readDoctorCapability();
   if (expected === null || presented === null) return false;
-  if (expected.length !== presented.length) return false;
-  let mismatch = 0;
-  for (let i = 0; i < expected.length; i++) {
-    mismatch |= expected.charCodeAt(i) ^ presented.charCodeAt(i);
-  }
-  return mismatch === 0;
+  const expectedBytes = Buffer.from(expected);
+  const presentedBytes = Buffer.from(presented);
+  if (expectedBytes.length !== presentedBytes.length) return false;
+  return timingSafeEqual(expectedBytes, presentedBytes);
 };
 
 export const resetDoctorCapabilityForTests = (): void => {

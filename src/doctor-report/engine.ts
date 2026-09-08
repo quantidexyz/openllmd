@@ -608,7 +608,7 @@ const flushLocked = async (
     });
   }
 
-  writePending({
+  const pendingWritten = writePending({
     report,
     created_at_ms: clock(),
     origin_scope: scope.originScope,
@@ -627,7 +627,7 @@ const flushLocked = async (
       gap_count: collected.gapCount,
       legacy_records_skipped: collected.legacySkipped,
       daemon_versions: versionsOf(report.events),
-      pending: true,
+      pending: pendingWritten,
     };
   }
 
@@ -647,7 +647,7 @@ const flushLocked = async (
         gap_count: collected.gapCount,
         legacy_records_skipped: collected.legacySkipped,
         daemon_versions: versionsOf(report.events),
-        pending: true,
+        pending: pendingWritten,
       };
     }
     if (result.kind === "ack") {
@@ -717,7 +717,7 @@ const flushLocked = async (
       gap_count: collected.gapCount,
       legacy_records_skipped: collected.legacySkipped,
       daemon_versions: versionsOf(report.events),
-      pending: true,
+      pending: pendingWritten,
     };
   } finally {
     if (activeUploadId === uploadId) inFlight = false;

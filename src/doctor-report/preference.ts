@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import type { TDoctorLocalPreference } from "@openllmsh/protocol";
 import {
   DOCTOR_LOCAL_OPT_OUT_FILENAME,
@@ -37,5 +38,7 @@ export const clearLocalPreference = (): void => {
  */
 export const localDisableSticky = (): boolean => {
   const pref = readLocalPreference();
-  return pref !== null && pref.enabled === false;
+  return pref === null
+    ? existsSync(doctorLocalPreferencePath())
+    : pref.enabled === false;
 };
