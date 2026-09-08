@@ -9,7 +9,7 @@ import type {
 } from "@openllmsh/protocol";
 import { observeDoctorEvent } from "./engine";
 
-const asProvider = (slug: string): TDoctorProvider | undefined => {
+export const asDoctorProvider = (slug: string): TDoctorProvider | undefined => {
   if (
     slug === "claude_code" ||
     slug === "chatgpt" ||
@@ -22,26 +22,22 @@ const asProvider = (slug: string): TDoctorProvider | undefined => {
   return undefined;
 };
 
-export const noteControlChannelClose = (opts: {
-  readonly code: number;
-  readonly superseded: boolean;
-  readonly clean: boolean;
-}): void => {
-  if (opts.superseded || opts.clean) return;
-  observeDoctorEvent({
-    code:
-      opts.code === 4003
-        ? "control_channel_protocol_failure"
-        : "control_channel_unexpected_disconnect",
-    producer: "control_channel",
-    trigger: "reconnect",
-    outcome: opts.code === 4003 ? "protocol_error" : "disconnect",
-    operation: "reconnect",
-    error_class: opts.code === 4003 ? "protocol_failure" : "transport_connect",
-  });
-};
+const PROTOCOL_FAILURE_COOLDOWN_MS = 60_000;
+let lastProtocolFailureAtMs = 0;
+let protocolFailureStreak = 0;
 
-export const noteControlChannelProtocolFailure = (): void => {
+const noteProtocolFailure = (): void => {
+  const now = Date.now();
+  protocolFailureStreak += 1;
+  if (
+    lastProtocolFailureAtMs !== 0 &&
+    now - lastProtocolFailureAtMs < PROTOCOL_FAILURE_COOLDOWN_MS
+  ) {
+    return;
+  }
+  lastProtocolFailureAtMs = now;
+  const n = protocolFailureStreak;
+  protocolFailureStreak = 0;
   observeDoctorEvent({
     code: "control_channel_protocol_failure",
     producer: "control_channel",
@@ -49,7 +45,32 @@ export const noteControlChannelProtocolFailure = (): void => {
     outcome: "protocol_error",
     operation: "reconnect",
     error_class: "protocol_failure",
+    ...(n > 1 ? { timings: { repeat_count: n } } : {}),
   });
+};
+
+export const noteControlChannelClose = (opts: {
+  readonly code: number;
+  readonly superseded: boolean;
+  readonly clean: boolean;
+}): void => {
+  if (opts.superseded || opts.clean) return;
+  if (opts.code === 4003) {
+    noteProtocolFailure();
+    return;
+  }
+  observeDoctorEvent({
+    code: "control_channel_unexpected_disconnect",
+    producer: "control_channel",
+    trigger: "reconnect",
+    outcome: "disconnect",
+    operation: "reconnect",
+    error_class: "transport_connect",
+  });
+};
+
+export const noteControlChannelProtocolFailure = (): void => {
+  noteProtocolFailure();
 };
 
 export const noteLoginTerminal = (opts: {
@@ -57,7 +78,7 @@ export const noteLoginTerminal = (opts: {
   readonly provider: string;
 }): void => {
   if (opts.code === "user_cancelled") return;
-  const provider = asProvider(opts.provider);
+  const provider = asDoctorProvider(opts.provider);
   const watchdog =
     opts.code === "poll_expired" || opts.code === "prompt_timeout";
   observeDoctorEvent({
@@ -82,6 +103,8 @@ const cliFailStreak = new Map<string, number>();
 
 export const resetCliInstallDoctorStreakForTests = (): void => {
   cliFailStreak.clear();
+  lastProtocolFailureAtMs = 0;
+  protocolFailureStreak = 0;
 };
 
 export const noteCliInstallProbeResult = (opts: {
@@ -96,7 +119,7 @@ export const noteCliInstallProbeResult = (opts: {
   const n = (cliFailStreak.get(opts.provider) ?? 0) + 1;
   cliFailStreak.set(opts.provider, n);
   if (n !== 3) return;
-  const provider = asProvider(opts.provider);
+  const provider = asDoctorProvider(opts.provider);
   observeDoctorEvent({
     code: "cli_install_repeated_failure",
     producer: "cli_install",
@@ -104,7 +127,7 @@ export const noteCliInstallProbeResult = (opts: {
     outcome: "failure",
     operation: "install",
     ...(provider !== undefined ? { provider } : {}),
-    error_class: "timeout",
+    error_class: "unclassified",
     timings: { repeat_count: n },
   });
 };
@@ -155,12 +178,22 @@ export const noteWalkerStreamTerminal = (opts: {
   readonly err: unknown;
 }): void => {
   if (opts.aborted) return;
-  observeDoctorEvent({
-    code: opts.hang ? "stream_hang_watchdog" : "stream_unexpected_failure",
-    producer: "walker",
-    trigger: "stream",
-    outcome: opts.hang ? "hang" : "failure",
-    operation: "stream",
-    error_class: opts.hang ? "watchdog" : classifyWalkerTransport(opts.err),
-  });
+  try {
+    observeDoctorEvent({
+      code: opts.hang ? "stream_hang_watchdog" : "stream_unexpected_failure",
+      producer: "walker",
+      trigger: "stream",
+      outcome: opts.hang ? "hang" : "failure",
+      operation: "stream",
+      error_class: opts.hang ? "watchdog" : classifyWalkerTransport(opts.err),
+    });
+  } catch {
+    // reporting failure must not affect the stream
+  }
 };
+
+export const runDoctorHookPromise = (work: Promise<unknown>): Promise<void> =>
+  work.then(
+    () => undefined,
+    () => undefined,
+  );

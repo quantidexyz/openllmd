@@ -25,8 +25,8 @@ import {
 import { logDebug, logError, logWarn } from "../logger";
 
 const noteNativeAuthTimeout = (input: {
-  readonly trigger: "native_login" | "capture";
-  readonly operation: "native_auth" | "capture";
+  readonly trigger: "native_login" | "capture" | "refresh" | "status_poll";
+  readonly operation: "native_auth" | "capture" | "refresh" | "probe";
   readonly timings: {
     readonly configured_timeout_ms: number;
     readonly spawn_elapsed_ms: number;
@@ -504,8 +504,22 @@ export const runCaptureResult = async (
             : {}),
         });
         noteNativeAuthTimeout({
-          trigger: opts?.producer !== undefined ? "native_login" : "capture",
-          operation: opts?.producer !== undefined ? "native_auth" : "capture",
+          trigger:
+            opts?.producer === "claude-refresh"
+              ? "refresh"
+              : opts?.producer === "claude-auth-status"
+                ? "status_poll"
+                : opts?.producer !== undefined
+                  ? "native_login"
+                  : "capture",
+          operation:
+            opts?.producer === "claude-refresh"
+              ? "refresh"
+              : opts?.producer === "claude-auth-status"
+                ? "probe"
+                : opts?.producer !== undefined
+                  ? "native_auth"
+                  : "capture",
           timings: {
             configured_timeout_ms: configuredTimeoutMs,
             spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,

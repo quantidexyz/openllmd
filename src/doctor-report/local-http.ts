@@ -34,15 +34,63 @@ const json = (status: number, body: unknown): Response =>
     },
   });
 
-const loopbackHost = (host: string | null): boolean => {
-  if (host === null || host.trim() === "") return false;
-  const hostname = host.trim().toLowerCase().split("]")[0]?.replace(/^\[/, "");
-  const name = (hostname ?? host).split(":")[0] ?? "";
-  return name === "127.0.0.1" || name === "localhost" || name === "::1";
+const portOk = (port: string): boolean => {
+  if (!/^\d{1,5}$/.test(port)) return false;
+  const n = Number(port);
+  return n >= 1 && n <= 65535;
 };
 
-const authorizeLocalDoctor = (req: Request): Response | null => {
-  if (!loopbackHost(req.headers.get("host"))) {
+/** Strict Host allow-list: loopback only. Rejects userinfo, extras, remotes. */
+export const isLoopbackDoctorHost = (host: string | null): boolean => {
+  if (host === null) return false;
+  const raw = host.trim().toLowerCase();
+  if (raw === "" || raw.includes("@") || /\s/.test(raw)) return false;
+  if (raw.startsWith("[")) {
+    const close = raw.indexOf("]");
+    if (close <= 1) return false;
+    const name = raw.slice(1, close);
+    const rest = raw.slice(close + 1);
+    if (name !== "::1") return false;
+    if (rest === "") return true;
+    return rest.startsWith(":") && portOk(rest.slice(1));
+  }
+  if (raw.includes("]")) return false;
+  const parts = raw.split(":");
+  if (parts.length > 2) return false;
+  const name = parts[0] ?? "";
+  if (name !== "127.0.0.1" && name !== "localhost") return false;
+  const port = parts[1];
+  if (port === undefined) return true;
+  return portOk(port);
+};
+
+const capabilityDeniedBody = (pathname: string): Record<string, unknown> => {
+  if (pathname === DOCTOR_LOCAL_STATUS_PATH) {
+    return {
+      local_enabled: false,
+      account_enabled: false,
+      pending_account_sync: false,
+      unavailable_reason: "capability_missing",
+    };
+  }
+  return {
+    nothing_new: true,
+    dry_run: false,
+    accepted_count: 0,
+    skipped_count: 0,
+    gap_count: 0,
+    legacy_records_skipped: 0,
+    daemon_versions: [],
+    pending: false,
+    unavailable_reason: "capability_missing",
+  };
+};
+
+const authorizeLocalDoctor = (
+  req: Request,
+  pathname: string,
+): Response | null => {
+  if (!isLoopbackDoctorHost(req.headers.get("host"))) {
     return json(403, { error: "forbidden" });
   }
   if (req.headers.get("origin") !== null) {
@@ -50,17 +98,7 @@ const authorizeLocalDoctor = (req: Request): Response | null => {
   }
   const presented = req.headers.get(DOCTOR_LOCAL_CAPABILITY_HEADER);
   if (!capabilityMatches(presented)) {
-    return json(403, {
-      nothing_new: true,
-      dry_run: false,
-      accepted_count: 0,
-      skipped_count: 0,
-      gap_count: 0,
-      legacy_records_skipped: 0,
-      daemon_versions: [],
-      pending: false,
-      unavailable_reason: "capability_missing",
-    });
+    return json(403, capabilityDeniedBody(pathname));
   }
   return null;
 };
@@ -91,9 +129,9 @@ export const isDoctorLocalPath = (pathname: string): boolean =>
   pathname === DOCTOR_LOCAL_PREFERENCE_PATH;
 
 export const handleDoctorLocal = async (req: Request): Promise<Response> => {
-  const denied = authorizeLocalDoctor(req);
-  if (denied !== null) return denied;
   const url = new URL(req.url);
+  const denied = authorizeLocalDoctor(req, url.pathname);
+  if (denied !== null) return denied;
   if (url.pathname === DOCTOR_LOCAL_STATUS_PATH) {
     if (req.method !== "GET") return json(405, { error: "method_not_allowed" });
     return json(200, reportingStatus());
@@ -140,7 +178,9 @@ export const handleDoctorLocal = async (req: Request): Promise<Response> => {
           ? { generation: scope.generation }
           : {}),
     };
-    writeLocalPreference(scoped);
+    if (!writeLocalPreference(scoped)) {
+      return json(500, { error: "persist_failed" });
+    }
     applyLocalPreferenceAndMaybePurge(scoped.enabled);
     return json(200, scoped);
   }

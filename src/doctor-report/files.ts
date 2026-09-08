@@ -24,6 +24,14 @@ export const doctorStateDir = (): string => stateDir();
 export const doctorStatePath = (basename: string): string =>
   join(doctorStateDir(), basename);
 
+type TAtomicWrite = (path: string, contents: string) => boolean;
+
+let atomicWriteForTests: TAtomicWrite | null = null;
+
+export const setAtomicWriteForTests = (fn: TAtomicWrite | null): void => {
+  atomicWriteForTests = fn;
+};
+
 export const ensureDoctorStateDir = (): void => {
   mkdirSync(doctorStateDir(), { recursive: true, mode: DIR_MODE });
   try {
@@ -42,6 +50,7 @@ export const readTextFile = (path: string): string | null => {
 };
 
 export const atomicWriteText = (path: string, contents: string): boolean => {
+  if (atomicWriteForTests !== null) return atomicWriteForTests(path, contents);
   try {
     ensureDoctorStateDir();
     const tmp = `${path}.${process.pid}.tmp`;

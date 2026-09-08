@@ -1473,13 +1473,15 @@ const serveSubscription = async (
   const recordStreamFailure = (err: unknown): void => {
     if (args.req.signal.aborted) return;
     if (isClientHangUp(err)) return;
-    void import("./doctor-report/hooks").then((m) =>
-      m.noteWalkerStreamTerminal({
-        aborted: false,
-        hang: false,
-        err,
-      }),
-    );
+    void import("./doctor-report/hooks")
+      .then((m) =>
+        m.noteWalkerStreamTerminal({
+          aborted: false,
+          hang: false,
+          err,
+        }),
+      )
+      .catch(() => {});
     report(
       {
         ...baseRow,

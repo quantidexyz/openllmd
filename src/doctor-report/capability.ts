@@ -6,6 +6,8 @@ import {
 import { atomicWriteText, doctorStatePath, readTextFile } from "./files";
 
 let cachedToken: string | null = null;
+/** This boot's mint failed after bind — do not honor a leftover file token. */
+let mintFailedClosed = false;
 
 export const doctorCapabilityPath = (): string =>
   doctorStatePath(DOCTOR_LOCAL_CAPABILITY_FILENAME);
@@ -14,17 +16,29 @@ export const doctorCapabilityHeaderName = (): string =>
   DOCTOR_LOCAL_CAPABILITY_HEADER;
 
 /** Mint a per-boot owner-only capability. Local FS only — never network. */
-export const mintDoctorCapability = (): string => {
+export const mintDoctorCapability = (): boolean => {
   const token = randomBytes(32).toString("hex");
   if (!atomicWriteText(doctorCapabilityPath(), `${token}\n`)) {
     cachedToken = null;
-    return token;
+    mintFailedClosed = true;
+    return false;
   }
+  mintFailedClosed = false;
   cachedToken = token;
-  return token;
+  return true;
+};
+
+/**
+ * Rotate the capability only after the loopback listener is bound.
+ * A failed bind must not clobber a live process's token.
+ */
+export const onDoctorListenAttempt = (bound: boolean): boolean => {
+  if (!bound) return false;
+  return mintDoctorCapability();
 };
 
 export const readDoctorCapability = (): string | null => {
+  if (mintFailedClosed) return null;
   if (cachedToken !== null) return cachedToken;
   const raw = readTextFile(doctorCapabilityPath());
   if (raw === null) return null;
@@ -47,4 +61,5 @@ export const capabilityMatches = (presented: string | null): boolean => {
 
 export const resetDoctorCapabilityForTests = (): void => {
   cachedToken = null;
+  mintFailedClosed = false;
 };

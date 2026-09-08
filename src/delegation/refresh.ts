@@ -15,8 +15,8 @@
  * valid (within the leeway window) and only AWAITS it once the token is already
  * hard-expired — exactly "no latency unless the refresh is close".
  */
-import type { TDoctorProvider } from "@openllmsh/protocol";
 import type { TDoctorObservationInput } from "../doctor-report";
+import { asDoctorProvider } from "../doctor-report/hooks";
 import { logDebug, logInfo, logWarn } from "../logger";
 import type { TRefreshCaller } from "../op-context";
 import {
@@ -761,14 +761,7 @@ export const makeRefresher = (opts: {
                       error_class: "unclassified" as const,
                       outcome: "failure" as const,
                     };
-            const provider: TDoctorProvider | undefined =
-              opts.slug === "claude_code" ||
-              opts.slug === "chatgpt" ||
-              opts.slug === "kimi_code" ||
-              opts.slug === "grok" ||
-              opts.slug === "cursor"
-                ? opts.slug
-                : undefined;
+            const provider = asDoctorProvider(opts.slug);
             const observation: TDoctorObservationInput = {
               code: "refresh_failure",
               producer: "refresh",
@@ -779,7 +772,7 @@ export const makeRefresher = (opts: {
               ...(provider !== undefined ? { provider } : {}),
               timings: {
                 ...(clocks.spawn_elapsed_ms !== null
-                  ? { elapsed_ms: clocks.spawn_elapsed_ms }
+                  ? { spawn_elapsed_ms: clocks.spawn_elapsed_ms }
                   : {}),
                 configured_timeout_ms: timeout_ms,
                 ...(typeof triggerError?.exitCode === "number"

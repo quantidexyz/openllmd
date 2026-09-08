@@ -63,7 +63,7 @@ import {
   handleDoctorLocal,
   initDoctorCursorAtTail,
   isDoctorLocalPath,
-  mintDoctorCapability,
+  onDoctorListenAttempt,
   recordDoctorObservation,
 } from "./doctor-report";
 import {
@@ -107,7 +107,6 @@ const main = async (): Promise<void> => {
   // `daemonPort()` loads the env file, so the kill-switch / opt-in vars are
   // resolved before the sandbox decision.
   const port = daemonPort();
-  mintDoctorCapability();
   initDoctorCursorAtTail();
 
   // Crash-loop circuit breaker. The supervisor (systemd `Restart=always` /
@@ -460,8 +459,16 @@ const main = async (): Promise<void> => {
       );
       logError("boot", err);
     }
+    onDoctorListenAttempt(false);
     exitAfterDisposableDrain(1);
     return;
+  }
+
+  if (!onDoctorListenAttempt(true)) {
+    const msg =
+      "doctor capability could not be persisted; local doctor routes fail closed";
+    process.stderr.write(`openllmd: ${msg}\n`);
+    logError("boot", msg);
   }
 
   // Reap verified disposable children left by a prior daemon instance —
