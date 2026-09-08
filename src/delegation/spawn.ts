@@ -22,7 +22,7 @@ import {
   splitReapBudget,
   timeoutCallbackLatenessMs,
 } from "../deadline-budget";
-import { logError, logWarn } from "../logger";
+import { logDebug, logError, logWarn } from "../logger";
 import { currentTickId } from "../op-context";
 import { sandboxSpawnArgs } from "../sandbox/exec";
 import { daemonTempDir } from "../sandbox/working-set";
@@ -162,6 +162,8 @@ export type TRunCaptureOpts = {
    * fill memory/disk.
    */
   readonly maxBytes?: number;
+  readonly producer?: TNativeAuthProducer;
+  readonly operationId?: string;
 };
 
 /** Subscribe to `signal` abort; invoke `onAbort` immediately if already aborted. */
@@ -203,6 +205,17 @@ type TCaptureTimeoutScheduler = (
 ) => ReturnType<typeof setTimeout>;
 
 let captureTimeoutSchedulerForTests: TCaptureTimeoutScheduler | null = null;
+let loginTimeoutSchedulerForTests: TCaptureTimeoutScheduler | null = null;
+
+export type TNativeAuthProducer = "claude-refresh" | "claude-auth-status";
+
+let nativeAuthOperationSeq = 0;
+
+/** Ephemeral correlation id for one native-auth child. Not an account identity. */
+export const newNativeAuthOperationId = (): string => {
+  nativeAuthOperationSeq += 1;
+  return `na-${nativeAuthOperationSeq.toString(36)}-${Math.floor(performance.now()).toString(36)}`;
+};
 
 /**
  * Test-only: replace the capture watchdog `setTimeout`. Used to inject a
@@ -212,6 +225,16 @@ export const setCaptureTimeoutSchedulerForTests = (
   scheduler: TCaptureTimeoutScheduler | null,
 ): void => {
   captureTimeoutSchedulerForTests = scheduler;
+};
+
+/**
+ * Test-only: replace the login watchdog `setTimeout`. Used to inject a
+ * delayed fire for lateness fields. Production always uses `setTimeout`.
+ */
+export const setLoginTimeoutSchedulerForTests = (
+  scheduler: TCaptureTimeoutScheduler | null,
+): void => {
+  loginTimeoutSchedulerForTests = scheduler;
 };
 
 export type TRunCaptureResult =
@@ -258,6 +281,20 @@ export const runCaptureResult = async (
     const spawnedAtMs = performance.now();
     const spawnSetupMs = spawnedAtMs - setupStartedAtMs;
     const proc = child.subprocess;
+    if (opts?.producer !== undefined) {
+      logDebug("spawn", "native auth child started", {
+        producer: opts.producer,
+        ...(opts.operationId !== undefined
+          ? { operation_id: opts.operationId }
+          : {}),
+        phase: "start",
+        child_pid: typeof proc.pid === "number" ? proc.pid : null,
+        tick_id: currentTickId(),
+        configured_timeout_ms: captureTimeoutMs(opts.timeoutMs),
+        spawn_setup_ms: spawnSetupMs,
+        clock: "performance.now",
+      });
+    }
     const stdout = proc.stdout;
     if (stdout === undefined || typeof stdout === "number") {
       await child.terminate();
@@ -412,7 +449,14 @@ export const runCaptureResult = async (
           tick_id: currentTickId(),
           kind: spawnOptions.kind,
           probe: opts?.probe === true,
-          argv: redactSensitiveArgv(argv),
+          reason_code: "timeout",
+          ...(opts?.producer !== undefined ? { producer: opts.producer } : {}),
+          ...(opts?.operationId !== undefined
+            ? { operation_id: opts.operationId }
+            : {}),
+          ...(opts?.producer === undefined
+            ? { argv: redactSensitiveArgv(argv) }
+            : {}),
         });
         return { kind: "timeout" };
       }
@@ -528,6 +572,8 @@ export type TSpawnLoginOpts = {
   readonly onDeadline?: () => boolean | Promise<boolean>;
   /** Finite persistence grace after a true {@link TSpawnLoginOpts.onDeadline}. */
   readonly persistenceGraceMs?: number;
+  readonly producer?: TNativeAuthProducer;
+  readonly operationId?: string;
 };
 
 /**
@@ -583,11 +629,13 @@ export const spawnLogin = async (
   if (loginOpts?.signal?.aborted === true) {
     return noChildResult(true);
   }
+  const setupStartedAtMs = performance.now();
   const timeoutMs = loginOpts?.timeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS;
   const parentBudget = budgetFromSignal(loginOpts?.signal);
   const budget =
     parentBudget?.child(timeoutMs) ??
     createDeadlineBudget(timeoutMs, loginOpts?.signal);
+  const remainingAtSpawn = budget.remainingMs();
   const child = superviseSpawn(
     sandboxSpawnArgs(argv, { probe: loginOpts?.probe }),
     {
@@ -599,8 +647,25 @@ export const spawnLogin = async (
       ...(spawnEnv(env) !== undefined ? { env: spawnEnv(env) } : {}),
     },
   );
+  const spawnedAtMs = performance.now();
+  const spawnSetupMs = spawnedAtMs - setupStartedAtMs;
   const proc = child.subprocess;
   const stamp = spawnStamp(proc);
+  if (loginOpts?.producer !== undefined) {
+    logDebug("spawn", "native auth child started", {
+      producer: loginOpts.producer,
+      ...(loginOpts.operationId !== undefined
+        ? { operation_id: loginOpts.operationId }
+        : {}),
+      phase: "start",
+      child_pid: stamp.child_pid,
+      tick_id: currentTickId(),
+      configured_timeout_ms: timeoutMs,
+      remaining_at_spawn_ms: remainingAtSpawn,
+      spawn_setup_ms: spawnSetupMs,
+      clock: "performance.now",
+    });
+  }
   const stdout = proc.stdout;
   const stderr = proc.stderr;
   if (
@@ -618,6 +683,16 @@ export const spawnLogin = async (
   let abandoned = false;
   let killTimer: ReturnType<typeof setTimeout> | null = null;
   let settleTimer: ReturnType<typeof setTimeout> | null = null;
+  let timerArmedAtMs: number | null = null;
+  let timerFiredAtMs: number | null = null;
+  let timerDelayMs = remainingAtSpawn;
+  let stdoutClosed = false;
+  let stderrClosed = false;
+  let rootExitCode: number | null = null;
+  let cleanupMs: number | null = null;
+  void proc.exited.then((code) => {
+    rootExitCode = code;
+  });
   let markAbandoned!: () => void;
   const abandonedGate = new Promise<void>((resolve) => {
     markAbandoned = resolve;
@@ -633,9 +708,62 @@ export const spawnLogin = async (
     void child.terminate(splitReapBudget(budget.remainingMs()));
   };
 
+  const emitLoginTimeout = (opts: {
+    readonly stdoutClosed: boolean;
+    readonly stderrClosed: boolean;
+    readonly rootExited: boolean;
+    readonly rootExitCode: number | null;
+    readonly cleanupMs: number;
+  }): void => {
+    const raceObservedAtMs = performance.now();
+    const armed = timerArmedAtMs ?? spawnedAtMs;
+    const fired = timerFiredAtMs ?? raceObservedAtMs;
+    logWarn("spawn", "login timed out", {
+      configured_timeout_ms: timeoutMs,
+      deadline_ms: remainingAtSpawn,
+      remaining_at_spawn_ms: remainingAtSpawn,
+      budget_remaining_ms_at_spawn: remainingAtSpawn,
+      spawn_elapsed_ms: raceObservedAtMs - spawnedAtMs,
+      spawn_setup_ms: spawnSetupMs,
+      timer_armed_at_ms: armed,
+      timer_fired_at_ms: fired,
+      race_observed_at_ms: raceObservedAtMs,
+      timeout_callback_lateness_ms: timeoutCallbackLatenessMs(
+        armed,
+        fired,
+        timerDelayMs,
+      ),
+      stdout_closed: opts.stdoutClosed,
+      stderr_closed: opts.stderrClosed,
+      root_exited: opts.rootExited,
+      root_exit_code: opts.rootExitCode,
+      cleanup_ms: opts.cleanupMs,
+      clock: "performance.now",
+      child_pid: stamp.child_pid,
+      tick_id: currentTickId(),
+      kind: "login",
+      probe: loginOpts?.probe === true,
+      reason_code: "timeout",
+      abandoned: true,
+      ...(loginOpts?.producer !== undefined
+        ? { producer: loginOpts.producer }
+        : {}),
+      ...(loginOpts?.operationId !== undefined
+        ? { operation_id: loginOpts.operationId }
+        : {}),
+    });
+  };
+
   const onTimeout = (): void => {
     void (async (): Promise<void> => {
       if (abandoned) return;
+      const stdoutClosedAtDeadline = stdoutClosed;
+      const stderrClosedAtDeadline = stderrClosed;
+      const rootExitedAtDeadline =
+        rootExitCode !== null ||
+        proc.exitCode !== null ||
+        proc.signalCode !== null;
+      const rootExitCodeAtDeadline = rootExitCode ?? proc.exitCode;
       const defer = await awaitOnDeadline(loginOpts?.onDeadline);
       if (abandoned) return;
       if (defer) {
@@ -651,15 +779,35 @@ export const spawnLogin = async (
         if (abandoned) return;
         if (proc.exitCode !== null || proc.signalCode !== null) return;
       }
+      const cleanupStartedAtMs = performance.now();
       kill();
+      await child.terminate(splitReapBudget(budget.remainingMs()));
+      cleanupMs = performance.now() - cleanupStartedAtMs;
+      emitLoginTimeout({
+        stdoutClosed: stdoutClosedAtDeadline,
+        stderrClosed: stderrClosedAtDeadline,
+        rootExited: rootExitedAtDeadline,
+        rootExitCode: rootExitCodeAtDeadline,
+        cleanupMs,
+      });
     })();
   };
-  killTimer = setTimeout(onTimeout, budget.remainingMs());
+  const scheduleTimeout =
+    loginTimeoutSchedulerForTests ??
+    ((callback: () => void, delayMs: number): ReturnType<typeof setTimeout> =>
+      setTimeout(callback, delayMs));
+  timerDelayMs = budget.remainingMs();
+  timerArmedAtMs = performance.now();
+  killTimer = scheduleTimeout(() => {
+    timerFiredAtMs = performance.now();
+    onTimeout();
+  }, timerDelayMs);
   const unbindAbort = bindAbort(opts?.signal, kill);
 
   const pump = async (
     stream: ReadableStream<Uint8Array>,
     onChunk: (s: string) => void,
+    onClose: () => void,
   ): Promise<void> => {
     const reader = stream.getReader();
     readers.push(reader);
@@ -667,7 +815,11 @@ export const spawnLogin = async (
       for (;;) {
         if (abandoned) break;
         const { done, value } = await reader.read();
-        if (done || abandoned) break;
+        if (done) {
+          onClose();
+          break;
+        }
+        if (abandoned) break;
         if (value !== undefined) onChunk(dec.decode(value));
         // Early-return once the awaited output appears (the child may never exit
         // cleanly — it can WEDGE after printing the token). Match the COMBINED
@@ -697,12 +849,24 @@ export const spawnLogin = async (
 
   await Promise.race([
     Promise.all([
-      pump(stdout, (s) => {
-        out += s;
-      }),
-      pump(stderr, (s) => {
-        err += s;
-      }),
+      pump(
+        stdout,
+        (s) => {
+          out += s;
+        },
+        () => {
+          stdoutClosed = true;
+        },
+      ),
+      pump(
+        stderr,
+        (s) => {
+          err += s;
+        },
+        () => {
+          stderrClosed = true;
+        },
+      ),
       proc.exited,
     ]),
     abandonedGate,
@@ -717,6 +881,20 @@ export const spawnLogin = async (
   // Only surface a SIGNAL kill we did NOT cause (a sandbox/OS kill) — our own
   // `until`/timeout kill is expected and its output is valid.
   if (!abandoned) logIfKilled(argv, proc, { confined: opts?.probe !== true });
+  if (loginOpts?.producer !== undefined) {
+    logDebug("spawn", "native auth child finished", {
+      producer: loginOpts.producer,
+      ...(loginOpts.operationId !== undefined
+        ? { operation_id: loginOpts.operationId }
+        : {}),
+      phase: "result",
+      reason_code: abandoned ? "abandoned" : "complete",
+      abandoned,
+      child_pid: stamp.child_pid,
+      tick_id: currentTickId(),
+      clock: "performance.now",
+    });
+  }
   // Join with a newline, NOT bare concatenation: a token printed as the last
   // bytes of stdout (no trailing newline) must not fuse with the first bytes
   // of stderr, or a greedy token match would swallow the spillover.

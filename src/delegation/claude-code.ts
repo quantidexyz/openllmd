@@ -94,6 +94,7 @@ import {
   ensureKeychainReady,
   grantKeychainToolAccess,
   keychainStoreIdentity,
+  newNativeAuthOperationId,
   observeKeychainReady,
   readIsolatedKeychain,
   readJsonStore,
@@ -236,6 +237,7 @@ const triggerRefresh = async (): Promise<void> => {
   // A locked/unusable isolated keychain must NOT reach `claude -p ping`: the
   // vendor CLI would open it and pop the SecurityAgent dialog (and it can't
   // refresh a credential it can't read). Skip when not ready.
+  const operationId = newNativeAuthOperationId();
   const keychain = await ensureKeychainReady(cliHome(PROVIDER));
   if (!keychainRefreshSpawnAllowed(PROVIDER, keychain)) return;
   clearAuthStatusCache();
@@ -245,6 +247,8 @@ const triggerRefresh = async (): Promise<void> => {
   await spawnRefresh([bin(), "-p", "ping"], env(), {
     probe: unwrapKeychainSpawn(PROVIDER),
     timeoutMs: 10_000,
+    producer: "claude-refresh",
+    operationId,
     // Darwin keychain snapshots are not a verified generation/account fence
     // without extra security(1) work; retain bounded abandoned failure there.
     ...(platform() === "darwin"
@@ -597,6 +601,8 @@ const authStatusLoggedIn = async (
       const out = await runCaptureResult([bin(), "auth", "status"], env(), {
         probe: unwrapKeychainSpawn(PROVIDER),
         timeoutMs: AUTH_STATUS_TIMEOUT_MS,
+        producer: "claude-auth-status",
+        operationId: newNativeAuthOperationId(),
       });
       if (out.kind === "timeout") return { kind: "timeout" };
       if (out.kind !== "ok") return { kind: "value", result: null };

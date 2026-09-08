@@ -23,6 +23,7 @@ import {
   refreshCallerBag,
   refreshSpawnBag,
 } from "../op-context";
+import type { TNativeAuthProducer } from "./spawn";
 import { DEADLINE_CHECK_CAP_MS, spawnLogin, spawnLoginPty } from "./spawn";
 import type { TLoginResult, TStoreRead } from "./util";
 
@@ -439,6 +440,8 @@ export const spawnRefresh = async (
     readonly signal?: AbortSignal;
     readonly readStore?: () => Promise<TRefreshCredentialSnapshot | null>;
     readonly persistenceGraceMs?: number;
+    readonly producer?: TNativeAuthProducer;
+    readonly operationId?: string;
   },
 ): Promise<void> => {
   const run = opts?.pty === true ? spawnLoginPty : spawnLogin;
@@ -451,6 +454,10 @@ export const spawnRefresh = async (
   const result = await run([...argv], env, {
     timeoutMs,
     probe: opts?.probe,
+    ...(opts?.producer !== undefined ? { producer: opts.producer } : {}),
+    ...(opts?.operationId !== undefined
+      ? { operationId: opts.operationId }
+      : {}),
     ...(opts?.readStore !== undefined
       ? {
           persistenceGraceMs: graceMs,
