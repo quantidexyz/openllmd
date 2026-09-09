@@ -29,7 +29,7 @@ import {
   reportingPolicyAllowsUpload,
 } from "@openllmsh/protocol";
 import { InvalidApiKeyError, NoApiKeyError } from "../cloud-client";
-import { getReportingPolicy } from "../config";
+import { getReportingPolicy, getReportingPolicyRevision } from "../config";
 import { daemonApiKeyId, daemonEnv, hasApiKey } from "../env";
 import { DAEMON_VERSION } from "../version";
 import {
@@ -38,13 +38,7 @@ import {
   readTextFile,
   removeFile,
 } from "./files";
-import { isDevDaemonVersion } from "./platform";
-
-import {
-  localDisableSticky,
-  readLocalPreference,
-  writeLocalPreference,
-} from "./preference";
+import { localDisableSticky, readLocalPreference } from "./preference";
 import type { TDoctorObservationInput } from "./record";
 import {
   diagnosticsLogPath,
@@ -96,7 +90,9 @@ let backoffTimer: ReturnType<typeof setTimeout> | null = null;
 let backoffMs = 1_000;
 let inFlight = false;
 let activeUploadId = 0;
-let lastPolicyAllowed = false;
+let cloudSuspended = false;
+let revokedAtPolicyRevision: number | null = null;
+let transitionRevision = 0;
 let scheduleTimer: (
   fn: () => void,
   ms: number,
@@ -257,11 +253,12 @@ const cursorMatchesScope = (
   cursor.generation === scope.generation;
 
 const uploadAllowed = (): boolean => {
+  if (process.env.NODE_ENV === "development") return false;
   const scope = reportingScope();
   if (!hasApiKey()) return false;
   if (!reportingPolicyAllowsUpload(scope.policy, clock())) return false;
   if (localDisableSticky()) return false;
-  if (isDevDaemonVersion(DAEMON_VERSION) && uploadImpl === null) return false;
+  if (cloudSuspended || revokedAtPolicyRevision !== null) return false;
   return true;
 };
 
@@ -634,8 +631,17 @@ const flushLocked = async (
   const uploadId = activeUploadId + 1;
   activeUploadId = uploadId;
   inFlight = true;
+  const uploadRevision = transitionRevision;
   try {
     const result = await (uploadImpl ?? defaultUpload)(report);
+    if (
+      uploadRevision !== transitionRevision ||
+      !cursorMatchesScope(cursorAfter, reportingScope()) ||
+      !uploadAllowed()
+    ) {
+      if (uploadRevision === transitionRevision) discardReportingWindow();
+      return emptyResult({ dry_run: false, report_id: report.report_id });
+    }
     if (result.kind === "ack" && !ackMatchesBatch(report, result.ack)) {
       scheduleRetry(backoffMs);
       return {
@@ -671,17 +677,10 @@ const flushLocked = async (
     }
     if (
       result.kind === "stop" ||
-      (result.kind === "reject" && result.code === "diagnostics_disabled")
+      (result.kind === "reject" && result.status === 403)
     ) {
-      purgePendingReports();
-      const pref = readLocalPreference();
-      writeLocalPreference({
-        enabled: false,
-        pending_account_sync: pref?.pending_account_sync ?? false,
-        origin_scope: scope.originScope,
-        account_scope: scope.accountScope,
-        ...(scope.generation !== null ? { generation: scope.generation } : {}),
-      });
+      revokedAtPolicyRevision = getReportingPolicyRevision();
+      discardReportingWindow();
       return emptyResult({
         dry_run: false,
         report_id: report.report_id,
@@ -787,7 +786,8 @@ export const reportingStatus = (): TDoctorReportingStatus => {
   const policyOn = reportingPolicyAllowsUpload(scope.policy, clock());
   return {
     local_enabled: !localDisableSticky(),
-    account_enabled: policyOn,
+    account_enabled:
+      policyOn && !cloudSuspended && revokedAtPolicyRevision === null,
     pending_account_sync: pref?.pending_account_sync === true,
     ...(cursor?.last_ack_report_id !== undefined
       ? { last_acknowledged_report_id: cursor.last_ack_report_id }
@@ -796,50 +796,43 @@ export const reportingStatus = (): TDoctorReportingStatus => {
   };
 };
 
-export const applyLocalPreferenceAndMaybePurge = (enabled: boolean): void => {
-  const scope = reportingScope();
-  if (!enabled) {
-    purgePendingReports();
-    if (debounceTimer !== null) {
-      clearTimer(debounceTimer);
-      debounceTimer = null;
-    }
-    writeCursor(tailCursorForScope(scope));
-  } else {
-    writeCursor(tailCursorForScope(scope));
-    purgePendingReports();
-  }
+const discardReportingWindow = (): void => {
+  transitionRevision += 1;
+  purgePendingReports();
+  if (debounceTimer !== null) clearTimer(debounceTimer);
+  if (backoffTimer !== null) clearTimer(backoffTimer);
+  debounceTimer = null;
+  backoffTimer = null;
+  backoffMs = 1_000;
+  writeCursor(tailCursorForScope(reportingScope()));
 };
 
-export const onBootstrapReportingPolicy = (): void => {
+export const applyLocalPreferenceAndMaybePurge = (_enabled: boolean): void => {
+  // A local choice starts a new window but cannot lift a cloud suspension.
+  discardReportingWindow();
+};
+
+export const onBootstrapReportingPolicy = (
+  revision: number = getReportingPolicyRevision(),
+): void => {
+  // An older dynamic-import callback is not evidence of credential recovery.
+  if (revision !== getReportingPolicyRevision()) return;
   const scope = reportingScope();
-  const allowed = reportingPolicyAllowsUpload(scope.policy, clock());
-  if (allowed && !lastPolicyAllowed) {
-    const existing = readCursor();
-    const generationChanged =
-      existing === null || existing.generation !== scope.generation;
-    if (generationChanged) {
-      purgePendingReports();
-      writeCursor(tailCursorForScope(scope));
-    }
+  if (scope.policy === null || scope.policy.enabled === false) {
+    cloudSuspended = true;
+    discardReportingWindow();
+    return;
   }
-  lastPolicyAllowed = allowed;
-  const pref = readLocalPreference();
-  if (scope.policy?.enabled === false && pref?.enabled === true) {
-    writeLocalPreference({
-      ...pref,
-      enabled: false,
-      pending_account_sync: false,
-      origin_scope: scope.originScope,
-      account_scope: scope.accountScope,
-      ...(scope.generation !== null ? { generation: scope.generation } : {}),
-    });
-    purgePendingReports();
+  if (!reportingPolicyAllowsUpload(scope.policy, clock())) return;
+  if (revokedAtPolicyRevision !== null && revision <= revokedAtPolicyRevision) {
+    return;
   }
+  const recovering = cloudSuspended || revokedAtPolicyRevision !== null;
+  cloudSuspended = false;
+  revokedAtPolicyRevision = null;
   const cursor = readCursor();
-  if (cursor !== null && !cursorMatchesScope(cursor, scope)) {
-    purgePendingReports();
-    writeCursor(tailCursorForScope(scope));
+  if (recovering || cursor === null || !cursorMatchesScope(cursor, scope)) {
+    discardReportingWindow();
     return;
   }
   if (readPending() !== null && uploadAllowed()) {
@@ -855,7 +848,9 @@ export const resetDoctorEngineForTests = (): void => {
   backoffMs = 1_000;
   inFlight = false;
   activeUploadId = 0;
-  lastPolicyAllowed = false;
+  cloudSuspended = false;
+  revokedAtPolicyRevision = null;
+  transitionRevision = 0;
   scheduleTimer = setTimeout;
   clearTimer = clearTimeout;
   chain = Promise.resolve();

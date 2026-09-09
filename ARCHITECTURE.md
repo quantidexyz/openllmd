@@ -246,6 +246,19 @@ separate, explicit media-library feature: `image-walker.ts` and
 `video-walker.ts` may upload locally generated image/video bytes to
 `/api/daemon/media` so the user can retrieve them from the cloud library.
 
+**Diagnostic reports (`src/doctor-report/`).** Uploads are blocked when
+`NODE_ENV === "development"`. Otherwise the permission path requires an API key, a valid unexpired bootstrap
+reporting policy, and no explicit local opt-out. The cloud derives that policy
+from current accepted cookie consent and the account preference (omitted means
+enabled; explicit false stays off), without an environment rollout switch.
+Cloud denial suspends reporting in memory; it never rewrites the saved machine
+choice. An upload authorization rejection requires a fresh successful eligible
+bootstrap before retrying. Refresh revisions reject delayed bootstrap callbacks,
+and transition revisions fence stale upload completions. Suspension and recovery
+purge pending reports and move the cursor to the current tail, so disabled-period
+history is not replayed; ordinary same-generation refreshes retain pending retries.
+Historical local opt-outs and malformed existing preference files remain disabled.
+
 **Validated live** (`RUN_DAEMON_LIVE=1`, `tests/server/daemon-walker-live
 .e2e.test.ts`) against the real authenticated CLIs, through the full
 production flow (client → cloud → signed 307 → walker → vendor): the core

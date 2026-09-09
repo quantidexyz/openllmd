@@ -11,6 +11,3 @@ export const doctorArchitecture = (): TDoctorArchitecture | null => {
   if (a === "arm64" || a === "x64") return a;
   return null;
 };
-
-export const isDevDaemonVersion = (version: string): boolean =>
-  version === "0.0.0-dev" || version.includes("-dev");

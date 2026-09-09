@@ -52,6 +52,10 @@ export type TCloudState = "ok" | "no_key" | "invalid_key" | "unreachable";
 let snapshot: TDaemonBootstrap = EMPTY;
 let byModelId: Map<string, TDaemonCatalogEntry> = new Map();
 let cloudState: TCloudState = "no_key";
+let reportingPolicyRevision = 0;
+
+/** Started refresh revision, used to fence delayed diagnostics callbacks. */
+export const getReportingPolicyRevision = (): number => reportingPolicyRevision;
 
 export const getCloudState = (): TCloudState => cloudState;
 
@@ -63,6 +67,7 @@ export const getReportingPolicy = (): TDaemonReportingPolicy | null =>
 export const setReportingPolicyForTests = (
   policy: TDaemonReportingPolicy | null,
 ): void => {
+  reportingPolicyRevision += 1;
   snapshot = {
     ...snapshot,
     ...(policy === null
@@ -85,12 +90,15 @@ export const setReportingPolicyForTests = (
  */
 export const refreshBootstrap = async (): Promise<boolean> => {
   const prev = cloudState;
+  const reportingRevision = ++reportingPolicyRevision;
   try {
-    snapshot = await fetchBootstrap();
+    const next = await fetchBootstrap();
+    if (reportingRevision !== reportingPolicyRevision) return false;
+    snapshot = next;
     byModelId = new Map(snapshot.catalog.map((e) => [e.model_id, e]));
     cloudState = "ok";
     void import("./doctor-report")
-      .then((m) => m.onBootstrapReportingPolicy())
+      .then((m) => m.onBootstrapReportingPolicy(reportingRevision))
       .catch(() => {});
     // A fresh snapshot may carry new routing config — drop any cached signed
     // plans so a stale chain never outlives the config that produced it.
@@ -123,6 +131,7 @@ export const refreshBootstrap = async (): Promise<boolean> => {
       // swallow — identity pin is non-critical hardening
     }
   } catch (err) {
+    if (reportingRevision !== reportingPolicyRevision) return false;
     if (err instanceof NoApiKeyError) cloudState = "no_key";
     else if (err instanceof InvalidApiKeyError) cloudState = "invalid_key";
     else cloudState = "unreachable";
